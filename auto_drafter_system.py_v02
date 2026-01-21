@@ -1,0 +1,81 @@
+import os
+import sys
+from tkinter import filedialog, Tk
+import cadquery as cq
+# 引入檢視器
+from simple_viewer import EngineeringViewer
+
+class AutoDraftingSystem:
+    def __init__(self):
+        self.model = None
+        self.filename = None
+
+    def load_step_file(self):
+        """開啟檔案選擇視窗載入 STEP"""
+        # 隱藏主視窗
+        root = Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        
+        file_path = filedialog.askopenfilename(
+            title="選擇 STEP 檔案",
+            filetypes=[("STEP Files", "*.step *.stp")]
+        )
+        root.destroy()
+        
+        if file_path:
+            print(f"[System] 正在載入: {file_path}")
+            try:
+                # 1. 讀取 STEP
+                self.model = cq.importers.importStep(file_path)
+                self.filename = file_path
+                
+                # 2. 先顯示 3D 預覽確認模型沒問題
+                print("[System] 顯示 3D 預覽...")
+                EngineeringViewer.view_3d_stl(file_path)
+                return True
+            except Exception as e:
+                print(f"[Error] 讀取失敗: {e}")
+        return False
+
+    def export_to_dxf(self, output_filename="output_drawing.dxf"):
+        """使用 CadQuery 引擎將 3D 匯出為 DXF"""
+        if not self.model:
+            print("[Error] 沒有載入模型")
+            return
+
+        print(f"[System] 正在進行 3D -> DXF 轉檔...")
+        try:
+            # ----------------------------------------------------
+            # [修正重點] 移除 opt 參數
+            # CadQuery 的 DXF 匯出器不支援 projectionDir
+            # 它會直接匯出 3D 線條，Viewer 讀取時會自動變成俯視效果
+            # ----------------------------------------------------
+            cq.exporters.export(
+                self.model,
+                output_filename,
+                "DXF"
+            )
+            print(f"[Success] 轉檔成功: {output_filename}")
+            
+            # 轉檔完成後，自動打開 2D 檢視器
+            print("[System] 開啟 2D圖面 檢查...")
+            EngineeringViewer.view_2d_dxf(output_filename)
+            
+        except Exception as e:
+            print(f"[Error] 匯出失敗: {e}")
+            import traceback
+            traceback.print_exc()
+
+if __name__ == "__main__":
+    app = AutoDraftingSystem()
+    
+    print("="*40)
+    print("  AI 自動繪圖系統 v2.2 (Fix DXF Export)")
+    print("="*40)
+    
+    # 執行流程
+    if app.load_step_file():
+        app.export_to_dxf("output_drawing.dxf")
+    else:
+        print("[System] 未選擇檔案或載入失敗")

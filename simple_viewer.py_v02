@@ -1,0 +1,88 @@
+# 檔名: simple_viewer.py
+import sys
+import os
+import matplotlib.pyplot as plt
+import ezdxf
+from ezdxf import bbox
+from ezdxf.addons.drawing import RenderContext, Frontend
+from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+import pyvista as pv
+
+# 延遲導入 cadquery
+try:
+    import cadquery as cq
+    CADQUERY_AVAILABLE = True
+except ImportError:
+    CADQUERY_AVAILABLE = False
+
+class EngineeringViewer:
+    """提供快速查看 3D (STL, STEP) 與 2D (DXF) 檔案的功能"""
+    
+    @staticmethod
+    def view_3d_stl(filename):
+        if not os.path.exists(filename): return
+        print(f"Opening 3D Viewer for: {filename} ...")
+        try:
+            # 讀取邏輯
+            if filename.lower().endswith(('.step', '.stp')):
+                if not CADQUERY_AVAILABLE: return
+                step_model = cq.importers.importStep(filename)
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix='.stl', delete=False) as tmp:
+                    cq.exporters.export(step_model, tmp.name)
+                    mesh = pv.read(tmp.name)
+            else:
+                mesh = pv.read(filename)
+            
+            p = pv.Plotter()
+            p.add_mesh(mesh, color='lightgrey', show_edges=True)
+            p.add_axes()
+            p.show()
+        except Exception as e:
+            print(f"3D Error: {e}")
+
+    @staticmethod
+    def view_2d_dxf(filename):
+        if not os.path.exists(filename): return
+        print(f"Opening 2D Viewer for: {filename} ...")
+        try:
+            doc = ezdxf.readfile(filename)
+            msp = doc.modelspace()
+            
+            # 使用 bbox 計算正確範圍 (包含 Spline)
+            cache = bbox.Cache()
+            bb = bbox.extents(msp, cache=cache)
+            
+            if not bb.has_data:
+                print("警告: DXF 似乎是空的")
+                return
+
+            xmin, ymin = bb.extmin
+            xmax, ymax = bb.extmax
+            w, h = xmax - xmin, ymax - ymin
+            margin = max(w, h) * 0.1
+            
+            fig = plt.figure(figsize=(10, 10))
+            ax = fig.add_subplot(111)
+            ax.set_facecolor('white')
+            
+            ctx = RenderContext(doc)
+            out = MatplotlibBackend(ax)
+            Frontend(ctx, out).draw_layout(msp, finalize=True)
+            
+            # 強制將線條改為藍色以利觀察
+            for artist in ax.get_children():
+                if hasattr(artist, 'set_color'): artist.set_color('blue')
+                if hasattr(artist, 'set_linewidth'): artist.set_linewidth(1.0)
+            
+            ax.set_xlim(xmin - margin, xmax + margin)
+            ax.set_ylim(ymin - margin, ymax + margin)
+            ax.set_aspect('equal')
+            ax.grid(True, linestyle='--')
+            
+            plt.show(block=True)
+        except Exception as e:
+            print(f"2D View Error: {e}")
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1: EngineeringViewer.view_2d_dxf(sys.argv[1])
