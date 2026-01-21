@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific
+output/
+*.dxf
+*.dwg
+*.step
+*.stp
+*.stl
+*.png
+*.jpg
+*.jpeg
+
+# Keep test files but ignore large ones
+!test_flange.step
+!1-2.stp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
