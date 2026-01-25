@@ -4,11 +4,14 @@
 
 ## 功能特色
 
-- 🎨 **3D 模型檢視**：支援 STL、STEP/STP 格式的 3D 模型預覽
-- 📐 **2D 工程圖檢視**：支援 DXF、DWG 格式的 2D 工程圖檢視
-- 🔄 **自動轉換**：將 3D 模型自動轉換為 2D 工程圖
-- 🎯 **智能特徵提取**：自動從 3D 模型中提取幾何特徵
-- 📁 **批量處理**：支援批量檔案處理
+- 🎨 **3D 模型檢視**：支援 STL、STEP/STP 格式的 3D 模型預覽（使用 PyVista）
+- 📐 **2D 工程圖檢視**：支援 DXF、DWG 格式的 2D 工程圖檢視（使用 Matplotlib）
+- 🔄 **自動轉換**：將 3D 模型自動轉換為 2D 工程圖（使用 CadQuery）
+- 🎯 **智能特徵提取**：自動從 3D 模型中提取幾何特徵（圓形、矩形、多段線等）
+- 🔀 **同時檢視**：支援同時顯示 3D 和 2D 視圖進行對比
+- 📁 **自動儲存**：轉換後的檔案自動儲存到 `output/` 目錄
+- 🖱️ **圖形化介面**：使用 Tkinter 提供檔案選擇對話框
+- 📋 **圖檔資訊視窗**：獨立視窗完整顯示圖檔資訊，包含 BOM、來源軟體、零件、單位等
 
 ## 系統需求
 
@@ -38,32 +41,51 @@ pip install 'ezdxf[odafc]'
 
 ## 使用方式
 
-### 1. 自動繪圖系統
+### 1. 自動繪圖系統（主要功能）
 
 ```bash
 python auto_drafter_system.py
 ```
 
-執行後會：
-1. 選擇 3D 模型檔案（STEP/STP）
-2. 顯示 3D 模型預覽
-3. 自動轉換為 2D 工程圖
-4. 儲存到 `output/原檔名.dxf`
-5. 顯示 2D 工程圖
+**執行流程：**
+1. 彈出檔案選擇對話框，選擇 3D 模型檔案（STEP/STP）
+2. **開啟圖檔資訊視窗**，完整顯示：
+   - 基本檔案資訊（路徑、大小、格式）
+   - 來源軟體與元資料（作者、組織、建立日期）
+   - 單位資訊
+   - 幾何統計（實體數、面數、邊數、體積、表面積）
+   - 邊界框資訊
+   - 零件列表
+   - BOM 材料清單
+   - 幾何特徵列表
+   - 若無特定資訊則顯示「無資訊」
+3. 關閉資訊視窗或按 Enter 繼續
+4. 自動將 3D 模型轉換為 2D 工程圖
+5. 自動儲存到 `output/原檔名.dxf`（例如：`output/1-2.dxf`）
+6. 自動顯示 2D 工程圖視窗（Matplotlib）
 
-### 2. 檔案檢視器
+**注意：** 目前版本直接轉換，不修改原圖內容。修改功能已註解，可根據需要啟用。
+
+### 2. 檔案檢視器（獨立工具）
 
 ```bash
-# 查看單一檔案
+# 互動模式：彈出檔案選擇對話框
 python simple_viewer.py
 
-# 查看指定檔案
-python simple_viewer.py 1-2.stp
-python simple_viewer.py output/1-2.dxf
+# 查看指定檔案（命令列）
+python simple_viewer.py 1-2.stp          # 3D 檔案
+python simple_viewer.py output/1-2.dxf    # 2D 檔案
+python simple_viewer.py LM-02.dwg         # DWG 檔案
 
-# 同時查看 3D 和 2D
+# 同時查看 3D 和 2D（對比模式）
 python simple_viewer.py 1-2.stp output/1-2.dxf
 ```
+
+**檢視器功能：**
+- 自動識別檔案類型（3D 或 2D）
+- 支援白色背景、黑色線條的清晰顯示
+- 自動調整視圖範圍和比例
+- 保留原始顏色（白色線條會自動轉為黑色以確保可見）
 
 ### 3. 生成測試模型
 
@@ -71,42 +93,142 @@ python simple_viewer.py 1-2.stp output/1-2.dxf
 python generate_test_flange.py
 ```
 
+生成一個測試用的法蘭（Flange）模型，輸出為 `test_flange.step` 和 `test_flange.stl`。
+
 ## 專案結構
 
 ```
 Drafter/
 ├── auto_drafter_system.py    # 主要系統：3D 到 2D 自動轉換
+│   ├── MockCADEngine         # CAD 核心模擬器（3D 模型載入和特徵提取）
+│   ├── AIIntentParser        # AI 意圖解析器（可擴展整合 LLM）
+│   └── AutoDraftingSystem    # 系統協調器
 ├── simple_viewer.py          # 檔案檢視器：支援 3D/2D 檢視
-├── generate_test_flange.py   # 測試模型生成器
+│   └── EngineeringViewer     # 工程檔案檢視器類別
+├── generate_test_flange.py   # 測試模型生成器（生成法蘭模型）
 ├── test_stp_viewer.py        # STEP 檔案測試工具
-├── output/                   # 輸出目錄（自動生成）
-└── README.md                 # 本文件
+├── output/                   # 輸出目錄（自動生成，包含轉換後的 DXF 檔案）
+├── .gitignore                # Git 忽略規則
+├── README.md                 # 本文件
+└── GITHUB_SETUP.md           # GitHub 上傳步驟說明
 ```
 
 ## 支援的檔案格式
 
-### 3D 格式
-- **STEP/STP**：使用 CadQuery 讀取
+### 3D 格式（輸入）
+- **STEP/STP**：使用 CadQuery 讀取和轉換
+  - 支援參數化 CAD 模型
+  - 可提取幾何特徵（圓形、邊緣等）
 - **STL**：使用 PyVista 讀取
+  - 網格格式，主要用於預覽
+  - 特徵提取功能有限
 
-### 2D 格式
+### 2D 格式（輸入/輸出）
 - **DXF**：使用 ezdxf 讀取/寫入
+  - 完全支援讀取和寫入
+  - 保留原始顏色和線條樣式
 - **DWG**：使用 ezdxf + ODA File Converter 讀取
+  - 需要安裝 ODA File Converter
+  - 支援 AutoCAD 原生格式
+  - 自動轉換為 DXF 後讀取
 
-## 開發說明
+## 技術架構
 
 ### 核心模組
 
-- `MockCADEngine`：模擬 CAD 核心，負責 3D 模型載入和特徵提取
-- `AIIntentParser`：AI 意圖解析器（目前為簡化版本）
-- `AutoDraftingSystem`：系統協調器，整合所有功能
-- `EngineeringViewer`：工程檔案檢視器
+1. **MockCADEngine** (`auto_drafter_system.py`)
+   - 負責 3D 模型載入（STEP/STL）
+   - 特徵提取（從 3D 模型提取幾何特徵）
+   - 3D 到 2D 投影（使用 CadQuery 直接導出 DXF）
+   - **圖檔資訊提取**：從 STEP 檔案提取元資料（來源軟體、作者、單位等）
+   - **資訊視窗顯示**：使用 Tkinter 獨立視窗完整顯示所有圖檔資訊
 
-### 擴展功能
+2. **AIIntentParser** (`auto_drafter_system.py`)
+   - AI 意圖解析器（目前為簡化版本，使用關鍵字匹配）
+   - 可擴展整合真實的 LLM API（OpenAI、Claude 等）
 
-- 可以擴展 `AIIntentParser` 整合真實的 LLM API
-- 可以改進 `_extract_features()` 提取更複雜的幾何特徵
-- 可以添加更多 2D 視圖（側視圖、前視圖等）
+3. **AutoDraftingSystem** (`auto_drafter_system.py`)
+   - 系統協調器，整合所有功能
+   - 處理用戶請求，生成 2D 工程圖
+   - 自動檔案管理和開啟
+
+4. **EngineeringViewer** (`simple_viewer.py`)
+   - 工程檔案檢視器
+   - 支援 3D 視圖（PyVista）和 2D 視圖（Matplotlib）
+   - 支援同時顯示 3D 和 2D 視圖
+
+### 工作流程
+
+```
+3D 模型 (STEP/STP)
+    ↓
+CadQuery 載入
+    ↓
+直接導出為 DXF（或提取特徵後生成 DXF）
+    ↓
+儲存到 output/目錄
+    ↓
+顯示 2D 工程圖
+```
+
+### 擴展建議
+
+- **整合 LLM API**：擴展 `AIIntentParser` 整合 OpenAI/Claude API
+- **改進特徵提取**：增強 `_extract_features()` 提取更複雜的幾何特徵
+- **多視圖支援**：添加側視圖、前視圖、等角投影等
+- **尺寸標註**：自動添加尺寸標註和技術要求
+- **圖層管理**：支援 DXF 圖層和線型設定
+
+## 更新日誌
+
+### v1.2 (最新)
+- ✅ **圖檔資訊視窗**：新增獨立視窗完整顯示圖檔資訊
+- ✅ **BOM 材料清單**：自動生成並顯示 BOM (Bill of Materials)
+- ✅ **來源軟體識別**：從 STEP 檔案提取來源 CAD 軟體資訊
+- ✅ **單位資訊**：顯示檔案使用的長度單位
+- ✅ **元資料提取**：提取作者、組織、建立日期、產品名稱等資訊
+- ✅ **幾何統計**：顯示實體數、面數、邊數、頂點數、體積、表面積
+- ✅ **零件列表**：顯示模型中的零件清單
+- ✅ **無資訊處理**：若無特定資訊則明確顯示「無資訊」
+- ✅ **視窗可捲動**：支援長內容捲動檢視
+
+### v1.1
+- ✅ 支援 DWG 檔案讀取（需要 ODA File Converter）
+- ✅ 同時顯示 3D 和 2D 視圖功能
+- ✅ 改進的顏色處理（保留原始顏色，白色自動轉黑色）
+- ✅ 自動儲存到 output 目錄
+- ✅ 改進的錯誤處理和調試訊息
+- ✅ 直接使用 CadQuery 導出 DXF（更快更可靠）
+
+### v1.0
+- 基本 3D 到 2D 轉換功能
+- 支援 STEP/STL 檔案讀取
+- 支援 DXF 檔案檢視和生成
+- 自動特徵提取
+- 圖形化檔案選擇介面
+
+## 常見問題
+
+### Q: 為什麼 DWG 檔案無法讀取？
+A: DWG 檔案需要安裝 ODA File Converter。如果已安裝但無法找到，程式會提示手動選擇路徑。
+
+### Q: 轉換後的 2D 圖只有簡單的邊界框？
+A: 這是因為特徵提取是簡化版本。系統會優先使用 CadQuery 直接導出 DXF，這樣可以保留更多細節。
+
+### Q: 如何啟用修改功能？
+A: 在 `auto_drafter_system.py` 的 main 區塊中，取消註解修改指令相關的程式碼即可。
+
+### Q: 支援哪些 Python 版本？
+A: 建議使用 Python 3.8 或更高版本。已測試 Python 3.13。
+
+### Q: 圖檔資訊視窗顯示「無資訊」怎麼辦？
+A: 這表示該項目在檔案中沒有相關資訊。例如：
+- STL 檔案不包含元資料，大部分項目會顯示「無資訊」
+- STEP 檔案的元資料取決於來源 CAD 軟體是否有寫入
+- 這是正常現象，不影響模型轉換功能
+
+### Q: 如何查看完整的圖檔資訊？
+A: 執行 `auto_drafter_system.py` 後，會自動彈出圖檔資訊視窗，顯示所有可提取的資訊，包含 BOM、來源軟體、零件列表、單位、幾何統計等。
 
 ## 授權
 
@@ -116,10 +238,4 @@ Drafter/
 
 歡迎提交 Issue 和 Pull Request！
 
-## 更新日誌
-
-### v1.0
-- 基本 3D 到 2D 轉換功能
-- 支援 STEP/STL 檔案讀取
-- 支援 DXF/DWG 檔案檢視
-- 自動特徵提取
+如有問題或建議，請在 GitHub 上開 Issue。

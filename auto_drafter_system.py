@@ -3,10 +3,12 @@ import math
 import os
 import subprocess
 import platform
+import threading
 import ezdxf
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
-from tkinter import filedialog, Tk
+import tkinter as tk
+from tkinter import filedialog, Tk, Toplevel, Text, Scrollbar, Frame, Label, Button
 from simple_viewer import EngineeringViewer
 
 # 延遲導入 cadquery，避免啟動時的導入錯誤
@@ -195,159 +197,766 @@ class MockCADEngine:
                 return True
         return False
 
+    def get_model_info(self) -> Dict:
+        """
+        取得 3D 模型的詳細資訊
+        返回包含模型資訊的字典，包括 BOM、來源軟體、零件、單位等
+        """
+        info = {
+            "has_model": self.cad_model is not None,
+            "model_file": self.model_file,
+            "file_name": os.path.basename(self.model_file) if self.model_file else None,
+            "file_extension": os.path.splitext(self.model_file)[1].lower() if self.model_file else None,
+            "file_size": None,
+            "features": [],
+            "bounding_box": None,
+            # 擴展資訊
+            "source_software": None,  # 來源軟體
+            "units": None,            # 單位
+            "parts": [],              # 零件列表
+            "bom": [],                # BOM (Bill of Materials)
+            "author": None,           # 作者
+            "organization": None,     # 組織
+            "creation_date": None,    # 建立日期
+            "description": None,      # 描述
+            "product_name": None,     # 產品名稱
+            "version": None,          # 版本
+            "solid_count": 0,         # 實體數量
+            "face_count": 0,          # 面數量
+            "edge_count": 0,          # 邊數量
+            "vertex_count": 0,        # 頂點數量
+            "volume": None,           # 體積
+            "surface_area": None,     # 表面積
+        }
+
+        # 獲取檔案大小
+        if self.model_file and os.path.exists(self.model_file):
+            try:
+                file_size_bytes = os.path.getsize(self.model_file)
+                if file_size_bytes < 1024:
+                    info["file_size"] = f"{file_size_bytes} bytes"
+                elif file_size_bytes < 1024 * 1024:
+                    info["file_size"] = f"{file_size_bytes / 1024:.2f} KB"
+                else:
+                    info["file_size"] = f"{file_size_bytes / (1024 * 1024):.2f} MB"
+            except:
+                pass
+
+        # 如果有 3D 模型，獲取詳細資訊
+        if self.cad_model is not None and CADQUERY_AVAILABLE:
+            try:
+                # 獲取邊界框資訊
+                bbox = self.cad_model.val().BoundingBox()
+                info["bounding_box"] = {
+                    "x_min": bbox.xmin,
+                    "x_max": bbox.xmax,
+                    "y_min": bbox.ymin,
+                    "y_max": bbox.ymax,
+                    "z_min": bbox.zmin,
+                    "z_max": bbox.zmax,
+                    "width": bbox.xmax - bbox.xmin,
+                    "height": bbox.ymax - bbox.ymin,
+                    "depth": bbox.zmax - bbox.zmin
+                }
+            except Exception as e:
+                print(f"[CAD Kernel] Warning: Could not get bounding box: {e}")
+
+            # 嘗試獲取幾何統計資訊
+            try:
+                shape = self.cad_model.val()
+
+                # 計算面、邊、頂點數量
+                try:
+                    from OCP.TopExp import TopExp_Explorer
+                    from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX, TopAbs_SOLID
+
+                    # 計算實體數量
+                    solid_explorer = TopExp_Explorer(shape.wrapped, TopAbs_SOLID)
+                    solid_count = 0
+                    while solid_explorer.More():
+                        solid_count += 1
+                        solid_explorer.Next()
+                    info["solid_count"] = solid_count
+
+                    # 計算面數量
+                    face_explorer = TopExp_Explorer(shape.wrapped, TopAbs_FACE)
+                    face_count = 0
+                    while face_explorer.More():
+                        face_count += 1
+                        face_explorer.Next()
+                    info["face_count"] = face_count
+
+                    # 計算邊數量
+                    edge_explorer = TopExp_Explorer(shape.wrapped, TopAbs_EDGE)
+                    edge_count = 0
+                    while edge_explorer.More():
+                        edge_count += 1
+                        edge_explorer.Next()
+                    info["edge_count"] = edge_count
+
+                    # 計算頂點數量
+                    vertex_explorer = TopExp_Explorer(shape.wrapped, TopAbs_VERTEX)
+                    vertex_count = 0
+                    while vertex_explorer.More():
+                        vertex_count += 1
+                        vertex_explorer.Next()
+                    info["vertex_count"] = vertex_count
+
+                except Exception as e:
+                    print(f"[CAD Kernel] Warning: Could not count topology: {e}")
+
+                # 嘗試計算體積和表面積
+                try:
+                    from OCP.GProp import GProp_GProps
+                    from OCP.BRepGProp import BRepGProp
+
+                    props = GProp_GProps()
+                    BRepGProp.VolumeProperties_s(shape.wrapped, props)
+                    info["volume"] = props.Mass()
+
+                    surf_props = GProp_GProps()
+                    BRepGProp.SurfaceProperties_s(shape.wrapped, surf_props)
+                    info["surface_area"] = surf_props.Mass()
+                except Exception as e:
+                    print(f"[CAD Kernel] Warning: Could not calculate volume/area: {e}")
+
+            except Exception as e:
+                print(f"[CAD Kernel] Warning: Could not get geometry stats: {e}")
+
+            # 嘗試從 STEP 檔案讀取元資料
+            if self.model_file and info["file_extension"] in ['.step', '.stp']:
+                info = self._extract_step_metadata(info)
+
+        # 設定預設單位（根據檔案類型推測）
+        if info["units"] is None:
+            if info["file_extension"] in ['.step', '.stp']:
+                info["units"] = "mm (預設)"
+            elif info["file_extension"] == '.stl':
+                info["units"] = "無單位資訊 (STL 格式)"
+            else:
+                info["units"] = "未知"
+
+        # 加入特徵資訊
+        for f in self.features:
+            info["features"].append({
+                "id": f.id,
+                "type": f.type,
+                "description": f.description,
+                "params": f.params
+            })
+
+        # 生成 BOM (Bill of Materials)
+        if info["solid_count"] > 0 or len(self.features) > 0:
+            bom_entry = {
+                "item": 1,
+                "name": info["file_name"] or "未命名零件",
+                "quantity": 1,
+                "material": "未指定",
+                "description": info["description"] or "3D 模型零件"
+            }
+            info["bom"].append(bom_entry)
+
+        # 加入零件資訊
+        if info["solid_count"] > 0:
+            for i in range(info["solid_count"]):
+                info["parts"].append({
+                    "id": i + 1,
+                    "name": f"Solid_{i + 1}",
+                    "type": "實體"
+                })
+        elif len(self.features) > 0:
+            for feat in info["features"]:
+                info["parts"].append({
+                    "id": feat["id"],
+                    "name": feat["description"],
+                    "type": feat["type"]
+                })
+
+        return info
+
+    def _extract_step_metadata(self, info: Dict) -> Dict:
+        """
+        從 STEP 檔案中提取元資料
+        STEP 檔案包含豐富的元資料，如作者、組織、軟體來源等
+        """
+        if not self.model_file or not os.path.exists(self.model_file):
+            return info
+
+        try:
+            with open(self.model_file, 'r', encoding='utf-8', errors='ignore') as f:
+                # 只讀取前 500 行來查找 header 資訊
+                lines = []
+                for i, line in enumerate(f):
+                    if i > 500:
+                        break
+                    lines.append(line)
+                content = ''.join(lines)
+
+            # 提取來源軟體
+            import re
+
+            # FILE_NAME 區段通常包含軟體資訊
+            file_name_match = re.search(r"FILE_NAME\s*\([^)]*'([^']*)'[^)]*\)", content, re.IGNORECASE)
+            if file_name_match:
+                info["product_name"] = file_name_match.group(1) if file_name_match.group(1) else None
+
+            # 查找來源軟體 - 常見格式
+            software_patterns = [
+                r"ORIGINATING_SYSTEM\s*\(\s*'([^']+)'",
+                r"FILE_DESCRIPTION.*?implementation_level.*?'([^']+)'",
+                r"preprocessor_version\s*=\s*'([^']+)'",
+                r"originating_system\s*=\s*'([^']+)'",
+                # 常見 CAD 軟體名稱
+                r"(SolidWorks|CATIA|AutoCAD|Inventor|Fusion\s*360|Creo|NX|FreeCAD|OpenSCAD|Onshape)",
+            ]
+
+            for pattern in software_patterns:
+                match = re.search(pattern, content, re.IGNORECASE)
+                if match:
+                    info["source_software"] = match.group(1).strip()
+                    break
+
+            # 查找作者
+            author_match = re.search(r"AUTHOR\s*\(\s*'([^']*)'", content, re.IGNORECASE)
+            if author_match and author_match.group(1):
+                info["author"] = author_match.group(1)
+
+            # 查找組織
+            org_match = re.search(r"ORGANIZATION\s*\(\s*'([^']*)'", content, re.IGNORECASE)
+            if org_match and org_match.group(1):
+                info["organization"] = org_match.group(1)
+
+            # 查找日期
+            date_match = re.search(r"TIME_STAMP\s*\(\s*'([^']*)'", content, re.IGNORECASE)
+            if date_match and date_match.group(1):
+                info["creation_date"] = date_match.group(1)
+
+            # 查找描述
+            desc_match = re.search(r"FILE_DESCRIPTION\s*\(\s*\(\s*'([^']*)'", content, re.IGNORECASE)
+            if desc_match and desc_match.group(1):
+                info["description"] = desc_match.group(1)
+
+            # 查找單位
+            unit_patterns = [
+                (r"SI_UNIT.*?\.MILLI\.", "mm"),
+                (r"SI_UNIT.*?\.CENTI\.", "cm"),
+                (r"SI_UNIT.*?METRE", "m"),
+                (r"LENGTH_UNIT.*?MILLI", "mm"),
+                (r"LENGTH_UNIT.*?INCH", "inch"),
+            ]
+
+            for pattern, unit in unit_patterns:
+                if re.search(pattern, content, re.IGNORECASE):
+                    info["units"] = unit
+                    break
+
+        except Exception as e:
+            print(f"[CAD Kernel] Warning: Could not extract STEP metadata: {e}")
+
+        return info
+
+    def display_info(self):
+        """
+        顯示 3D 模型的完整資訊
+        如果沒有資訊則顯示 "無資訊"
+        在控制台輸出簡要資訊
+        """
+        info = self.get_model_info()
+
+        print("\n" + "=" * 50)
+        print("圖檔資訊 (Model Information)")
+        print("=" * 50)
+
+        # 檢查是否有資訊可顯示
+        if not info["features"] and info["bounding_box"] is None:
+            print("無資訊")
+            print("=" * 50 + "\n")
+            return False
+
+        # 顯示檔案資訊
+        if info["model_file"]:
+            print(f"\n檔案路徑: {info['model_file']}")
+            print(f"   檔案名稱: {os.path.basename(info['model_file'])}")
+        else:
+            print("\n檔案: 使用模擬資料 (Mock Data)")
+
+        # 顯示 3D 模型狀態
+        if info["has_model"]:
+            print(f"   3D 模型: 已載入")
+        else:
+            print(f"   3D 模型: 未載入 (使用特徵資料)")
+
+        print(f"\n詳細資訊將在獨立視窗中顯示...")
+        print("=" * 50 + "\n")
+        return True
+
+    def show_info_window(self):
+        """
+        在獨立視窗中顯示完整的圖檔資訊
+        包含 BOM、來源軟體、零件、單位等
+        如無資訊則顯示「無資訊」
+        """
+        info = self.get_model_info()
+
+        # 建立獨立視窗
+        window = Toplevel()
+        window.title("圖檔資訊 (Model Information)")
+        window.geometry("700x800")
+        window.configure(bg='#f0f0f0')
+
+        # 使視窗置頂
+        window.attributes('-topmost', True)
+        window.focus_force()
+
+        # 建立主框架
+        main_frame = Frame(window, bg='#f0f0f0')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 標題
+        title_label = Label(main_frame, text="圖檔完整資訊", font=('Microsoft JhengHei', 16, 'bold'),
+                           bg='#f0f0f0', fg='#333333')
+        title_label.pack(pady=(0, 10))
+
+        # 建立文字區域框架
+        text_frame = Frame(main_frame, bg='#ffffff', relief=tk.SUNKEN, bd=1)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 建立捲軸
+        scrollbar = Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 建立文字區域
+        text_widget = Text(text_frame, wrap=tk.WORD, font=('Consolas', 10),
+                          yscrollcommand=scrollbar.set, bg='#ffffff', fg='#333333',
+                          padx=10, pady=10)
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+
+        # 定義文字標籤樣式
+        text_widget.tag_configure('header', font=('Microsoft JhengHei', 12, 'bold'), foreground='#0066cc')
+        text_widget.tag_configure('section', font=('Microsoft JhengHei', 11, 'bold'), foreground='#006600')
+        text_widget.tag_configure('label', font=('Consolas', 10, 'bold'), foreground='#333333')
+        text_widget.tag_configure('value', font=('Consolas', 10), foreground='#666666')
+        text_widget.tag_configure('no_info', font=('Microsoft JhengHei', 10, 'italic'), foreground='#999999')
+        text_widget.tag_configure('separator', foreground='#cccccc')
+
+        def add_line(text, tag=None):
+            """添加一行文字"""
+            if tag:
+                text_widget.insert(tk.END, text + "\n", tag)
+            else:
+                text_widget.insert(tk.END, text + "\n")
+
+        def add_field(label, value, indent="    "):
+            """添加欄位，如無資訊顯示「無資訊」"""
+            text_widget.insert(tk.END, f"{indent}{label}: ", 'label')
+            if value is not None and value != "" and value != []:
+                text_widget.insert(tk.END, f"{value}\n", 'value')
+            else:
+                text_widget.insert(tk.END, "無資訊\n", 'no_info')
+
+        def add_separator():
+            """添加分隔線"""
+            add_line("─" * 60, 'separator')
+
+        # ===== 開始填入資訊 =====
+
+        add_line("=" * 60, 'separator')
+        add_line("圖檔資訊報告 (Model Information Report)", 'header')
+        add_line("=" * 60, 'separator')
+        add_line("")
+
+        # ----- 基本檔案資訊 -----
+        add_line("【基本檔案資訊】", 'section')
+        add_separator()
+        add_field("檔案路徑", info.get("model_file"))
+        add_field("檔案名稱", info.get("file_name"))
+        add_field("檔案格式", info.get("file_extension"))
+        add_field("檔案大小", info.get("file_size"))
+        add_field("3D 模型狀態", "已載入" if info.get("has_model") else "未載入 (使用特徵資料)")
+        add_line("")
+
+        # ----- 來源軟體與元資料 -----
+        add_line("【來源軟體與元資料】", 'section')
+        add_separator()
+        add_field("來源軟體", info.get("source_software"))
+        add_field("作者", info.get("author"))
+        add_field("組織", info.get("organization"))
+        add_field("建立日期", info.get("creation_date"))
+        add_field("產品名稱", info.get("product_name"))
+        add_field("版本", info.get("version"))
+        add_field("描述", info.get("description"))
+        add_line("")
+
+        # ----- 單位資訊 -----
+        add_line("【單位資訊】", 'section')
+        add_separator()
+        add_field("長度單位", info.get("units"))
+        add_line("")
+
+        # ----- 幾何統計資訊 -----
+        add_line("【幾何統計資訊】", 'section')
+        add_separator()
+        add_field("實體數量 (Solids)", info.get("solid_count") if info.get("solid_count", 0) > 0 else None)
+        add_field("面數量 (Faces)", info.get("face_count") if info.get("face_count", 0) > 0 else None)
+        add_field("邊數量 (Edges)", info.get("edge_count") if info.get("edge_count", 0) > 0 else None)
+        add_field("頂點數量 (Vertices)", info.get("vertex_count") if info.get("vertex_count", 0) > 0 else None)
+
+        if info.get("volume") is not None:
+            add_field("體積", f"{info['volume']:.4f} 立方單位")
+        else:
+            add_field("體積", None)
+
+        if info.get("surface_area") is not None:
+            add_field("表面積", f"{info['surface_area']:.4f} 平方單位")
+        else:
+            add_field("表面積", None)
+        add_line("")
+
+        # ----- 邊界框資訊 -----
+        add_line("【邊界框資訊 (Bounding Box)】", 'section')
+        add_separator()
+        bbox = info.get("bounding_box")
+        if bbox:
+            add_field("X 範圍", f"{bbox['x_min']:.2f} ~ {bbox['x_max']:.2f}")
+            add_field("Y 範圍", f"{bbox['y_min']:.2f} ~ {bbox['y_max']:.2f}")
+            add_field("Z 範圍", f"{bbox['z_min']:.2f} ~ {bbox['z_max']:.2f}")
+            add_field("寬度 (Width)", f"{bbox['width']:.2f}")
+            add_field("高度 (Height)", f"{bbox['height']:.2f}")
+            add_field("深度 (Depth)", f"{bbox['depth']:.2f}")
+        else:
+            add_field("邊界框", None)
+        add_line("")
+
+        # ----- 零件列表 -----
+        add_line("【零件列表 (Parts)】", 'section')
+        add_separator()
+        parts = info.get("parts", [])
+        if parts:
+            for i, part in enumerate(parts, 1):
+                add_line(f"    [{i}] ID: {part.get('id')}", 'value')
+                add_line(f"        名稱: {part.get('name')}", 'value')
+                add_line(f"        類型: {part.get('type')}", 'value')
+        else:
+            add_line("    無資訊", 'no_info')
+        add_line("")
+
+        # ----- BOM (Bill of Materials) -----
+        add_line("【BOM 材料清單 (Bill of Materials)】", 'section')
+        add_separator()
+        bom = info.get("bom", [])
+        if bom:
+            add_line("    項次 | 名稱                     | 數量 | 材料     | 描述", 'label')
+            add_line("    " + "-" * 56, 'separator')
+            for item in bom:
+                name = item.get('name', '未命名')[:24].ljust(24)
+                qty = str(item.get('quantity', 1)).ljust(4)
+                material = item.get('material', '未指定')[:8].ljust(8)
+                desc = item.get('description', '')[:20]
+                add_line(f"    {item.get('item', 1):4d} | {name} | {qty} | {material} | {desc}", 'value')
+        else:
+            add_line("    無資訊", 'no_info')
+        add_line("")
+
+        # ----- 幾何特徵 -----
+        add_line("【幾何特徵 (Geometric Features)】", 'section')
+        add_separator()
+        features = info.get("features", [])
+        if features:
+            add_line(f"    共 {len(features)} 個特徵", 'value')
+            add_line("")
+            for i, feat in enumerate(features, 1):
+                add_line(f"    [{i}] 特徵 ID: {feat['id']}", 'label')
+                add_line(f"        類型: {feat['type']}", 'value')
+                add_line(f"        描述: {feat['description']}", 'value')
+                params_str = ", ".join([f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}"
+                                       for k, v in feat['params'].items()])
+                add_line(f"        參數: {params_str}", 'value')
+                if i < len(features):
+                    add_line("")
+        else:
+            add_line("    無資訊", 'no_info')
+        add_line("")
+
+        add_line("=" * 60, 'separator')
+        add_line("報告結束", 'header')
+        add_line("=" * 60, 'separator')
+
+        # 設定文字區域為唯讀
+        text_widget.config(state=tk.DISABLED)
+
+        # 關閉按鈕
+        close_button = Button(main_frame, text="關閉視窗", font=('Microsoft JhengHei', 10),
+                             command=window.destroy, bg='#4a90d9', fg='white',
+                             padx=20, pady=5, relief=tk.FLAT)
+        close_button.pack(pady=10)
+
+        # 讓視窗保持開啟但不阻擋主程序
+        window.update()
+
+        return window
+
+    def save_info_to_file(self, output_dir: str = "output") -> str:
+        """
+        將圖檔資訊儲存到檔案
+        Args:
+            output_dir: 輸出目錄，預設為 "output"
+        Returns:
+            輸出檔案的完整路徑
+        """
+        info = self.get_model_info()
+
+        # 確保輸出目錄存在
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"[System] 建立輸出目錄: {output_dir}")
+
+        # 生成輸出檔名
+        if info.get("file_name"):
+            base_name = os.path.splitext(info["file_name"])[0]
+            output_filename = f"{base_name}_info.txt"
+        else:
+            output_filename = "model_info.txt"
+
+        output_path = os.path.join(output_dir, output_filename)
+
+        # 輔助函數
+        def format_value(value):
+            """格式化數值，如無資訊返回「無資訊」"""
+            if value is not None and value != "" and value != []:
+                return str(value)
+            return "無資訊"
+
+        # 建立報告內容
+        lines = []
+        lines.append("=" * 60)
+        lines.append("圖檔資訊報告 (Model Information Report)")
+        lines.append("=" * 60)
+        lines.append("")
+
+        # ----- 基本檔案資訊 -----
+        lines.append("【基本檔案資訊】")
+        lines.append("-" * 60)
+        lines.append(f"    檔案路徑: {format_value(info.get('model_file'))}")
+        lines.append(f"    檔案名稱: {format_value(info.get('file_name'))}")
+        lines.append(f"    檔案格式: {format_value(info.get('file_extension'))}")
+        lines.append(f"    檔案大小: {format_value(info.get('file_size'))}")
+        lines.append(f"    3D 模型狀態: {'已載入' if info.get('has_model') else '未載入 (使用特徵資料)'}")
+        lines.append("")
+
+        # ----- 來源軟體與元資料 -----
+        lines.append("【來源軟體與元資料】")
+        lines.append("-" * 60)
+        lines.append(f"    來源軟體: {format_value(info.get('source_software'))}")
+        lines.append(f"    作者: {format_value(info.get('author'))}")
+        lines.append(f"    組織: {format_value(info.get('organization'))}")
+        lines.append(f"    建立日期: {format_value(info.get('creation_date'))}")
+        lines.append(f"    產品名稱: {format_value(info.get('product_name'))}")
+        lines.append(f"    版本: {format_value(info.get('version'))}")
+        lines.append(f"    描述: {format_value(info.get('description'))}")
+        lines.append("")
+
+        # ----- 單位資訊 -----
+        lines.append("【單位資訊】")
+        lines.append("-" * 60)
+        lines.append(f"    長度單位: {format_value(info.get('units'))}")
+        lines.append("")
+
+        # ----- 幾何統計資訊 -----
+        lines.append("【幾何統計資訊】")
+        lines.append("-" * 60)
+        solid_count = info.get("solid_count", 0)
+        face_count = info.get("face_count", 0)
+        edge_count = info.get("edge_count", 0)
+        vertex_count = info.get("vertex_count", 0)
+        lines.append(f"    實體數量 (Solids): {solid_count if solid_count > 0 else '無資訊'}")
+        lines.append(f"    面數量 (Faces): {face_count if face_count > 0 else '無資訊'}")
+        lines.append(f"    邊數量 (Edges): {edge_count if edge_count > 0 else '無資訊'}")
+        lines.append(f"    頂點數量 (Vertices): {vertex_count if vertex_count > 0 else '無資訊'}")
+
+        if info.get("volume") is not None:
+            lines.append(f"    體積: {info['volume']:.4f} 立方單位")
+        else:
+            lines.append(f"    體積: 無資訊")
+
+        if info.get("surface_area") is not None:
+            lines.append(f"    表面積: {info['surface_area']:.4f} 平方單位")
+        else:
+            lines.append(f"    表面積: 無資訊")
+        lines.append("")
+
+        # ----- 邊界框資訊 -----
+        lines.append("【邊界框資訊 (Bounding Box)】")
+        lines.append("-" * 60)
+        bbox = info.get("bounding_box")
+        if bbox:
+            lines.append(f"    X 範圍: {bbox['x_min']:.2f} ~ {bbox['x_max']:.2f}")
+            lines.append(f"    Y 範圍: {bbox['y_min']:.2f} ~ {bbox['y_max']:.2f}")
+            lines.append(f"    Z 範圍: {bbox['z_min']:.2f} ~ {bbox['z_max']:.2f}")
+            lines.append(f"    寬度 (Width): {bbox['width']:.2f}")
+            lines.append(f"    高度 (Height): {bbox['height']:.2f}")
+            lines.append(f"    深度 (Depth): {bbox['depth']:.2f}")
+        else:
+            lines.append(f"    邊界框: 無資訊")
+        lines.append("")
+
+        # ----- 零件列表 -----
+        lines.append("【零件列表 (Parts)】")
+        lines.append("-" * 60)
+        parts = info.get("parts", [])
+        if parts:
+            for i, part in enumerate(parts, 1):
+                lines.append(f"    [{i}] ID: {part.get('id')}")
+                lines.append(f"        名稱: {part.get('name')}")
+                lines.append(f"        類型: {part.get('type')}")
+        else:
+            lines.append("    無資訊")
+        lines.append("")
+
+        # ----- BOM (Bill of Materials) -----
+        lines.append("【BOM 材料清單 (Bill of Materials)】")
+        lines.append("-" * 60)
+        bom = info.get("bom", [])
+        if bom:
+            lines.append("    項次 | 名稱                     | 數量 | 材料     | 描述")
+            lines.append("    " + "-" * 56)
+            for item in bom:
+                name = str(item.get('name', '未命名'))[:24].ljust(24)
+                qty = str(item.get('quantity', 1)).ljust(4)
+                material = str(item.get('material', '未指定'))[:8].ljust(8)
+                desc = str(item.get('description', ''))[:20]
+                lines.append(f"    {item.get('item', 1):4d} | {name} | {qty} | {material} | {desc}")
+        else:
+            lines.append("    無資訊")
+        lines.append("")
+
+        # ----- 幾何特徵 -----
+        lines.append("【幾何特徵 (Geometric Features)】")
+        lines.append("-" * 60)
+        features = info.get("features", [])
+        if features:
+            lines.append(f"    共 {len(features)} 個特徵")
+            lines.append("")
+            # 只顯示前 20 個特徵，避免檔案過大
+            display_features = features[:20]
+            for i, feat in enumerate(display_features, 1):
+                lines.append(f"    [{i}] 特徵 ID: {feat['id']}")
+                lines.append(f"        類型: {feat['type']}")
+                lines.append(f"        描述: {feat['description']}")
+                params_str = ", ".join([f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}"
+                                       for k, v in feat['params'].items()])
+                lines.append(f"        參數: {params_str}")
+                if i < len(display_features):
+                    lines.append("")
+            if len(features) > 20:
+                lines.append(f"    ... 還有 {len(features) - 20} 個特徵未顯示")
+        else:
+            lines.append("    無資訊")
+        lines.append("")
+
+        lines.append("=" * 60)
+        lines.append("報告結束")
+        lines.append("=" * 60)
+
+        # 寫入檔案
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            print(f"[System] 圖檔資訊已儲存至: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"[System] 儲存圖檔資訊失敗: {e}")
+            return None
+
     def project_to_2d(self) -> List[GeometricFeature]:
         """
         真正的 3D 轉 2D 投影運算
         使用 CadQuery 將 3D 模型投影到 XY 平面（俯視圖）
-        改進版本：直接使用 CadQuery 導出 DXF，然後從 DXF 中提取特徵
         """
         print("[CAD Kernel] Projecting 3D model to 2D plane...")
         
         # 如果有 3D 模型，進行真正的投影
         if self.cad_model is not None and CADQUERY_AVAILABLE:
             try:
-                import tempfile
+                # 方法：將 3D 模型投影到 XY 平面
+                # 使用 CadQuery 的投影功能或直接從邊界框生成 2D 視圖
                 
-                # 方法：使用 CadQuery 直接導出 DXF，然後從 DXF 中提取特徵
-                # 這樣可以保留更多的幾何細節
-                with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp_file:
-                    temp_dxf = tmp_file.name
+                # 獲取模型的邊界框
+                bbox = self.cad_model.val().BoundingBox()
                 
+                # 生成 2D 投影特徵（俯視圖）
+                features_2d = []
+                feature_id = 1
+                
+                # 1. 添加外框（從邊界框生成）
+                width = bbox.xmax - bbox.xmin
+                height = bbox.ymax - bbox.ymin
+                center_x = (bbox.xmin + bbox.xmax) / 2
+                center_y = (bbox.ymin + bbox.ymax) / 2
+                
+                features_2d.append(GeometricFeature(
+                    f"F{feature_id:02d}",
+                    "rect",
+                    {'w': width, 'h': height, 'x': center_x, 'y': center_y},
+                    "projected_outline"
+                ))
+                feature_id += 1
+                
+                # 2. 嘗試從 3D 模型的邊緣提取圓形特徵
+                # 這是一個簡化版本，實際應該分析所有邊緣
                 try:
-                    # 使用 CadQuery 導出 DXF（會自動投影到 XY 平面）
-                    print(f"[CAD Kernel] Exporting 3D model to temporary DXF...")
-                    print(f"[CAD Kernel] Temporary DXF path: {temp_dxf}")
-                    cq.exporters.export(self.cad_model, temp_dxf, "DXF")
-                    print(f"[CAD Kernel] DXF export completed")
+                    # 獲取所有邊緣
+                    edges = self.cad_model.edges()
                     
-                    # 確認臨時檔案是否存在
-                    if not os.path.exists(temp_dxf):
-                        print(f"[CAD Kernel] Error: Temporary DXF file was not created")
-                        return self._project_from_bbox()
+                    # 尋找圓形邊緣
+                    circle_edges = edges.filter(lambda e: e.geomType() == "CIRCLE")
                     
-                    file_size = os.path.getsize(temp_dxf)
-                    print(f"[CAD Kernel] Temporary DXF file size: {file_size} bytes")
-                    
-                    # 從導出的 DXF 中讀取特徵
-                    print(f"[CAD Kernel] Extracting features from DXF...")
-                    features_2d = self._extract_features_from_dxf(temp_dxf)
-                    print(f"[CAD Kernel] Extracted {len(features_2d)} features from DXF")
-                    
-                    # 清理臨時檔案
-                    if os.path.exists(temp_dxf):
-                        os.unlink(temp_dxf)
-                    
-                    if features_2d:
-                        print(f"[CAD Kernel] Generated {len(features_2d)} 2D projection features from DXF")
-                        return features_2d
-                    else:
-                        print(f"[CAD Kernel] Warning: No features extracted from DXF, using fallback method")
-                        # 回退到邊界框方法
-                        return self._project_from_bbox()
-                        
+                    # 提取圓形特徵（投影到 XY 平面）
+                    for i, edge in enumerate(circle_edges.objects):
+                        try:
+                            # 獲取邊緣的幾何資訊
+                            # 注意：這需要根據實際的 CadQuery API 調整
+                            # 簡化處理：使用邊界框中心附近的圓形
+                            radius = 10.0  # 預設值
+                            
+                            # 嘗試從邊緣獲取更多資訊
+                            # 這裡簡化處理，實際應該分析邊緣的實際幾何
+                            
+                            features_2d.append(GeometricFeature(
+                                f"F{feature_id:02d}",
+                                "circle",
+                                {'radius': radius, 'x': center_x, 'y': center_y},
+                                f"projected_circle_{i+1}"
+                            ))
+                            feature_id += 1
+                            
+                            # 限制提取的圓形數量，避免太多
+                            if i >= 10:
+                                break
+                        except:
+                            continue
                 except Exception as e:
-                    print(f"[CAD Kernel] Error exporting to DXF: {e}")
-                    # 清理臨時檔案
-                    if os.path.exists(temp_dxf):
-                        os.unlink(temp_dxf)
-                    # 回退到邊界框方法
-                    return self._project_from_bbox()
+                    print(f"[CAD Kernel] Warning: Could not extract circles from edges: {e}")
+                
+                # 如果沒有提取到圓形，添加一個預設的中心圓
+                if len([f for f in features_2d if f.type == 'circle']) == 0:
+                    features_2d.append(GeometricFeature(
+                        f"F{feature_id:02d}",
+                        "circle",
+                        {'radius': min(width, height) * 0.1, 'x': center_x, 'y': center_y},
+                        "projected_center_feature"
+                    ))
+                
+                print(f"[CAD Kernel] Generated {len(features_2d)} 2D projection features")
+                return features_2d
                 
             except Exception as e:
                 print(f"[CAD Kernel] Error in 2D projection: {e}")
-                import traceback
-                traceback.print_exc()
-                # 回退到邊界框方法
-                return self._project_from_bbox()
+                # 回退到原始特徵
+                return self.features
         
         # 如果沒有 3D 模型或投影失敗，使用原始特徵
         return self.features
-    
-    def _project_from_bbox(self) -> List[GeometricFeature]:
-        """
-        從邊界框生成基本的 2D 投影（備用方法）
-        """
-        features_2d = []
-        feature_id = 1
-        
-        try:
-            bbox = self.cad_model.val().BoundingBox()
-            width = bbox.xmax - bbox.xmin
-            height = bbox.ymax - bbox.ymin
-            center_x = (bbox.xmin + bbox.xmax) / 2
-            center_y = (bbox.ymin + bbox.ymax) / 2
-            
-            # 添加外框
-            features_2d.append(GeometricFeature(
-                f"F{feature_id:02d}",
-                "rect",
-                {'w': width, 'h': height, 'x': center_x, 'y': center_y},
-                "projected_outline"
-            ))
-        except:
-            pass
-        
-        return features_2d if features_2d else self.features
-    
-    def _extract_features_from_dxf(self, dxf_file: str) -> List[GeometricFeature]:
-        """
-        從 DXF 檔案中提取幾何特徵
-        """
-        features = []
-        feature_id = 1
-        
-        try:
-            doc = ezdxf.readfile(dxf_file)
-            msp = doc.modelspace()
-            
-            # 提取所有實體
-            for entity in msp:
-                try:
-                    if entity.dxftype() == 'CIRCLE':
-                        center = entity.dxf.center
-                        radius = entity.dxf.radius
-                        features.append(GeometricFeature(
-                            f"F{feature_id:02d}",
-                            "circle",
-                            {'radius': float(radius), 'x': float(center.x), 'y': float(center.y)},
-                            f"circle_{feature_id}"
-                        ))
-                        feature_id += 1
-                    elif entity.dxftype() == 'LWPOLYLINE':
-                        # 提取多段線的邊界框作為矩形
-                        vertices = list(entity.vertices())
-                        if len(vertices) >= 2:
-                            x_coords = [float(v[0]) for v in vertices]
-                            y_coords = [float(v[1]) for v in vertices]
-                            xmin, xmax = min(x_coords), max(x_coords)
-                            ymin, ymax = min(y_coords), max(y_coords)
-                            width = xmax - xmin
-                            height = ymax - ymin
-                            center_x = (xmin + xmax) / 2
-                            center_y = (ymin + ymax) / 2
-                            
-                            # 如果寬高比接近 1:1，可能是正方形
-                            if abs(width - height) < max(width, height) * 0.1:
-                                features.append(GeometricFeature(
-                                    f"F{feature_id:02d}",
-                                    "rect",
-                                    {'w': width, 'h': height, 'x': center_x, 'y': center_y},
-                                    f"polyline_rect_{feature_id}"
-                                ))
-                                feature_id += 1
-                    elif entity.dxftype() == 'LINE':
-                        # 線條暫時跳過，或可以轉換為多段線
-                        pass
-                except Exception as e:
-                    # 跳過無法處理的實體
-                    continue
-            
-            print(f"[CAD Kernel] Extracted {len(features)} features from DXF")
-            return features
-            
-        except Exception as e:
-            print(f"[CAD Kernel] Error reading DXF: {e}")
-            return []
 
 # ==========================================
 # 2. AI 語意解析層 (The "Brain")
@@ -408,26 +1017,39 @@ class AutoDraftingSystem:
         self.cad = MockCADEngine(model_file)
         self.ai = AIIntentParser()
 
-    def process_request(self, user_prompt: str, output_filename: Optional[str] = None):
+    def display_model_info(self) -> bool:
         """
-        處理用戶請求，生成 2D 工程圖
+        顯示載入的模型資訊
+        返回 True 表示有資訊顯示，False 表示無資訊
+        """
+        return self.cad.display_info()
+
+    def show_info_window(self):
+        """
+        開啟獨立視窗顯示完整的圖檔資訊
+        包含 BOM、來源軟體、零件、單位等
+        """
+        return self.cad.show_info_window()
+
+    def save_info_to_file(self, output_dir: str = "output") -> str:
+        """
+        將圖檔資訊儲存到檔案
         Args:
-            user_prompt: 用戶指令
-            output_filename: 輸出檔案名稱，如果為 None 則根據 3D 檔案名稱自動生成
+            output_dir: 輸出目錄，預設為 "output"
+        Returns:
+            輸出檔案的完整路徑
         """
-        # 1. 如果載入了 3D 檔案，先顯示 3D 預覽
-        if self.cad.model_file and os.path.exists(self.cad.model_file):
-            print(f"[System] 顯示 3D 模型預覽...")
-            EngineeringViewer.view_3d_stl(self.cad.model_file)
-        
-        # 2. AI 解析
+        return self.cad.save_info_to_file(output_dir)
+
+    def process_request(self, user_prompt: str, output_filename="output.dxf"):
+        # 1. AI 解析
         instruction = self.ai.parse_instruction(user_prompt, self.cad.features)
         
         if "error" in instruction:
             print(f"Error: {instruction['error']}")
             return
 
-        # 3. 執行修改
+        # 2. 執行修改
         print(f"Executing: {instruction}")
         self.cad.modify_feature(
             instruction["target_id"], 
@@ -436,28 +1058,13 @@ class AutoDraftingSystem:
             instruction["operation"]
         )
 
-        # 4. 生成 2D 視圖
+        # 3. 生成 2D 視圖
         projection_data = self.cad.project_to_2d()
 
-        # 5. 確定輸出檔案名稱
-        if output_filename is None:
-            if self.cad.model_file:
-                # 使用原檔名，但改為 .dxf 副檔名
-                base_name = os.path.splitext(os.path.basename(self.cad.model_file))[0]
-                output_dir = "output"
-                # 確保 output 目錄存在
-                if not os.path.exists(output_dir):
-                    os.makedirs(output_dir)
-                    print(f"[System] 創建輸出目錄: {output_dir}")
-                output_filename = os.path.join(output_dir, f"{base_name}.dxf")
-            else:
-                output_filename = "output.dxf"
-        
-        # 6. 輸出 DXF 圖檔
+        # 4. 輸出 DXF 圖檔
         self._export_dxf(projection_data, output_filename)
         
-        # 7. 顯示 2D 工程圖
-        print(f"[System] 顯示 2D 工程圖...")
+        # 5. 自動開啟生成的檔案
         self._open_file(output_filename)
 
     def _export_dxf(self, features: List[GeometricFeature], filename: str):
@@ -509,9 +1116,9 @@ class AutoDraftingSystem:
         file_ext = os.path.splitext(filename)[1].lower()
         
         try:
-            # 如果是 DXF/DWG 檔案，使用 EngineeringViewer 開啟
-            if file_ext in ['.dxf', '.dwg']:
-                print(f"[System] Opening {file_ext.upper()} file with EngineeringViewer: {filename}")
+            # 如果是 DXF 檔案，使用 EngineeringViewer 開啟
+            if file_ext == '.dxf':
+                print(f"[System] Opening DXF file with EngineeringViewer: {filename}")
                 EngineeringViewer.view_2d_dxf(filename)
             # 如果是 STL 檔案，使用 3D 檢視器
             elif file_ext == '.stl':
@@ -539,40 +1146,27 @@ def select_3d_file() -> Optional[str]:
     開啟檔案選擇對話框，讓使用者選擇 3D 模型檔案
     返回選取的檔案路徑，如果取消則返回 None
     """
-    root = None
-    try:
-        # 隱藏主視窗（只顯示對話框）
-        root = Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        
-        # 開啟檔案選擇對話框
-        file_path = filedialog.askopenfilename(
-            title="選擇 3D 模型檔案",
-            filetypes=[
-                ("STEP 檔案", "*.step *.stp"),
-                ("STL 檔案", "*.stl"),
-                ("所有檔案", "*.*")
-            ],
-            initialdir=os.getcwd()
-        )
-        
-        if file_path:
-            return file_path
-        return None
-    except KeyboardInterrupt:
-        print("\n[System] 使用者中斷檔案選擇")
-        return None
-    except Exception as e:
-        print(f"[Error] 檔案選擇對話框錯誤: {e}")
-        return None
-    finally:
-        # 確保視窗被正確關閉
-        if root is not None:
-            try:
-                root.destroy()
-            except:
-                pass
+    # 隱藏主視窗（只顯示對話框）
+    root = Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    
+    # 開啟檔案選擇對話框
+    file_path = filedialog.askopenfilename(
+        title="選擇 3D 模型檔案",
+        filetypes=[
+            ("STEP 檔案", "*.step *.stp"),
+            ("STL 檔案", "*.stl"),
+            ("所有檔案", "*.*")
+        ],
+        initialdir=os.getcwd()
+    )
+    
+    root.destroy()
+    
+    if file_path:
+        return file_path
+    return None
 
 # ==========================================
 # 5. 執行範例
@@ -581,122 +1175,166 @@ if __name__ == "__main__":
     print("=" * 50)
     print("自動繪圖系統 (Auto Drafter System)")
     print("=" * 50)
-    
+
+    # 建立主視窗（隱藏）供後續對話框使用
+    root = Tk()
+    root.withdraw()
+
     # 讓使用者選擇 3D 模型檔案
     print("\n請選擇 3D 模型檔案...")
     model_file = select_3d_file()
-    
+
     if model_file:
         print(f"[System] 已選擇檔案: {model_file}")
     else:
         print("[System] 未選擇檔案，將使用模擬資料")
-    
+
     # 初始化系統
     system = AutoDraftingSystem(model_file=model_file)
-    
-    # ==========================================
-    # 修改指令部分（已註解，直接轉換 3D 到 2D）
-    # ==========================================
-    # 使用者輸入（可以改為從命令列參數或輸入取得）
-    # print("\n請輸入修改指令（或按 Enter 使用預設指令）:")
-    # try:
-    #     user_input = input().strip()
-    # except (EOFError, KeyboardInterrupt):
-    #     # 非互動模式或使用者取消，使用預設指令
-    #     user_input = ""
-    #     print("\n使用預設指令")
-    # 
-    # if not user_input:
-    #     # 預設指令
-    #     user_input = "中間的孔太小了，請把它變成2倍大"
-    #     print(f"使用預設指令: {user_input}")
-    # 
-    # # 處理請求並生成 DXF 檔案（output_filename 為 None，會自動根據 3D 檔案名稱生成）
-    # system.process_request(user_input, output_filename=None)
-    
-    # ==========================================
-    # 直接轉換 3D 到 2D（不修改原圖內容）
-    # ==========================================
-    if model_file:
-        # 1. 先顯示 3D 模型預覽
-        print(f"\n[System] 顯示 3D 模型預覽...")
-        EngineeringViewer.view_3d_stl(model_file)
-        
-        # 2. 直接轉換 3D 模型到 2D 工程圖（不修改原圖內容）
-        print(f"\n[System] 直接轉換 3D 模型到 2D 工程圖（不修改原圖）...")
-        
-        # 3. 確定輸出檔案名稱（儲存到 output 目錄）
-        base_name = os.path.splitext(os.path.basename(model_file))[0]
-        output_dir = "output"
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-            print(f"[System] 創建輸出目錄: {output_dir}")
-        output_filename = os.path.join(output_dir, f"{base_name}.dxf")
-        print(f"[System] 輸出檔案: {output_filename}")
-        
-        # 4. 直接使用 CadQuery 導出 DXF（最快最簡單的方法）
-        if CADQUERY_AVAILABLE and system.cad.cad_model is not None:
-            print(f"[System] 使用 CadQuery 直接導出 DXF...")
-            try:
-                cq.exporters.export(system.cad.cad_model, output_filename, "DXF")
-                print(f"[Success] DXF 檔案已直接導出")
-                
-                # 確認檔案是否成功建立
-                if os.path.exists(output_filename):
-                    file_size = os.path.getsize(output_filename)
-                    print(f"[Success] DXF 檔案已成功儲存: {output_filename} ({file_size} bytes)")
-                    
-                    # 5. 顯示 2D 工程圖
-                    print(f"[System] 顯示 2D 工程圖...")
-                    try:
-                        system._open_file(output_filename)
-                        print(f"[Success] 2D 工程圖視窗已開啟")
-                    except Exception as e:
-                        print(f"[Error] 顯示 2D 工程圖時發生錯誤: {e}")
-                        import traceback
-                        traceback.print_exc()
-                else:
-                    print(f"[Error] DXF 檔案導出失敗，檔案不存在: {output_filename}")
-            except Exception as e:
-                print(f"[Error] 直接導出 DXF 失敗: {e}")
-                import traceback
-                traceback.print_exc()
-                print(f"[System] 嘗試使用特徵提取方法...")
-                # 回退到特徵提取方法
-                try:
-                    projection_data = system.cad.project_to_2d()
-                    print(f"[System] 2D 投影完成，提取到 {len(projection_data)} 個特徵")
-                    
-                    if projection_data and len(projection_data) > 0:
-                        # 輸出 DXF 圖檔
-                        print(f"[System] 正在儲存 DXF 檔案到: {output_filename}")
-                        system._export_dxf(projection_data, output_filename)
-                        
-                        # 確認檔案是否成功建立
-                        if os.path.exists(output_filename):
-                            file_size = os.path.getsize(output_filename)
-                            print(f"[Success] DXF 檔案已成功儲存: {output_filename} ({file_size} bytes)")
-                            
-                            # 顯示 2D 工程圖
-                            print(f"[System] 顯示 2D 工程圖...")
-                            try:
-                                system._open_file(output_filename)
-                                print(f"[Success] 2D 工程圖視窗已開啟")
-                            except Exception as e2:
-                                print(f"[Error] 顯示 2D 工程圖時發生錯誤: {e2}")
-                                import traceback
-                                traceback.print_exc()
-                    else:
-                        print(f"[Error] 無法提取 2D 特徵，投影資料為空")
-                except Exception as e2:
-                    print(f"[Error] 特徵提取方法也失敗: {e2}")
-                    import traceback
-                    traceback.print_exc()
-        else:
-            print(f"[Error] CadQuery 不可用或沒有載入 3D 模型")
+
+    # 讀取並完整顯示圖檔資訊（控制台簡要輸出）
+    has_info = system.display_model_info()
+
+    if not has_info:
+        print("[System] 警告：無法取得圖檔資訊")
+
+    # 將圖檔資訊儲存到 output 目錄
+    info_file = system.save_info_to_file("output")
+
+    # 開啟獨立視窗顯示完整資訊
+    print("[System] 開啟圖檔資訊視窗...")
+    print("請檢視資訊後關閉視窗繼續...")
+
+    # 建立資訊視窗（使用 root 作為父視窗）
+    info = system.cad.get_model_info()
+
+    info_window = Toplevel(root)
+    info_window.title("圖檔資訊 (Model Information)")
+    info_window.geometry("700x800")
+    info_window.configure(bg='#f0f0f0')
+    info_window.attributes('-topmost', True)
+    info_window.focus_force()
+
+    # 建立主框架
+    main_frame = Frame(info_window, bg='#f0f0f0')
+    main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    # 標題
+    title_label = Label(main_frame, text="圖檔完整資訊", font=('Microsoft JhengHei', 16, 'bold'),
+                       bg='#f0f0f0', fg='#333333')
+    title_label.pack(pady=(0, 10))
+
+    # 建立文字區域框架
+    text_frame = Frame(main_frame, bg='#ffffff', relief=tk.SUNKEN, bd=1)
+    text_frame.pack(fill=tk.BOTH, expand=True)
+
+    scrollbar = Scrollbar(text_frame)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    text_widget = Text(text_frame, wrap=tk.WORD, font=('Consolas', 10),
+                      yscrollcommand=scrollbar.set, bg='#ffffff', fg='#333333',
+                      padx=10, pady=10)
+    text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.config(command=text_widget.yview)
+
+    # 填入資訊內容
+    def format_value(value):
+        if value is not None and value != "" and value != []:
+            return str(value)
+        return "無資訊"
+
+    content = []
+    content.append("=" * 60)
+    content.append("圖檔資訊報告 (Model Information Report)")
+    content.append("=" * 60)
+    content.append("")
+    content.append("【基本檔案資訊】")
+    content.append("-" * 60)
+    content.append(f"    檔案路徑: {format_value(info.get('model_file'))}")
+    content.append(f"    檔案名稱: {format_value(info.get('file_name'))}")
+    content.append(f"    檔案格式: {format_value(info.get('file_extension'))}")
+    content.append(f"    檔案大小: {format_value(info.get('file_size'))}")
+    content.append(f"    3D 模型狀態: {'已載入' if info.get('has_model') else '未載入'}")
+    content.append("")
+    content.append("【來源軟體與元資料】")
+    content.append("-" * 60)
+    content.append(f"    來源軟體: {format_value(info.get('source_software'))}")
+    content.append(f"    作者: {format_value(info.get('author'))}")
+    content.append(f"    組織: {format_value(info.get('organization'))}")
+    content.append(f"    建立日期: {format_value(info.get('creation_date'))}")
+    content.append(f"    產品名稱: {format_value(info.get('product_name'))}")
+    content.append(f"    描述: {format_value(info.get('description'))}")
+    content.append("")
+    content.append("【單位資訊】")
+    content.append("-" * 60)
+    content.append(f"    長度單位: {format_value(info.get('units'))}")
+    content.append("")
+    content.append("【幾何統計資訊】")
+    content.append("-" * 60)
+    content.append(f"    實體數量: {info.get('solid_count', 0) or '無資訊'}")
+    content.append(f"    面數量: {info.get('face_count', 0) or '無資訊'}")
+    content.append(f"    邊數量: {info.get('edge_count', 0) or '無資訊'}")
+    content.append(f"    頂點數量: {info.get('vertex_count', 0) or '無資訊'}")
+    if info.get("volume"):
+        content.append(f"    體積: {info['volume']:.4f}")
+    if info.get("surface_area"):
+        content.append(f"    表面積: {info['surface_area']:.4f}")
+    content.append("")
+    bbox = info.get("bounding_box")
+    if bbox:
+        content.append("【邊界框資訊】")
+        content.append("-" * 60)
+        content.append(f"    寬度: {bbox['width']:.2f}, 高度: {bbox['height']:.2f}, 深度: {bbox['depth']:.2f}")
+        content.append("")
+    content.append("【BOM 材料清單】")
+    content.append("-" * 60)
+    bom = info.get("bom", [])
+    if bom:
+        for item in bom:
+            content.append(f"    {item.get('item', 1)}. {item.get('name', '未命名')} x {item.get('quantity', 1)}")
     else:
-        print("[System] 未選擇 3D 檔案，無法轉換")
-    
+        content.append("    無資訊")
+    content.append("")
+    content.append("【幾何特徵】")
+    content.append("-" * 60)
+    features = info.get("features", [])
+    content.append(f"    共 {len(features)} 個特徵")
+    content.append("")
+    content.append("=" * 60)
+
+    text_widget.insert(tk.END, '\n'.join(content))
+    text_widget.config(state=tk.DISABLED)
+
+    # 關閉按鈕
+    close_button = Button(main_frame, text="關閉視窗繼續", font=('Microsoft JhengHei', 10),
+                         command=info_window.destroy, bg='#4a90d9', fg='white',
+                         padx=20, pady=5)
+    close_button.pack(pady=10)
+
+    # 等待視窗關閉
+    root.wait_window(info_window)
+
+    print("[System] 圖檔資訊視窗已關閉，繼續執行...")
+
+    # 繼續執行後續操作
+    print("\n請輸入修改指令（或按 Enter 使用預設指令）:")
+    try:
+        user_input = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        user_input = ""
+        print("\n使用預設指令")
+
+    if not user_input:
+        user_input = "中間的孔太小了，請把它變成2倍大"
+        print(f"使用預設指令: {user_input}")
+
+    # 處理請求並生成 DXF 檔案
+    output_filename = "output/modified_part.dxf"
+    system.process_request(user_input, output_filename)
+
     print("\n" + "=" * 50)
     print("處理完成！")
     print("=" * 50)
+
+    # 清理
+    root.destroy()
