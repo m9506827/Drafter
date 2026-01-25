@@ -4,6 +4,8 @@ import os
 import subprocess
 import platform
 import threading
+import logging
+from datetime import datetime
 import ezdxf
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
@@ -11,14 +13,79 @@ import tkinter as tk
 from tkinter import filedialog, Tk, Toplevel, Text, Scrollbar, Frame, Label, Button
 from simple_viewer import EngineeringViewer
 
+# ==========================================
+# 日誌設定 (Logging Configuration)
+# ==========================================
+
+def setup_logging():
+    """
+    設定日誌系統
+    日誌檔案儲存在 logs/yyyymmdd.log
+    """
+    # 建立 logs 目錄
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    # 生成日誌檔案名稱 (yyyymmdd.log)
+    today = datetime.now().strftime("%Y%m%d")
+    log_file = os.path.join(log_dir, f"{today}.log")
+
+    # 設定日誌格式
+    log_format = "%(asctime)s [%(levelname)s] %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+
+    # 建立 logger
+    logger = logging.getLogger("AutoDrafter")
+    logger.setLevel(logging.DEBUG)
+
+    # 清除現有的 handlers（避免重複）
+    if logger.handlers:
+        logger.handlers.clear()
+
+    # 檔案 handler
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(log_format, date_format))
+
+    # 控制台 handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter(log_format, date_format))
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+# 初始化 logger
+logger = setup_logging()
+
+def log_print(message: str, level: str = "info"):
+    """
+    同時輸出到控制台和日誌檔案
+    Args:
+        message: 要輸出的訊息
+        level: 日誌級別 (debug, info, warning, error)
+    """
+    print(message)
+    if level == "debug":
+        logger.debug(message)
+    elif level == "warning":
+        logger.warning(message)
+    elif level == "error":
+        logger.error(message)
+    else:
+        logger.info(message)
+
 # 延遲導入 cadquery，避免啟動時的導入錯誤
 try:
     import cadquery as cq
     CADQUERY_AVAILABLE = True
 except ImportError as e:
     CADQUERY_AVAILABLE = False
-    print(f"[Warning] CadQuery not available: {e}")
-    print("[Warning] 3D file loading will be disabled. Using mock data only.")
+    logger.warning(f"CadQuery not available: {e}")
+    logger.warning("3D file loading will be disabled. Using mock data only.")
 
 # ==========================================
 # 1. 核心資料結構 (模擬 3D CAD 實體)
@@ -56,7 +123,7 @@ class MockCADEngine:
                 GeometricFeature("F01", "rect", {'w': 100, 'h': 100, 'x': 0, 'y': 0}, "base_plate"),
                 GeometricFeature("F02", "circle", {'radius': 10, 'x': 0, 'y': 0}, "center_hole")
             ]
-            print("[CAD Kernel] Using mock data (no 3D file loaded)")
+            log_print("[CAD Kernel] Using mock data (no 3D file loaded)")
     
     def load_3d_file(self, filename: str):
         """
@@ -68,8 +135,8 @@ class MockCADEngine:
         
         # 檢查 cadquery 是否可用
         if not CADQUERY_AVAILABLE:
-            print(f"[CAD Kernel] Warning: CadQuery not available, cannot load 3D file")
-            print(f"[CAD Kernel] Falling back to mock data")
+            log_print("[CAD Kernel] Warning: CadQuery not available, cannot load 3D file", "warning")
+            log_print("[CAD Kernel] Falling back to mock data", "warning")
             self.features = [
                 GeometricFeature("F01", "rect", {'w': 100, 'h': 100, 'x': 0, 'y': 0}, "base_plate"),
                 GeometricFeature("F02", "circle", {'radius': 10, 'x': 0, 'y': 0}, "center_hole")
@@ -77,17 +144,17 @@ class MockCADEngine:
             return
         
         file_ext = os.path.splitext(filename)[1].lower()
-        print(f"[CAD Kernel] Loading 3D file: {filename} ({file_ext})")
+        log_print(f"[CAD Kernel] Loading 3D file: {filename} ({file_ext})")
         
         try:
             if file_ext in ['.step', '.stp']:
                 # 讀取 STEP 檔案
                 self.cad_model = cq.importers.importStep(filename)
-                print(f"[CAD Kernel] STEP file loaded successfully")
+                log_print("[CAD Kernel] STEP file loaded successfully")
             elif file_ext == '.stl':
                 # STL 是網格格式，需要轉換
                 # 注意：STL 無法直接轉換為參數化特徵，這裡僅做基本處理
-                print(f"[CAD Kernel] Warning: STL files are mesh-based, feature extraction may be limited")
+                log_print("[CAD Kernel] Warning: STL files are mesh-based, feature extraction may be limited", "warning")
                 # 可以考慮使用 pyvista 讀取，但這裡先跳過
                 raise NotImplementedError("STL file support requires additional processing")
             else:
@@ -95,11 +162,11 @@ class MockCADEngine:
             
             # 從 3D 模型中提取特徵
             self.features = self._extract_features()
-            print(f"[CAD Kernel] Extracted {len(self.features)} features from 3D model")
-            
+            log_print(f"[CAD Kernel] Extracted {len(self.features)} features from 3D model")
+
         except Exception as e:
-            print(f"[CAD Kernel] Error loading file: {e}")
-            print(f"[CAD Kernel] Falling back to mock data")
+            log_print(f"[CAD Kernel] Error loading file: {e}", "error")
+            log_print("[CAD Kernel] Falling back to mock data", "warning")
             self.features = [
                 GeometricFeature("F01", "rect", {'w': 100, 'h': 100, 'x': 0, 'y': 0}, "base_plate"),
                 GeometricFeature("F02", "circle", {'radius': 10, 'x': 0, 'y': 0}, "center_hole")
@@ -158,7 +225,7 @@ class MockCADEngine:
                     except:
                         pass
             except Exception as e:
-                print(f"[CAD Kernel] Warning: Could not extract circular features: {e}")
+                log_print(f"[CAD Kernel] Warning: Could not extract circular features: {e}", "warning")
                 # 添加一個預設的中心孔
                 features.append(GeometricFeature(
                     f"F{feature_id:02d}",
@@ -168,7 +235,7 @@ class MockCADEngine:
                 ))
             
         except Exception as e:
-            print(f"[CAD Kernel] Error extracting features: {e}")
+            log_print(f"[CAD Kernel] Error extracting features: {e}", "error")
             # 返回基本特徵
             features = [
                 GeometricFeature("F01", "rect", {'w': 100, 'h': 100, 'x': 0, 'y': 0}, "base_plate"),
@@ -193,7 +260,7 @@ class MockCADEngine:
                 else: # set
                     f.params[parameter] = value
                 
-                print(f"[CAD Kernel] Modified {f.description}: {parameter} -> {f.params[parameter]}")
+                log_print(f"[CAD Kernel] Modified {f.description}: {parameter} -> {f.params[parameter]}")
                 return True
         return False
 
@@ -259,7 +326,7 @@ class MockCADEngine:
                     "depth": bbox.zmax - bbox.zmin
                 }
             except Exception as e:
-                print(f"[CAD Kernel] Warning: Could not get bounding box: {e}")
+                log_print(f"[CAD Kernel] Warning: Could not get bounding box: {e}", "warning")
 
             # 嘗試獲取幾何統計資訊
             try:
@@ -303,7 +370,7 @@ class MockCADEngine:
                     info["vertex_count"] = vertex_count
 
                 except Exception as e:
-                    print(f"[CAD Kernel] Warning: Could not count topology: {e}")
+                    log_print(f"[CAD Kernel] Warning: Could not count topology: {e}", "warning")
 
                 # 嘗試計算體積和表面積
                 try:
@@ -318,10 +385,10 @@ class MockCADEngine:
                     BRepGProp.SurfaceProperties_s(shape.wrapped, surf_props)
                     info["surface_area"] = surf_props.Mass()
                 except Exception as e:
-                    print(f"[CAD Kernel] Warning: Could not calculate volume/area: {e}")
+                    log_print(f"[CAD Kernel] Warning: Could not calculate volume/area: {e}", "warning")
 
             except Exception as e:
-                print(f"[CAD Kernel] Warning: Could not get geometry stats: {e}")
+                log_print(f"[CAD Kernel] Warning: Could not get geometry stats: {e}", "warning")
 
             # 嘗試從 STEP 檔案讀取元資料
             if self.model_file and info["file_extension"] in ['.step', '.stp']:
@@ -451,7 +518,7 @@ class MockCADEngine:
                     break
 
         except Exception as e:
-            print(f"[CAD Kernel] Warning: Could not extract STEP metadata: {e}")
+            log_print(f"[CAD Kernel] Warning: Could not extract STEP metadata: {e}", "warning")
 
         return info
 
@@ -463,31 +530,31 @@ class MockCADEngine:
         """
         info = self.get_model_info()
 
-        print("\n" + "=" * 50)
-        print("圖檔資訊 (Model Information)")
-        print("=" * 50)
+        log_print("\n" + "=" * 50)
+        log_print("圖檔資訊 (Model Information)")
+        log_print("=" * 50)
 
         # 檢查是否有資訊可顯示
         if not info["features"] and info["bounding_box"] is None:
-            print("無資訊")
-            print("=" * 50 + "\n")
+            log_print("無資訊")
+            log_print("=" * 50 + "\n")
             return False
 
         # 顯示檔案資訊
         if info["model_file"]:
-            print(f"\n檔案路徑: {info['model_file']}")
-            print(f"   檔案名稱: {os.path.basename(info['model_file'])}")
+            log_print(f"\n檔案路徑: {info['model_file']}")
+            log_print(f"   檔案名稱: {os.path.basename(info['model_file'])}")
         else:
-            print("\n檔案: 使用模擬資料 (Mock Data)")
+            log_print("\n檔案: 使用模擬資料 (Mock Data)")
 
         # 顯示 3D 模型狀態
         if info["has_model"]:
-            print(f"   3D 模型: 已載入")
+            log_print(f"   3D 模型: 已載入")
         else:
-            print(f"   3D 模型: 未載入 (使用特徵資料)")
+            log_print(f"   3D 模型: 未載入 (使用特徵資料)")
 
-        print(f"\n詳細資訊將在獨立視窗中顯示...")
-        print("=" * 50 + "\n")
+        log_print(f"\n詳細資訊將在獨立視窗中顯示...")
+        log_print("=" * 50 + "\n")
         return True
 
     def show_info_window(self):
@@ -709,7 +776,7 @@ class MockCADEngine:
         # 確保輸出目錄存在
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-            print(f"[System] 建立輸出目錄: {output_dir}")
+            log_print(f"[System] 建立輸出目錄: {output_dir}")
 
         # 生成輸出檔名
         if info.get("file_name"):
@@ -862,10 +929,10 @@ class MockCADEngine:
         try:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines))
-            print(f"[System] 圖檔資訊已儲存至: {output_path}")
+            log_print(f"[System] 圖檔資訊已儲存至: {output_path}")
             return output_path
         except Exception as e:
-            print(f"[System] 儲存圖檔資訊失敗: {e}")
+            log_print(f"[System] 儲存圖檔資訊失敗: {e}", "error")
             return None
 
     def project_to_2d(self) -> List[GeometricFeature]:
@@ -873,7 +940,7 @@ class MockCADEngine:
         真正的 3D 轉 2D 投影運算
         使用 CadQuery 將 3D 模型投影到 XY 平面（俯視圖）
         """
-        print("[CAD Kernel] Projecting 3D model to 2D plane...")
+        log_print("[CAD Kernel] Projecting 3D model to 2D plane...")
         
         # 如果有 3D 模型，進行真正的投影
         if self.cad_model is not None and CADQUERY_AVAILABLE:
@@ -936,7 +1003,7 @@ class MockCADEngine:
                         except:
                             continue
                 except Exception as e:
-                    print(f"[CAD Kernel] Warning: Could not extract circles from edges: {e}")
+                    log_print(f"[CAD Kernel] Warning: Could not extract circles from edges: {e}", "warning")
                 
                 # 如果沒有提取到圓形，添加一個預設的中心圓
                 if len([f for f in features_2d if f.type == 'circle']) == 0:
@@ -947,11 +1014,11 @@ class MockCADEngine:
                         "projected_center_feature"
                     ))
                 
-                print(f"[CAD Kernel] Generated {len(features_2d)} 2D projection features")
+                log_print(f"[CAD Kernel] Generated {len(features_2d)} 2D projection features")
                 return features_2d
                 
             except Exception as e:
-                print(f"[CAD Kernel] Error in 2D projection: {e}")
+                log_print(f"[CAD Kernel] Error in 2D projection: {e}", "error")
                 # 回退到原始特徵
                 return self.features
         
@@ -968,7 +1035,7 @@ class AIIntentParser:
     實際應用中，這裡會呼叫 OpenAI API
     """
     def parse_instruction(self, user_prompt: str, context_features: List[GeometricFeature]) -> dict:
-        print(f"[AI Agent] Analyzing prompt: '{user_prompt}'")
+        log_print(f"[AI Agent] Analyzing prompt: '{user_prompt}'")
         
         # --- 模擬 LLM 的推理過程 ---
         # 規則：如果 prompt 包含 "大" 和 "孔"，且有 "倍"，則解析為縮放操作
@@ -1046,11 +1113,11 @@ class AutoDraftingSystem:
         instruction = self.ai.parse_instruction(user_prompt, self.cad.features)
         
         if "error" in instruction:
-            print(f"Error: {instruction['error']}")
+            log_print(f"Error: {instruction['error']}", "error")
             return
 
         # 2. 執行修改
-        print(f"Executing: {instruction}")
+        log_print(f"Executing: {instruction}")
         self.cad.modify_feature(
             instruction["target_id"], 
             instruction["parameter"], 
@@ -1072,7 +1139,7 @@ class AutoDraftingSystem:
         doc = ezdxf.new()
         msp = doc.modelspace()
 
-        print(f"[DXF Gen] Drawing {len(features)} entities...")
+        log_print(f"[DXF Gen] Drawing {len(features)} entities...")
         
         for f in features:
             if f.type == 'rect':
@@ -1101,7 +1168,7 @@ class AutoDraftingSystem:
             msp.add_text(f"R{r:.1f}", height=2.5).set_placement((r, r))
 
         doc.saveas(filename)
-        print(f"[Success] Saved drawing to {filename}")
+        log_print(f"[Success] Saved drawing to {filename}")
     
     def _open_file(self, filename: str):
         """
@@ -1110,7 +1177,7 @@ class AutoDraftingSystem:
         其他格式使用系統預設程式開啟
         """
         if not os.path.exists(filename):
-            print(f"[Warning] File not found: {filename}")
+            log_print(f"[Warning] File not found: {filename}", "warning")
             return
         
         file_ext = os.path.splitext(filename)[1].lower()
@@ -1118,11 +1185,11 @@ class AutoDraftingSystem:
         try:
             # 如果是 DXF 檔案，使用 EngineeringViewer 開啟
             if file_ext == '.dxf':
-                print(f"[System] Opening DXF file with EngineeringViewer: {filename}")
+                log_print(f"[System] Opening DXF file with EngineeringViewer: {filename}")
                 EngineeringViewer.view_2d_dxf(filename)
             # 如果是 STL 檔案，使用 3D 檢視器
             elif file_ext == '.stl':
-                print(f"[System] Opening STL file with EngineeringViewer: {filename}")
+                log_print(f"[System] Opening STL file with EngineeringViewer: {filename}")
                 EngineeringViewer.view_3d_stl(filename)
             # 其他格式使用系統預設程式開啟
             else:
@@ -1133,9 +1200,9 @@ class AutoDraftingSystem:
                     subprocess.run(["open", filename])
                 else:  # Linux
                     subprocess.run(["xdg-open", filename])
-                print(f"[System] Opened file with system default: {filename}")
+                log_print(f"[System] Opened file with system default: {filename}")
         except Exception as e:
-            print(f"[Warning] Could not open file: {e}")
+            log_print(f"[Warning] Could not open file: {e}", "warning")
 
 # ==========================================
 # 4. 輔助函數：檔案選擇對話框
@@ -1172,22 +1239,25 @@ def select_3d_file() -> Optional[str]:
 # 5. 執行範例
 # ==========================================
 if __name__ == "__main__":
-    print("=" * 50)
-    print("自動繪圖系統 (Auto Drafter System)")
-    print("=" * 50)
+    # 記錄程式開始時間
+    start_time = datetime.now()
+    log_print("=" * 50)
+    log_print("自動繪圖系統 (Auto Drafter System)")
+    log_print(f"程式啟動時間: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log_print("=" * 50)
 
     # 建立主視窗（隱藏）供後續對話框使用
     root = Tk()
     root.withdraw()
 
     # 讓使用者選擇 3D 模型檔案
-    print("\n請選擇 3D 模型檔案...")
+    log_print("\n請選擇 3D 模型檔案...")
     model_file = select_3d_file()
 
     if model_file:
-        print(f"[System] 已選擇檔案: {model_file}")
+        log_print(f"[System] 已選擇檔案: {model_file}")
     else:
-        print("[System] 未選擇檔案，將使用模擬資料")
+        log_print("[System] 未選擇檔案，將使用模擬資料")
 
     # 初始化系統
     system = AutoDraftingSystem(model_file=model_file)
@@ -1196,14 +1266,14 @@ if __name__ == "__main__":
     has_info = system.display_model_info()
 
     if not has_info:
-        print("[System] 警告：無法取得圖檔資訊")
+        log_print("[System] 警告：無法取得圖檔資訊", "warning")
 
     # 將圖檔資訊儲存到 output 目錄
     info_file = system.save_info_to_file("output")
 
     # 開啟獨立視窗顯示完整資訊
-    print("[System] 開啟圖檔資訊視窗...")
-    print("請檢視資訊後關閉視窗繼續...")
+    log_print("[System] 開啟圖檔資訊視窗...")
+    log_print("請檢視資訊後關閉視窗繼續...")
 
     # 建立資訊視窗（使用 root 作為父視窗）
     info = system.cad.get_model_info()
@@ -1314,27 +1384,33 @@ if __name__ == "__main__":
     # 等待視窗關閉
     root.wait_window(info_window)
 
-    print("[System] 圖檔資訊視窗已關閉，繼續執行...")
+    log_print("[System] 圖檔資訊視窗已關閉，繼續執行...")
 
     # 繼續執行後續操作
-    print("\n請輸入修改指令（或按 Enter 使用預設指令）:")
+    log_print("\n請輸入修改指令（或按 Enter 使用預設指令）:")
     try:
         user_input = input().strip()
     except (EOFError, KeyboardInterrupt):
         user_input = ""
-        print("\n使用預設指令")
+        log_print("\n使用預設指令")
 
     if not user_input:
         user_input = "中間的孔太小了，請把它變成2倍大"
-        print(f"使用預設指令: {user_input}")
+        log_print(f"使用預設指令: {user_input}")
 
     # 處理請求並生成 DXF 檔案
     output_filename = "output/modified_part.dxf"
     system.process_request(user_input, output_filename)
 
-    print("\n" + "=" * 50)
-    print("處理完成！")
-    print("=" * 50)
+    # 記錄程式結束時間
+    end_time = datetime.now()
+    elapsed_time = end_time - start_time
+
+    log_print("\n" + "=" * 50)
+    log_print("處理完成！")
+    log_print(f"程式結束時間: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log_print(f"總執行時間: {elapsed_time}")
+    log_print("=" * 50)
 
     # 清理
     root.destroy()
