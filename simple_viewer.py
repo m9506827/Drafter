@@ -315,10 +315,21 @@ class EngineeringViewer:
                 for entity in msp.query('CIRCLE'):
                     center = entity.dxf.center
                     radius = entity.dxf.radius
-                    circle = plt.Circle((center[0], center[1]), radius, 
+                    circle = plt.Circle((center[0], center[1]), radius,
                                        fill=False, edgecolor='black', linewidth=0.5)
                     ax.add_patch(circle)
-                
+
+                for entity in msp.query('TEXT'):
+                    insert = entity.dxf.insert
+                    text = entity.dxf.text
+                    height = entity.dxf.get('height', 10)
+                    rotation = entity.dxf.get('rotation', 0)
+                    ax.text(insert[0], insert[1], text,
+                            fontsize=max(6, height * 0.8),
+                            rotation=rotation,
+                            color='black',
+                            ha='left', va='bottom')
+
                 # 設定視圖
                 ax.set_xlim(xmin, xmax)
                 ax.set_ylim(ymin, ymax)
