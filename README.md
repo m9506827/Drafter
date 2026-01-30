@@ -4,14 +4,15 @@
 
 ## 功能特色
 
-- 🎨 **3D 模型檢視**：支援 STL、STEP/STP 格式的 3D 模型預覽（使用 PyVista）
-- 📐 **2D 工程圖檢視**：支援 DXF、DWG 格式的 2D 工程圖檢視（使用 Matplotlib）
-- 🔄 **自動轉換**：將 3D 模型自動轉換為 2D 工程圖（使用 CadQuery）
-- 🎯 **智能特徵提取**：自動從 3D 模型中提取幾何特徵（圓形、矩形、多段線等）
-- 🔀 **同時檢視**：支援同時顯示 3D 和 2D 視圖進行對比
-- 📁 **自動儲存**：轉換後的檔案自動儲存到 `output/` 目錄
-- 🖱️ **圖形化介面**：使用 Tkinter 提供檔案選擇對話框
-- 📋 **圖檔資訊視窗**：獨立視窗完整顯示圖檔資訊，包含 BOM、來源軟體、零件、單位等
+- **3D 模型檢視**：支援 STL、STEP/STP 格式的 3D 模型預覽（使用 PyVista）
+- **2D 工程圖檢視**：支援 DXF、DWG 格式的 2D 工程圖檢視（使用 Matplotlib）
+- **六方向投影**：自動生成 XY/XZ/YZ 三平面的直接投影與反向投影（共 6 張 DXF）
+- **完整邊緣提取**：使用 OCP TopExp_Explorer 遍歷複合體所有 solid 的邊，支援多實體組合件
+- **自動轉換**：將 3D 模型自動轉換為 2D 工程圖（使用 CadQuery + OCP）
+- **智能特徵提取**：自動從 3D 模型中提取幾何特徵（圓形、矩形、多段線等）
+- **Headless 測試**：支援無 GUI 的自動投影測試，可輸出 PNG 並與基準圖比對（SSIM）
+- **圖檔資訊視窗**：獨立視窗完整顯示圖檔資訊，包含 BOM、來源軟體、零件、單位等
+- **自動儲存**：轉換後的檔案自動儲存到 `output/` 目錄
 
 ## 系統需求
 
@@ -87,30 +88,44 @@ python simple_viewer.py 1-2.stp output/1-2.dxf
 - 自動調整視圖範圍和比例
 - 保留原始顏色（白色線條會自動轉為黑色以確保可見）
 
-### 3. 生成測試模型
+### 3. 投影測試（Headless）
 
 ```bash
-python generate_test_flange.py
+# 生成投影 + PNG（無 GUI）
+python test/test_projection.py
+
+# 將當前輸出存為基準圖
+python test/test_projection.py --save-reference
+
+# 之後每次執行會自動與基準圖比對 SSIM
+python test/test_projection.py
 ```
 
-生成一個測試用的法蘭（Flange）模型，輸出為 `test_flange.step` 和 `test_flange.stl`。
+**測試流程：**
+1. 載入 STEP 檔案，生成 6 方向 DXF 投影
+2. 每張 DXF 渲染為 PNG（存於 `test/output/`）
+3. 若 `test/reference/` 有基準圖，自動進行 SSIM 比對
+4. 輸出 PASS/FAIL 結果摘要
 
 ## 專案結構
 
 ```
 Drafter/
-├── auto_drafter_system.py    # 主要系統：3D 到 2D 自動轉換
-│   ├── MockCADEngine         # CAD 核心模擬器（3D 模型載入和特徵提取）
-│   ├── AIIntentParser        # AI 意圖解析器（可擴展整合 LLM）
-│   └── AutoDraftingSystem    # 系統協調器
-├── simple_viewer.py          # 檔案檢視器：支援 3D/2D 檢視
-│   └── EngineeringViewer     # 工程檔案檢視器類別
-├── generate_test_flange.py   # 測試模型生成器（生成法蘭模型）
-├── test_stp_viewer.py        # STEP 檔案測試工具
-├── output/                   # 輸出目錄（自動生成，包含轉換後的 DXF 檔案）
-├── .gitignore                # Git 忽略規則
-├── README.md                 # 本文件
-└── GITHUB_SETUP.md           # GitHub 上傳步驟說明
+├── auto_drafter_system.py       # 主要系統：3D 到 2D 自動轉換
+│   ├── MockCADEngine            #   CAD 核心（模型載入、特徵提取、投影）
+│   ├── AIIntentParser           #   AI 意圖解析器
+│   └── AutoDraftingSystem       #   系統協調器
+├── simple_viewer.py             # 檔案檢視器：3D/2D 檢視 + PNG 輸出
+│   └── EngineeringViewer        #   工程檔案檢視器類別
+├── generate_assembly_drawing.py # 組合件工程圖生成器
+├── info2xml.py                  # STEP 資訊轉 XML 工具
+├── test/                        # 自動化測試
+│   ├── test_projection.py       #   Headless 投影測試腳本
+│   ├── output/                  #   測試輸出 PNG（自動生成）
+│   └── reference/               #   基準 PNG（用於 SSIM 比對）
+├── output/                      # 輸出目錄（自動生成）
+├── .gitignore                   # Git 忽略規則
+└── README.md                    # 本文件
 ```
 
 ## 支援的檔案格式
@@ -139,9 +154,9 @@ Drafter/
 1. **MockCADEngine** (`auto_drafter_system.py`)
    - 負責 3D 模型載入（STEP/STL）
    - 特徵提取（從 3D 模型提取幾何特徵）
-   - 3D 到 2D 投影（使用 CadQuery 直接導出 DXF）
+   - 3D 到 2D 投影：使用 OCP `TopExp_Explorer` 遍歷所有 solid 邊緣，投影到 XY/XZ/YZ 平面
+   - 支援多實體複合件（Compound Shape），確保所有零件邊緣都被投影
    - **圖檔資訊提取**：從 STEP 檔案提取元資料（來源軟體、作者、單位等）
-   - **資訊視窗顯示**：使用 Tkinter 獨立視窗完整顯示所有圖檔資訊
 
 2. **AIIntentParser** (`auto_drafter_system.py`)
    - AI 意圖解析器（目前為簡化版本，使用關鍵字匹配）
@@ -155,7 +170,7 @@ Drafter/
 4. **EngineeringViewer** (`simple_viewer.py`)
    - 工程檔案檢視器
    - 支援 3D 視圖（PyVista）和 2D 視圖（Matplotlib）
-   - 支援同時顯示 3D 和 2D 視圖
+   - 支援 `save_path` 參數：指定路徑時輸出 PNG，不開啟 GUI 視窗
 
 ### 工作流程
 
@@ -175,22 +190,23 @@ CadQuery 載入
 
 - **整合 LLM API**：擴展 `AIIntentParser` 整合 OpenAI/Claude API
 - **改進特徵提取**：增強 `_extract_features()` 提取更複雜的幾何特徵
-- **多視圖支援**：添加側視圖、前視圖、等角投影等
 - **尺寸標註**：自動添加尺寸標註和技術要求
 - **圖層管理**：支援 DXF 圖層和線型設定
 
 ## 更新日誌
 
-### v1.2 (最新)
-- ✅ **圖檔資訊視窗**：新增獨立視窗完整顯示圖檔資訊
-- ✅ **BOM 材料清單**：自動生成並顯示 BOM (Bill of Materials)
-- ✅ **來源軟體識別**：從 STEP 檔案提取來源 CAD 軟體資訊
-- ✅ **單位資訊**：顯示檔案使用的長度單位
-- ✅ **元資料提取**：提取作者、組織、建立日期、產品名稱等資訊
-- ✅ **幾何統計**：顯示實體數、面數、邊數、頂點數、體積、表面積
-- ✅ **零件列表**：顯示模型中的零件清單
-- ✅ **無資訊處理**：若無特定資訊則明確顯示「無資訊」
-- ✅ **視窗可捲動**：支援長內容捲動檢視
+### v1.3 (最新)
+- **六方向投影**：XY/XZ/YZ 直接投影 + 反向投影，共 6 張 DXF
+- **完整邊緣提取**：使用 OCP `TopExp_Explorer` 遍歷 Compound 中所有 Solid（修正多實體組合件邊緣遺漏問題）
+- **Headless 測試**：`test/test_projection.py` 支援無 GUI 自動測試 + SSIM 基準比對
+- **PNG 輸出**：`view_2d_dxf()` 和 `view_projected_2d()` 支援 `save_path` 參數直接輸出 PNG
+
+### v1.2
+- 圖檔資訊視窗：獨立視窗完整顯示圖檔資訊
+- BOM 材料清單：自動生成並顯示
+- 來源軟體識別、單位資訊、元資料提取
+- 幾何統計：實體數、面數、邊數、頂點數、體積、表面積
+- 零件列表、視窗可捲動
 
 ### v1.1
 - ✅ 支援 DWG 檔案讀取（需要 ODA File Converter）

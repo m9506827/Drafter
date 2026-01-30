@@ -22,6 +22,7 @@ wheels/
 
 # Virtual Environment
 venv/
+.venv/
 ENV/
 env/
 
@@ -32,7 +33,15 @@ env/
 *.swo
 *~
 
-# Project specific
+# Tool configs
+.claude/
+.trunk/
+
+# Project specific - excluded directories
+google/
+nul
+
+# CAD/image files (large binaries)
 output/
 *.dxf
 *.dwg
@@ -43,9 +52,13 @@ output/
 *.jpg
 *.jpeg
 
-# Keep test files but ignore large ones
-!test_flange.step
-!1-2.stp
+# Test outputs (generated, not tracked)
+test/output/
+test/reference/
+
+# Versioned backups
+*_v02
+*_v03
 
 # OS
 .DS_Store
@@ -53,3 +66,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Reports / temp
+bom_report.txt
