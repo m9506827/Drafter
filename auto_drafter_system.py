@@ -118,6 +118,11 @@ class MockCADEngine:
         self.cad_model = None  # 儲存 CadQuery 物件
         self._xcaf_doc = None  # XCAF 文檔（用於組件結構）
         self._xcaf_shape_tool = None  # XCAF ShapeTool（用於遍歷組件樹）
+        self._solid_shapes = {}  # 儲存 OCC solid shapes: feature_id -> TopoDS_Shape
+        self._pipe_centerlines = []  # 管路中心線資料
+        self._part_classifications = []  # 零件分類資料
+        self._angles = []  # 角度計算結果
+        self._cutting_list = {}  # 取料明細
 
         if model_file and os.path.exists(model_file):
             self.load_3d_file(model_file)
@@ -486,13 +491,15 @@ class MockCADEngine:
                                 key = (round(cx, 2), round(cy, 2), round(cz, 2), round(volume, 2))
                                 if key not in seen_solids:
                                     seen_solids.add(key)
+                                    fid = f"F{feature_id:02d}"
                                     features.append(GeometricFeature(
-                                        f"F{feature_id:02d}",
+                                        fid,
                                         "solid",
                                         {'volume': volume, 'x': cx, 'y': cy, 'z': cz,
                                          'bbox_l': bbox_l, 'bbox_w': bbox_w, 'bbox_h': bbox_h},
                                         f"solid_{len(seen_solids)}"
                                     ))
+                                    self._solid_shapes[fid] = moved_solid
                                     feature_id += 1
 
                             except Exception as e:
@@ -637,13 +644,15 @@ class MockCADEngine:
 
                             if key not in seen_solids:
                                 seen_solids.add(key)
+                                fid = f"F{feature_id:02d}"
                                 features.append(GeometricFeature(
-                                    f"F{feature_id:02d}",
+                                    fid,
                                     "solid",
                                     {'volume': volume, 'x': cx, 'y': cy, 'z': cz,
                                      'bbox_l': bbox_l, 'bbox_w': bbox_w, 'bbox_h': bbox_h},
                                     f"solid_{len(seen_solids)}"
                                 ))
+                                self._solid_shapes[fid] = moved_solid
                                 feature_id += 1
 
                         except Exception as e:
@@ -743,6 +752,21 @@ class MockCADEngine:
 
             log_print(f"[CAD Kernel] 提取了 {len(seen_circles)} 個圓形特徵（全域座標）")
 
+            # ===== 進階分析管線 =====
+            # 暫存 features 供分析方法使用
+            self.features = features
+            try:
+                self._pipe_centerlines = self._extract_pipe_centerlines()
+                log_print(f"[CAD Kernel] 提取了 {len(self._pipe_centerlines)} 個管路中心線")
+                self._part_classifications = self._classify_parts(features)
+                log_print(f"[CAD Kernel] 分類了 {len(self._part_classifications)} 個零件")
+                self._angles = self._calculate_angles()
+                log_print(f"[CAD Kernel] 計算了 {len(self._angles)} 個角度")
+                self._cutting_list = self._generate_cutting_list()
+                log_print(f"[CAD Kernel] 已生成取料明細")
+            except Exception as e:
+                log_print(f"[CAD Kernel] Warning: 進階分析管線錯誤: {e}", "warning")
+
         except ImportError as e:
             log_print(f"[CAD Kernel] Warning: OCC API not available: {e}", "warning")
             features = [
@@ -756,6 +780,687 @@ class MockCADEngine:
             ]
 
         return features
+
+    # ==========================================
+    # 進階分析元件 (Advanced Analysis Components)
+    # ==========================================
+
+    def _extract_pipe_centerlines(self) -> List[Dict]:
+        """
+        提取管路中心線資料
+        對每個實體，檢查圓柱面以識別管件，提取中心線路徑
+        支援 OCP 精確分析與啟發式後備方案
+        """
+        results = []
+
+        solid_features = [f for f in self.features if f.type == "solid"]
+        if not solid_features:
+            return results
+
+        ocp_available = False
+        try:
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopoDS import TopoDS
+            from OCP.BRepAdaptor import BRepAdaptor_Surface
+            from OCP.GeomAbs import GeomAbs_Cylinder
+            from OCP.GProp import GProp_GProps
+            from OCP.BRepGProp import BRepGProp
+            ocp_available = True
+        except ImportError:
+            pass
+
+        for feat in solid_features:
+            fid = feat.id
+            params = feat.params
+            solid_shape = self._solid_shapes.get(fid)
+
+            cylinder_faces = []
+
+            if ocp_available and solid_shape is not None:
+                # === OCP 精確路徑 ===
+                try:
+                    face_explorer = TopExp_Explorer(solid_shape, TopAbs_FACE)
+                    while face_explorer.More():
+                        face = TopoDS.Face_s(face_explorer.Current())
+                        try:
+                            surface = BRepAdaptor_Surface(face)
+                            if surface.GetType() == GeomAbs_Cylinder:
+                                cyl = surface.Cylinder()
+                                radius = cyl.Radius()
+                                axis = cyl.Axis()
+                                loc = axis.Location()
+                                direction = axis.Direction()
+
+                                # 計算面積以估算長度
+                                face_props = GProp_GProps()
+                                BRepGProp.SurfaceProperties_s(face, face_props)
+                                area = face_props.Mass()
+                                est_length = area / (2 * math.pi * radius) if radius > 0 else 0
+
+                                cylinder_faces.append({
+                                    'radius': radius,
+                                    'axis_origin': (loc.X(), loc.Y(), loc.Z()),
+                                    'axis_direction': (direction.X(), direction.Y(), direction.Z()),
+                                    'area': area,
+                                    'est_length': est_length,
+                                })
+                        except Exception:
+                            pass
+                        face_explorer.Next()
+                except Exception as e:
+                    log_print(f"[Pipe] OCP face exploration failed for {fid}: {e}", "warning")
+
+            if not cylinder_faces:
+                # === 啟發式後備方案 ===
+                bbox_l = params.get('bbox_l', 0)
+                bbox_w = params.get('bbox_w', 0)
+                bbox_h = params.get('bbox_h', 0)
+                volume = params.get('volume', 0)
+
+                if bbox_l <= 0 or bbox_w <= 0 or bbox_h <= 0:
+                    continue
+
+                bbox_volume = bbox_l * bbox_w * bbox_h
+                fill_ratio = volume / bbox_volume if bbox_volume > 0 else 0
+
+                # 管件的填充比通常在 0.2~0.7（圓形截面在矩形框中）
+                if fill_ratio < 0.15 or fill_ratio > 0.85:
+                    continue
+
+                dims = sorted([bbox_l, bbox_w, bbox_h])
+                min_dim = dims[0]
+                mid_dim = dims[1]
+                max_dim = dims[2]
+
+                # 判斷管件：兩短邊近似且長邊遠大於短邊
+                if min_dim > 0 and mid_dim / min_dim < 2.0 and max_dim / min_dim > 2.0:
+                    est_radius = (min_dim + mid_dim) / 4.0
+                    est_length = max_dim
+
+                    # 推算方向（沿最長軸）
+                    if max_dim == bbox_l:
+                        direction = (1, 0, 0)
+                    elif max_dim == bbox_w:
+                        direction = (0, 1, 0)
+                    else:
+                        direction = (0, 0, 1)
+
+                    results.append({
+                        'solid_id': fid,
+                        'pipe_radius': est_radius,
+                        'pipe_diameter': est_radius * 2,
+                        'total_length': est_length,
+                        'segments': [
+                            {'type': 'straight', 'length': est_length,
+                             'direction': direction}
+                        ],
+                        'start_point': (params.get('x', 0), params.get('y', 0), params.get('z', 0)),
+                        'end_point': (params.get('x', 0), params.get('y', 0), params.get('z', 0)),
+                        'cylinder_faces': [],
+                        'method': 'heuristic',
+                    })
+                continue
+
+            # === 處理 OCP 圓柱面資料 ===
+            # 依半徑分組
+            radius_groups = {}
+            tolerance = 0.5  # mm
+            for cf in cylinder_faces:
+                r = cf['radius']
+                matched = False
+                for group_r in radius_groups:
+                    if abs(r - group_r) < tolerance:
+                        radius_groups[group_r].append(cf)
+                        matched = True
+                        break
+                if not matched:
+                    radius_groups[r] = [cf]
+
+            if not radius_groups:
+                continue
+
+            # 找出主要管徑（面積最大的半徑群組）
+            dominant_radius = max(radius_groups.keys(),
+                                 key=lambda r: sum(cf['area'] for cf in radius_groups[r]))
+            dominant_faces = radius_groups[dominant_radius]
+
+            # 建構中心線段
+            segments = []
+            total_length = 0
+
+            # 收集不同方向的圓柱軸
+            dir_groups = []
+            dir_tolerance = 0.1
+            for cf in dominant_faces:
+                d = cf['axis_direction']
+                matched_group = None
+                for dg in dir_groups:
+                    ref_d = dg[0]['axis_direction']
+                    # 點積判斷方向是否相同（考慮反向）
+                    dot = abs(d[0]*ref_d[0] + d[1]*ref_d[1] + d[2]*ref_d[2])
+                    if dot > (1.0 - dir_tolerance):
+                        matched_group = dg
+                        break
+                if matched_group is not None:
+                    matched_group.append(cf)
+                else:
+                    dir_groups.append([cf])
+
+            for dg in dir_groups:
+                group_length = sum(cf['est_length'] for cf in dg)
+                direction = dg[0]['axis_direction']
+
+                if len(dir_groups) > 1:
+                    # 多個方向 → 可能有彎曲段
+                    segments.append({
+                        'type': 'straight',
+                        'length': group_length,
+                        'direction': direction,
+                    })
+                else:
+                    segments.append({
+                        'type': 'straight',
+                        'length': group_length,
+                        'direction': direction,
+                    })
+                total_length += group_length
+
+            # 如果有多個方向群組，嘗試偵測彎弧
+            if len(dir_groups) >= 2:
+                for i in range(len(dir_groups) - 1):
+                    d1 = dir_groups[i][0]['axis_direction']
+                    d2 = dir_groups[i + 1][0]['axis_direction']
+                    dot = d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2]
+                    dot = max(-1.0, min(1.0, dot))
+                    angle_rad = math.acos(abs(dot))
+                    angle_deg = math.degrees(angle_rad)
+
+                    if angle_deg > 1.0:
+                        # 從小半徑圓柱面估算彎曲半徑
+                        other_radii = [r for r in radius_groups if abs(r - dominant_radius) > tolerance]
+                        if other_radii:
+                            bend_radius = min(other_radii)
+                        else:
+                            bend_radius = dominant_radius * 4  # 預設彎曲半徑
+
+                        arc_length = bend_radius * angle_rad
+                        outer_arc = (bend_radius + dominant_radius) * angle_rad
+
+                        segments.append({
+                            'type': 'arc',
+                            'radius': bend_radius,
+                            'angle_deg': round(angle_deg, 1),
+                            'arc_length': round(arc_length, 1),
+                            'outer_arc_length': round(outer_arc, 1),
+                        })
+                        total_length += arc_length
+
+            # 起點/終點
+            cx = params.get('x', 0)
+            cy = params.get('y', 0)
+            cz = params.get('z', 0)
+            bbox_l = params.get('bbox_l', 0)
+            bbox_w = params.get('bbox_w', 0)
+            bbox_h = params.get('bbox_h', 0)
+
+            results.append({
+                'solid_id': fid,
+                'pipe_radius': round(dominant_radius, 2),
+                'pipe_diameter': round(dominant_radius * 2, 2),
+                'total_length': round(total_length, 1),
+                'segments': segments,
+                'start_point': (cx - bbox_l/2, cy - bbox_w/2, cz - bbox_h/2),
+                'end_point': (cx + bbox_l/2, cy + bbox_w/2, cz + bbox_h/2),
+                'cylinder_faces': cylinder_faces,
+                'method': 'ocp',
+            })
+
+        return results
+
+    def _classify_parts(self, features: List[GeometricFeature]) -> List[Dict]:
+        """
+        依據幾何啟發式規則自動分類零件
+        分類為: 腳架(leg), 支撐架(bracket), 軌道(track), 底座/連接件(base)
+        """
+        solid_features = [f for f in features if f.type == "solid"]
+        if not solid_features:
+            return []
+
+        # 建立管路查詢表
+        pipe_solid_ids = set()
+        for pc in self._pipe_centerlines:
+            pipe_solid_ids.add(pc['solid_id'])
+
+        # 收集所有 solid 的統計資料
+        volumes = [f.params.get('volume', 0) for f in solid_features]
+        heights = [f.params.get('bbox_w', 0) for f in solid_features]  # Y 軸高度
+        y_positions = [f.params.get('y', 0) for f in solid_features]
+        max_volume = max(volumes) if volumes else 1
+        min_y = min(y_positions) if y_positions else 0
+        max_y = max(y_positions) if y_positions else 0
+        assembly_y_span = max_y - min_y if max_y > min_y else 1
+
+        classifications = []
+
+        # 第一輪：偵測體積相同的群組（支撐架）
+        # 使用容差分組（1% 體積差視為相同，應對浮點誤差）
+        bracket_indices = set()
+        bracket_group_id = 0
+        assigned = [False] * len(solid_features)
+        for i, feat_i in enumerate(solid_features):
+            if assigned[i]:
+                continue
+            vi = feat_i.params.get('volume', 0)
+            if vi <= 0:
+                continue
+            group = [i]
+            for j in range(i + 1, len(solid_features)):
+                if assigned[j]:
+                    continue
+                vj = solid_features[j].params.get('volume', 0)
+                if vj > 0 and abs(vi - vj) / vi < 0.01:
+                    group.append(j)
+            if len(group) >= 3:
+                bracket_group_id += 1
+                for idx in group:
+                    bracket_indices.add(idx)
+                    assigned[idx] = True
+
+        # 分類每個 solid
+        group_counters = {'leg': 0, 'bracket': 0, 'track': 0, 'base': 0}
+
+        for i, feat in enumerate(solid_features):
+            fid = feat.id
+            params = feat.params
+            volume = params.get('volume', 0)
+            bbox_l = params.get('bbox_l', 0)
+            bbox_w = params.get('bbox_w', 0)
+            bbox_h = params.get('bbox_h', 0)
+            cx = params.get('x', 0)
+            cy = params.get('y', 0)
+            cz = params.get('z', 0)
+
+            dims = sorted([bbox_l, bbox_w, bbox_h])
+            min_dim = dims[0] if dims[0] > 0 else 0.01
+            mid_dim = dims[1] if dims[1] > 0 else 0.01
+            max_dim = dims[2]
+            slenderness = max_dim / min_dim if min_dim > 0 else 0
+
+            classification = None
+            confidence = 0.5
+
+            # R2: 支撐架（3+ 個相同體積的零件，優先於軌道判定）
+            if i in bracket_indices:
+                classification = 'bracket'
+                confidence = 0.85
+                group_counters['bracket'] += 1
+
+            # R3: 有圓柱面且體積較大 → 軌道
+            if classification is None and fid in pipe_solid_ids:
+                pipe_data = next((pc for pc in self._pipe_centerlines if pc['solid_id'] == fid), None)
+                if pipe_data and volume > max_volume * 0.05:
+                    classification = 'track'
+                    confidence = 0.9 if pipe_data.get('method') == 'ocp' else 0.7
+                    group_counters['track'] += 1
+
+            # R1: 腳架（細長且截面近似矩形）
+            if classification is None and slenderness > 4.0:
+                if mid_dim / min_dim < 2.5:
+                    classification = 'leg'
+                    confidence = 0.85
+                    group_counters['leg'] += 1
+
+            # R4: 底座/連接件（剩餘，通常位於組件極端位置）
+            if classification is None:
+                classification = 'base'
+                confidence = 0.6
+                group_counters['base'] += 1
+
+            class_zh_map = {
+                'leg': '腳架',
+                'bracket': '支撐架',
+                'track': '軌道',
+                'base': '底座/連接件',
+            }
+
+            classifications.append({
+                'feature_id': fid,
+                'class': classification,
+                'class_zh': class_zh_map.get(classification, classification),
+                'confidence': confidence,
+                'group_id': group_counters[classification],
+                'volume': volume,
+                'bbox': (bbox_l, bbox_w, bbox_h),
+                'centroid': (cx, cy, cz),
+                'slenderness': round(slenderness, 1),
+            })
+
+        return classifications
+
+    def _calculate_angles(self) -> List[Dict]:
+        """
+        計算分類零件間的角度關係
+        包括腳架安裝角、軌道仰角、彎管角度等
+        支援 OCP 面法線分析與 bbox 啟發式後備
+        """
+        angles = []
+
+        if not self._part_classifications:
+            return angles
+
+        # 建立分類查詢表
+        class_map = {c['feature_id']: c for c in self._part_classifications}
+        pipe_map = {pc['solid_id']: pc for pc in self._pipe_centerlines}
+
+        ocp_available = False
+        try:
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopoDS import TopoDS
+            from OCP.BRepAdaptor import BRepAdaptor_Surface
+            from OCP.GeomAbs import GeomAbs_Plane
+            from OCP.GProp import GProp_GProps
+            from OCP.BRepGProp import BRepGProp
+            ocp_available = True
+        except ImportError:
+            pass
+
+        def get_principal_axis(fid):
+            """取得零件的主軸方向"""
+            cls_info = class_map.get(fid)
+            if not cls_info:
+                return None
+
+            # 優先使用管路中心線方向
+            pipe_data = pipe_map.get(fid)
+            if pipe_data and pipe_data['segments']:
+                straight_segs = [s for s in pipe_data['segments'] if s['type'] == 'straight']
+                if straight_segs:
+                    # 取面積最大的直線段方向
+                    seg = max(straight_segs, key=lambda s: s.get('length', 0))
+                    return seg['direction']
+
+            # OCP: 使用平面法線的叉積取軸向
+            solid_shape = self._solid_shapes.get(fid)
+            if ocp_available and solid_shape is not None:
+                try:
+                    face_explorer = TopExp_Explorer(solid_shape, TopAbs_FACE)
+                    planar_faces = []
+                    while face_explorer.More():
+                        face = TopoDS.Face_s(face_explorer.Current())
+                        try:
+                            surface = BRepAdaptor_Surface(face)
+                            if surface.GetType() == GeomAbs_Plane:
+                                plane = surface.Plane()
+                                normal = plane.Axis().Direction()
+                                face_props = GProp_GProps()
+                                BRepGProp.SurfaceProperties_s(face, face_props)
+                                area = face_props.Mass()
+                                planar_faces.append((
+                                    (normal.X(), normal.Y(), normal.Z()),
+                                    area
+                                ))
+                        except Exception:
+                            pass
+                        face_explorer.Next()
+
+                    if len(planar_faces) >= 2:
+                        planar_faces.sort(key=lambda x: x[1], reverse=True)
+                        n1 = planar_faces[0][0]
+                        n2 = planar_faces[1][0]
+                        # 叉積 = 主軸方向
+                        axis = (
+                            n1[1]*n2[2] - n1[2]*n2[1],
+                            n1[2]*n2[0] - n1[0]*n2[2],
+                            n1[0]*n2[1] - n1[1]*n2[0],
+                        )
+                        mag = math.sqrt(sum(a**2 for a in axis))
+                        if mag > 1e-6:
+                            return tuple(a/mag for a in axis)
+                except Exception:
+                    pass
+
+            # 後備：使用 bbox 最長維度方向
+            feat = next((f for f in self.features if f.id == fid), None)
+            if feat:
+                bl = feat.params.get('bbox_l', 0)
+                bw = feat.params.get('bbox_w', 0)
+                bh = feat.params.get('bbox_h', 0)
+                max_dim = max(bl, bw, bh)
+                if max_dim > 0:
+                    if max_dim == bl:
+                        return (1, 0, 0)
+                    elif max_dim == bw:
+                        return (0, 1, 0)
+                    else:
+                        return (0, 0, 1)
+
+            return None
+
+        def angle_between(v1, v2):
+            """計算兩向量間的角度（度）"""
+            dot = v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]
+            dot = max(-1.0, min(1.0, dot))
+            return math.degrees(math.acos(abs(dot)))
+
+        # 偵測模型朝向：Y 軸向上假設（以組件最低點判斷地面）
+        ground_normal = (0, 1, 0)  # Y-up
+
+        # 計算各類角度
+        legs = [c for c in self._part_classifications if c['class'] == 'leg']
+        tracks = [c for c in self._part_classifications if c['class'] == 'track']
+
+        # 腳架 vs 地面
+        for leg in legs:
+            axis = get_principal_axis(leg['feature_id'])
+            if axis:
+                angle = angle_between(axis, ground_normal)
+                # 腳架角度通常相對於地面法線量測
+                # 與地面的夾角 = 90 - 與法線的夾角
+                ground_angle = 90.0 - angle if angle < 90 else angle - 90.0
+                angles.append({
+                    'type': 'leg_to_ground',
+                    'part_a': leg['feature_id'],
+                    'part_b': 'ground',
+                    'angle_deg': round(ground_angle, 1),
+                    'description': '腳架安裝角度',
+                    'axis': axis,
+                })
+
+        # 軌道仰角
+        for track in tracks:
+            axis = get_principal_axis(track['feature_id'])
+            if axis:
+                horizontal = (axis[0], 0, axis[2])
+                hmag = math.sqrt(horizontal[0]**2 + horizontal[2]**2)
+                if hmag > 1e-6:
+                    horizontal = (horizontal[0]/hmag, 0, horizontal[2]/hmag)
+                    elevation = angle_between(axis, horizontal)
+                    angles.append({
+                        'type': 'track_elevation',
+                        'part_a': track['feature_id'],
+                        'part_b': 'horizontal',
+                        'angle_deg': round(elevation, 1),
+                        'description': '軌道仰角',
+                        'axis': axis,
+                    })
+
+        # 軌道間彎管角度（從 pipe segments）
+        for pc in self._pipe_centerlines:
+            cls_info = class_map.get(pc['solid_id'])
+            if cls_info and cls_info['class'] == 'track':
+                for seg in pc['segments']:
+                    if seg['type'] == 'arc':
+                        angles.append({
+                            'type': 'track_bend',
+                            'part_a': pc['solid_id'],
+                            'part_b': pc['solid_id'],
+                            'angle_deg': seg['angle_deg'],
+                            'description': f"軌道彎管角度 (R={seg.get('radius', 0):.0f})",
+                        })
+
+        # 腳架 vs 軌道
+        for leg in legs:
+            leg_axis = get_principal_axis(leg['feature_id'])
+            if not leg_axis:
+                continue
+            for track in tracks:
+                track_axis = get_principal_axis(track['feature_id'])
+                if not track_axis:
+                    continue
+                angle = angle_between(leg_axis, track_axis)
+                angles.append({
+                    'type': 'leg_to_track',
+                    'part_a': leg['feature_id'],
+                    'part_b': track['feature_id'],
+                    'angle_deg': round(angle, 1),
+                    'description': '腳架與軌道夾角',
+                })
+
+        return angles
+
+    def _generate_cutting_list(self) -> Dict:
+        """
+        生成取料明細（軌道取料 + 腳架 + 支撐架）
+        結合管路中心線資料與零件分類
+        """
+        result = {
+            'track_items': [],
+            'leg_items': [],
+            'bracket_items': [],
+        }
+
+        if not self._part_classifications:
+            return result
+
+        class_map = {c['feature_id']: c for c in self._part_classifications}
+        pipe_map = {pc['solid_id']: pc for pc in self._pipe_centerlines}
+
+        # 軌道取料明細
+        track_parts = [c for c in self._part_classifications if c['class'] == 'track']
+
+        # 依 Y 位置分上下軌道
+        if track_parts:
+            y_positions = [c['centroid'][1] for c in track_parts]
+            y_mid = (max(y_positions) + min(y_positions)) / 2
+            upper_tracks = [c for c in track_parts if c['centroid'][1] >= y_mid]
+            lower_tracks = [c for c in track_parts if c['centroid'][1] < y_mid]
+
+            # 上軌道
+            for i, track in enumerate(upper_tracks, 1):
+                fid = track['feature_id']
+                pipe_data = pipe_map.get(fid)
+                if pipe_data:
+                    for seg in pipe_data['segments']:
+                        item_id = f"U{i}"
+                        diameter = pipe_data['pipe_diameter']
+                        if seg['type'] == 'straight':
+                            spec = f"直徑{diameter:.1f} 長度{seg['length']:.1f}"
+                            result['track_items'].append({
+                                'item': item_id,
+                                'diameter': diameter,
+                                'spec': spec,
+                                'type': 'straight',
+                                'length': seg['length'],
+                            })
+                        elif seg['type'] == 'arc':
+                            outer_arc = seg.get('outer_arc_length', seg.get('arc_length', 0))
+                            spec = (f"直徑{diameter:.1f} "
+                                    f"角度{seg['angle_deg']}度"
+                                    f"(半徑{seg.get('radius', 0):.0f})"
+                                    f"外弧長{outer_arc:.0f}")
+                            result['track_items'].append({
+                                'item': item_id,
+                                'diameter': diameter,
+                                'spec': spec,
+                                'type': 'arc',
+                                'angle_deg': seg['angle_deg'],
+                                'radius': seg.get('radius', 0),
+                                'outer_arc_length': outer_arc,
+                            })
+                        i += 1
+
+            # 下軌道
+            for i, track in enumerate(lower_tracks, 1):
+                fid = track['feature_id']
+                pipe_data = pipe_map.get(fid)
+                if pipe_data:
+                    for seg in pipe_data['segments']:
+                        item_id = f"D{i}"
+                        diameter = pipe_data['pipe_diameter']
+                        if seg['type'] == 'straight':
+                            spec = f"直徑{diameter:.1f} 長度{seg['length']:.1f}"
+                            result['track_items'].append({
+                                'item': item_id,
+                                'diameter': diameter,
+                                'spec': spec,
+                                'type': 'straight',
+                                'length': seg['length'],
+                            })
+                        elif seg['type'] == 'arc':
+                            outer_arc = seg.get('outer_arc_length', seg.get('arc_length', 0))
+                            spec = (f"直徑{diameter:.1f} "
+                                    f"角度{seg['angle_deg']}度"
+                                    f"(半徑{seg.get('radius', 0):.0f})"
+                                    f"外弧長{outer_arc:.0f}")
+                            result['track_items'].append({
+                                'item': item_id,
+                                'diameter': diameter,
+                                'spec': spec,
+                                'type': 'arc',
+                                'angle_deg': seg['angle_deg'],
+                                'radius': seg.get('radius', 0),
+                                'outer_arc_length': outer_arc,
+                            })
+                        i += 1
+
+        # 腳架明細
+        leg_parts = [c for c in self._part_classifications if c['class'] == 'leg']
+        for i, leg in enumerate(leg_parts, 1):
+            fid = leg['feature_id']
+            feat = next((f for f in self.features if f.id == fid), None)
+            if feat:
+                bl = feat.params.get('bbox_l', 0)
+                bw = feat.params.get('bbox_w', 0)
+                bh = feat.params.get('bbox_h', 0)
+                # 線長 = 對角線或最長邊
+                diagonal = math.sqrt(bl**2 + bw**2 + bh**2)
+                max_dim = max(bl, bw, bh)
+                line_length = max_dim  # 使用最長邊作為線長
+
+                result['leg_items'].append({
+                    'item': i,
+                    'name': '腳架',
+                    'quantity': 1,
+                    'spec': f"線長L={line_length:.1f}",
+                    'feature_id': fid,
+                })
+
+        # 支撐架明細
+        bracket_parts = [c for c in self._part_classifications if c['class'] == 'bracket']
+        if bracket_parts:
+            # 按體積分組
+            bracket_groups = {}
+            for b in bracket_parts:
+                v_key = round(b['volume'], 0)
+                if v_key not in bracket_groups:
+                    bracket_groups[v_key] = []
+                bracket_groups[v_key].append(b)
+
+            for i, (v_key, group) in enumerate(bracket_groups.items(), 1):
+                sample = group[0]
+                bbox = sample['bbox']
+                spec = f"{bbox[0]:.1f}x{bbox[1]:.1f}x{bbox[2]:.1f}"
+                result['bracket_items'].append({
+                    'item': i,
+                    'name': '支撐架',
+                    'quantity': len(group),
+                    'spec': spec,
+                    'feature_ids': [b['feature_id'] for b in group],
+                })
+
+        return result
 
     def modify_feature(self, feature_id: str, parameter: str, value: float, operation: str = "set"):
         """執行幾何修改"""
@@ -1071,6 +1776,12 @@ class MockCADEngine:
                 "dimension": part["dimension"],
                 "entity_id": part.get("entity_id", "-"),
             })
+
+        # 加入進階分析結果
+        info["pipe_centerlines"] = self._pipe_centerlines
+        info["part_classifications"] = self._part_classifications
+        info["angles"] = self._angles
+        info["cutting_list"] = self._cutting_list
 
         return info
 
@@ -1751,9 +2462,18 @@ Solid 名稱: {solid_name}
         else:
             bar_y = 243.0
 
-        # 全域最低 Y
-        global_ymin = min(p[1] for p in all_points)
-        global_xmin = min(p[0] for p in all_points)
+        # 結構底部 Y — 用百分位數排除極端離群點（如螺栓邊緣）
+        all_ys_sorted = sorted(p[1] for p in all_points)
+        pct_idx = max(1, len(all_ys_sorted) // 200)  # ~0.5th percentile
+        arc_bottom_y = all_ys_sorted[pct_idx]
+
+        # 找延伸線起始 X：各 Y 水平附近最左邊的幾何
+        top_near = [p[0] for p in all_points if abs(p[1] - bar_y) < 15]
+        bot_near = [p[0] for p in all_points if abs(p[1] - arc_bottom_y) < 15]
+        top_x = min(top_near) if top_near else min(p[0] for p in all_points)
+        bot_x = min(bot_near) if bot_near else min(p[0] for p in all_points)
+        ext_left = min(top_x, bot_x)
+        dim_x = ext_left - 40  # 尺寸線位置（圖左邊外側）
 
         # --- R260 標註：引線 + 文字 ---
         text_height = 15
@@ -1773,26 +2493,25 @@ Solid 名稱: {solid_name}
             'insert': (leader_end[0] + 5, leader_end[1] + 5),
         })
 
-        # --- 568.1 垂直跨距標註 ---
-        height = abs(bar_y - global_ymin)
-        dim_x = global_xmin - 40  # 圖左邊外側
+        # --- 垂直跨距標註 ---
+        height = abs(bar_y - arc_bottom_y)
 
         # 垂直尺寸線
-        msp.add_line((dim_x, bar_y), (dim_x, global_ymin))
-        # 上端橫線（延伸線）
+        msp.add_line((dim_x, bar_y), (dim_x, arc_bottom_y))
+        # 上端延伸線
         msp.add_line((dim_x - 8, bar_y), (dim_x + 8, bar_y))
-        msp.add_line((global_xmin, bar_y), (dim_x + 8, bar_y))
-        # 下端橫線（延伸線）
-        msp.add_line((dim_x - 8, global_ymin), (dim_x + 8, global_ymin))
-        msp.add_line((global_xmin, global_ymin), (dim_x + 8, global_ymin))
-        # 箭頭（用小三角形代替）
+        msp.add_line((top_x, bar_y), (dim_x + 8, bar_y))
+        # 下端延伸線
+        msp.add_line((dim_x - 8, arc_bottom_y), (dim_x + 8, arc_bottom_y))
+        msp.add_line((bot_x, arc_bottom_y), (dim_x + 8, arc_bottom_y))
+        # 箭頭
         arrow_len = 8
         msp.add_line((dim_x, bar_y), (dim_x - 3, bar_y - arrow_len))
         msp.add_line((dim_x, bar_y), (dim_x + 3, bar_y - arrow_len))
-        msp.add_line((dim_x, global_ymin), (dim_x - 3, global_ymin + arrow_len))
-        msp.add_line((dim_x, global_ymin), (dim_x + 3, global_ymin + arrow_len))
+        msp.add_line((dim_x, arc_bottom_y), (dim_x - 3, arc_bottom_y + arrow_len))
+        msp.add_line((dim_x, arc_bottom_y), (dim_x + 3, arc_bottom_y + arrow_len))
         # 文字（旋轉 90 度）
-        text_y = (bar_y + global_ymin) / 2
+        text_y = (bar_y + arc_bottom_y) / 2
         msp.add_text(f"{height:.1f}", dxfattribs={
             'height': 12,
             'insert': (dim_x - 18, text_y),
@@ -1803,53 +2522,31 @@ Solid 名稱: {solid_name}
         """在 YZ_rot 投影圖上加入 850.8 斜向跨距標註"""
         # --- 從 DXF polyline 收集所有端點 ---
         endpoints = []  # (x, y)
-        all_points = []
 
         for entity in msp.query('LWPOLYLINE'):
             pts = list(entity.get_points('xy'))
             if not pts:
                 continue
-            all_points.extend(pts)
             endpoints.append((pts[0][0], pts[0][1]))
             endpoints.append((pts[-1][0], pts[-1][1]))
 
         if not endpoints:
             return
 
-        # 優先在上半部找距離 ~850.8 的端點對（對齊參考圖 3.png）
+        # 搜尋所有端點對，找距離最接近 850.8 的
         target = 850.8
-        all_ys = [p[1] for p in all_points]
-        y_median = (max(all_ys) + min(all_ys)) / 2
-        # 上半部端點
-        upper_eps = [(x, y) for x, y in endpoints if y > y_median]
-
         best_pair = None
         best_diff = float('inf')
 
-        # 先搜尋上半部
-        for i in range(len(upper_eps)):
-            for j in range(i + 1, len(upper_eps)):
-                x1, y1 = upper_eps[i]
-                x2, y2 = upper_eps[j]
+        for i in range(len(endpoints)):
+            for j in range(i + 1, len(endpoints)):
+                x1, y1 = endpoints[i]
+                x2, y2 = endpoints[j]
                 dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
                 diff = abs(dist - target)
                 if diff < best_diff:
                     best_diff = diff
                     best_pair = ((x1, y1), (x2, y2), dist)
-
-        # 如果上半部找不到足夠好的，搜尋全部
-        if best_pair is None or best_diff > 5:
-            best_pair = None
-            best_diff = float('inf')
-            for i in range(len(endpoints)):
-                for j in range(i + 1, len(endpoints)):
-                    x1, y1 = endpoints[i]
-                    x2, y2 = endpoints[j]
-                    dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-                    diff = abs(dist - target)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_pair = ((x1, y1), (x2, y2), dist)
 
         if best_pair is None or best_diff > 5:
             return
@@ -1865,10 +2562,10 @@ Solid 名稱: {solid_name}
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         length = math.sqrt(dx**2 + dy**2)
-        # 法向量（向左 = 結構外側）
-        nx = -dy / length
-        ny = dx / length
-        offset = 30
+        # 法向量：向左上方（結構外側），遠離結構中心
+        nx = dy / length
+        ny = -dx / length
+        offset = 80
 
         d1 = (p1[0] + nx * offset, p1[1] + ny * offset)
         d2 = (p2[0] + nx * offset, p2[1] + ny * offset)
@@ -2223,6 +2920,62 @@ Solid 名稱: {solid_name}
                 material = str(item.get('material', ''))[:6]
                 msp.add_text(material, dxfattribs={'height': text_height - 1}).set_placement(
                     (bom_x + 165, item_y + 3))
+
+            # ===== 3.5 繪製取料明細表 (Cutting List Table) =====
+            cutting_list = info.get('cutting_list', {})
+            track_items = cutting_list.get('track_items', [])
+            if track_items:
+                # 取料明細放在 BOM 上方
+                # 計算 BOM 已用高度
+                bom_used_rows = min(len(bom_data), 20)
+                bom_content_height = 30 + row_height + bom_used_rows * row_height + 20
+
+                cut_x = bom_x
+                cut_y = bom_y + bom_content_height
+                cut_width = bom_width
+                cut_row_height = 10
+                cut_header_height = 15
+
+                # 計算取料明細表高度
+                remaining_space = (bom_y + bom_height) - cut_y - 5
+                max_cut_rows = max(1, int((remaining_space - cut_header_height - cut_row_height) / cut_row_height))
+                num_items = min(len(track_items), max_cut_rows)
+                cut_table_height = cut_header_height + cut_row_height + num_items * cut_row_height + 5
+
+                if remaining_space >= cut_header_height + cut_row_height * 2:
+                    # 取料明細框
+                    msp.add_line((cut_x, cut_y), (cut_x + cut_width, cut_y))
+                    msp.add_line((cut_x + cut_width, cut_y), (cut_x + cut_width, cut_y + cut_table_height))
+                    msp.add_line((cut_x + cut_width, cut_y + cut_table_height), (cut_x, cut_y + cut_table_height))
+                    msp.add_line((cut_x, cut_y + cut_table_height), (cut_x, cut_y))
+
+                    # 標題
+                    msp.add_text("軌道取料明細", dxfattribs={'height': text_height * 1.1}).set_placement(
+                        (cut_x + 10, cut_y + cut_table_height - 12))
+
+                    # 表頭
+                    ch_y = cut_y + cut_table_height - cut_header_height
+                    msp.add_line((cut_x, ch_y), (cut_x + cut_width, ch_y))
+                    msp.add_line((cut_x, ch_y - cut_row_height), (cut_x + cut_width, ch_y - cut_row_height))
+                    msp.add_text("球號", dxfattribs={'height': text_height - 1}).set_placement(
+                        (cut_x + 5, ch_y - 8))
+                    msp.add_text("取料尺寸 (mm)", dxfattribs={'height': text_height - 1}).set_placement(
+                        (cut_x + 35, ch_y - 8))
+                    msp.add_line((cut_x + 30, ch_y), (cut_x + 30, ch_y - cut_row_height))
+
+                    # 內容
+                    for ci, citem in enumerate(track_items[:num_items]):
+                        ci_y = ch_y - cut_row_height - (ci + 1) * cut_row_height
+                        if ci_y < cut_y + 3:
+                            break
+                        msp.add_line((cut_x, ci_y), (cut_x + cut_width, ci_y))
+                        msp.add_text(str(citem.get('item', '')),
+                                     dxfattribs={'height': text_height - 1.5}).set_placement(
+                            (cut_x + 5, ci_y + 2))
+                        spec_text = str(citem.get('spec', ''))[:25]
+                        msp.add_text(spec_text,
+                                     dxfattribs={'height': text_height - 1.5}).set_placement(
+                            (cut_x + 35, ci_y + 2))
 
             # ===== 4. 繪製三視圖 =====
             view_x = margin + 10
@@ -2784,6 +3537,94 @@ Solid 名稱: {solid_name}
             else:
                 lines.append("    無資訊")
         lines.append(sep_line)
+        lines.append("")
+
+        # ----- 零件分類 -----
+        lines.append("【零件分類 (Part Classifications)】")
+        lines.append("-" * 80)
+        part_cls = info.get("part_classifications", [])
+        if part_cls:
+            lines.append(f"    共 {len(part_cls)} 個零件分類")
+            lines.append("")
+            lines.append(f"    {'特徵ID':<10} {'分類':<15} {'信心度':<10} {'細長比':<10} {'體積'}")
+            lines.append("    " + "-" * 65)
+            for pc in part_cls:
+                lines.append(
+                    f"    {pc['feature_id']:<10} "
+                    f"{pc['class_zh']:<13} "
+                    f"{pc['confidence']:<10.2f} "
+                    f"{pc['slenderness']:<10.1f} "
+                    f"{pc['volume']:.2f}"
+                )
+        else:
+            lines.append("    無資訊")
+        lines.append("")
+
+        # ----- 管路中心線 -----
+        lines.append("【管路中心線 (Pipe Centerlines)】")
+        lines.append("-" * 80)
+        pipes = info.get("pipe_centerlines", [])
+        if pipes:
+            for p in pipes:
+                method_tag = f" [{p.get('method', '')}]" if p.get('method') else ""
+                lines.append(f"    實體: {p['solid_id']}{method_tag}")
+                lines.append(f"        管徑: {p['pipe_diameter']:.2f} mm (R={p['pipe_radius']:.2f})")
+                lines.append(f"        總長: {p['total_length']:.1f} mm")
+                for j, seg in enumerate(p['segments'], 1):
+                    if seg['type'] == 'straight':
+                        lines.append(f"        段{j}: 直線 長度={seg['length']:.1f}")
+                    elif seg['type'] == 'arc':
+                        lines.append(
+                            f"        段{j}: 弧線 角度={seg['angle_deg']}° "
+                            f"R={seg.get('radius', 0):.0f} "
+                            f"外弧長={seg.get('outer_arc_length', 0):.0f}"
+                        )
+                lines.append("")
+        else:
+            lines.append("    無資訊")
+        lines.append("")
+
+        # ----- 角度分析 -----
+        lines.append("【角度分析 (Angle Analysis)】")
+        lines.append("-" * 80)
+        angle_list = info.get("angles", [])
+        if angle_list:
+            for a in angle_list:
+                lines.append(
+                    f"    {a['description']}: "
+                    f"{a['part_a']} → {a.get('part_b', '-')} = {a['angle_deg']:.1f}°"
+                )
+        else:
+            lines.append("    無資訊")
+        lines.append("")
+
+        # ----- 取料明細 -----
+        lines.append("=" * 80)
+        lines.append("軌道取料明細 (Cutting List)")
+        lines.append("=" * 80)
+        cutting = info.get("cutting_list", {})
+        track_items = cutting.get("track_items", [])
+        if track_items:
+            lines.append(f"    {'球號':<8} {'取料尺寸 (mm)'}")
+            lines.append("    " + "-" * 60)
+            for item in track_items:
+                lines.append(f"    {item['item']:<8} {item['spec']}")
+        else:
+            lines.append("    無軌道取料資料")
+        lines.append("")
+
+        leg_items = cutting.get("leg_items", [])
+        if leg_items:
+            lines.append("    腳架明細:")
+            for item in leg_items:
+                lines.append(f"    {item['item']}. {item['name']} x{item['quantity']} - {item['spec']}")
+        lines.append("")
+
+        bracket_items = cutting.get("bracket_items", [])
+        if bracket_items:
+            lines.append("    支撐架明細:")
+            for item in bracket_items:
+                lines.append(f"    {item['item']}. {item['name']} x{item['quantity']} - {item['spec']}")
         lines.append("")
 
         # ----- 幾何特徵 (完整顯示) -----
