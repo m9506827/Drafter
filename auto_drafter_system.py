@@ -785,11 +785,201 @@ class MockCADEngine:
     # 進階分析元件 (Advanced Analysis Components)
     # ==========================================
 
+    def _analyze_bspline_pipe(self, solid_shape, feature_id, params):
+        """
+        對具有 BSpline 表面的實體進行管路中心線分析。
+        透過取樣表面路徑來提取管徑、中心線長度、直/彎管判斷。
+        """
+        try:
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopoDS import TopoDS
+            from OCP.BRepAdaptor import BRepAdaptor_Surface
+            from OCP.GeomAbs import GeomAbs_BSplineSurface
+            from OCP.BRepGProp import BRepGProp
+            from OCP.GProp import GProp_GProps
+        except ImportError:
+            return None
+
+        # 找出大面積 BSpline 表面（排除端蓋）
+        bspline_faces = []
+        fexp = TopExp_Explorer(solid_shape, TopAbs_FACE)
+        while fexp.More():
+            try:
+                face = TopoDS.Face_s(fexp.Current())
+                surf = BRepAdaptor_Surface(face)
+                if surf.GetType() == GeomAbs_BSplineSurface:
+                    props = GProp_GProps()
+                    BRepGProp.SurfaceProperties_s(face, props)
+                    area = props.Mass()
+                    if area > 500:
+                        bspline_faces.append((face, area))
+            except Exception:
+                pass
+            fexp.Next()
+
+        if len(bspline_faces) < 2:
+            return None
+
+        bspline_faces.sort(key=lambda x: x[1])
+
+        # 從最大 BSpline 表面的 V 方向取得管徑
+        largest_face = bspline_faces[-1][0]
+        surf = BRepAdaptor_Surface(largest_face)
+        u1, u2 = surf.FirstUParameter(), surf.LastUParameter()
+        v1, v2 = surf.FirstVParameter(), surf.LastVParameter()
+        u_mid = (u1 + u2) / 2
+        pt_v1 = surf.Value(u_mid, v1)
+        pt_v2 = surf.Value(u_mid, v2)
+        pipe_diameter = math.sqrt(
+            (pt_v2.X() - pt_v1.X()) ** 2 +
+            (pt_v2.Y() - pt_v1.Y()) ** 2 +
+            (pt_v2.Z() - pt_v1.Z()) ** 2
+        )
+
+        if pipe_diameter < 1.0:
+            return None
+
+        # 取樣最大表面的路徑作為中心線近似
+        # （直管時，表面路徑長度＝中心線長度；彎管時誤差很小）
+        n_samples = 100
+
+        def sample_path(face, n):
+            s = BRepAdaptor_Surface(face)
+            su1, su2 = s.FirstUParameter(), s.LastUParameter()
+            sv_mid = (s.FirstVParameter() + s.LastVParameter()) / 2
+            pts = []
+            for i in range(n + 1):
+                t = i / n
+                u = su1 + t * (su2 - su1)
+                pt = s.Value(u, sv_mid)
+                pts.append((pt.X(), pt.Y(), pt.Z()))
+            return pts
+
+        centerline = sample_path(largest_face, n_samples)
+
+        # 計算中心線總長
+        total_length = 0
+        for i in range(len(centerline) - 1):
+            dx = centerline[i + 1][0] - centerline[i][0]
+            dy = centerline[i + 1][1] - centerline[i][1]
+            dz = centerline[i + 1][2] - centerline[i][2]
+            total_length += math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        # 判斷直管或彎管
+        end_dx = centerline[-1][0] - centerline[0][0]
+        end_dy = centerline[-1][1] - centerline[0][1]
+        end_dz = centerline[-1][2] - centerline[0][2]
+        end_dist = math.sqrt(end_dx ** 2 + end_dy ** 2 + end_dz ** 2)
+        straightness = end_dist / total_length if total_length > 0 else 0
+
+        segments = []
+        if straightness > 0.99:
+            # 直管
+            d = (end_dx / end_dist, end_dy / end_dist, end_dz / end_dist) if end_dist > 0 else (0, 0, 0)
+            segments.append({
+                'type': 'straight',
+                'length': round(total_length, 1),
+                'direction': d,
+            })
+        else:
+            # 彎管 — 找出曲率所在的軸（起點≈終點的軸），投影到含該軸的平面
+            start_p = centerline[0]
+            end_p = centerline[-1]
+            deltas = [
+                (abs(end_p[0] - start_p[0]), 0),
+                (abs(end_p[1] - start_p[1]), 1),
+                (abs(end_p[2] - start_p[2]), 2),
+            ]
+            deltas.sort(key=lambda x: x[0])
+            # 曲率軸：起終點值最接近的軸（圓弧往返的方向）
+            curve_axis = deltas[0][1]
+            # 投影平面：包含曲率軸和第二大變化軸
+            other_axis = deltas[1][1]
+            # 高度方向：起終點變化最大的軸
+            height_axis = deltas[2][1]
+            arc_axes = [curve_axis, other_axis]
+
+            def proj(p):
+                return (p[arc_axes[0]], p[arc_axes[1]])
+
+            p0 = proj(centerline[0])
+            p_mid = proj(centerline[n_samples // 2])
+            p_end = proj(centerline[-1])
+
+            # 三點擬合圓
+            ax_, ay_ = p0
+            bx_, by_ = p_mid
+            cx_, cy_ = p_end
+            D = 2 * (ax_ * (by_ - cy_) + bx_ * (cy_ - ay_) + cx_ * (ay_ - by_))
+
+            if abs(D) > 1e-6:
+                ux = ((ax_ ** 2 + ay_ ** 2) * (by_ - cy_) +
+                      (bx_ ** 2 + by_ ** 2) * (cy_ - ay_) +
+                      (cx_ ** 2 + cy_ ** 2) * (ay_ - by_)) / D
+                uy = ((ax_ ** 2 + ay_ ** 2) * (cx_ - bx_) +
+                      (bx_ ** 2 + by_ ** 2) * (ax_ - cx_) +
+                      (cx_ ** 2 + cy_ ** 2) * (bx_ - ax_)) / D
+
+                r0 = math.sqrt((ax_ - ux) ** 2 + (ay_ - uy) ** 2)
+                r1 = math.sqrt((bx_ - ux) ** 2 + (by_ - uy) ** 2)
+                r2 = math.sqrt((cx_ - ux) ** 2 + (cy_ - uy) ** 2)
+                arc_radius = (r0 + r1 + r2) / 3
+
+                angle_start = math.atan2(ay_ - uy, ax_ - ux)
+                angle_end = math.atan2(cy_ - uy, cx_ - ux)
+                arc_angle = abs(angle_end - angle_start)
+                if arc_angle > math.pi:
+                    arc_angle = 2 * math.pi - arc_angle
+                arc_angle_deg = round(math.degrees(arc_angle), 1)
+
+                height_gain = abs(centerline[-1][height_axis] - centerline[0][height_axis])
+
+                if height_gain > 1:
+                    cl_arc = math.sqrt((arc_radius * arc_angle) ** 2 + height_gain ** 2)
+                else:
+                    cl_arc = arc_radius * arc_angle
+
+                outer_r = arc_radius + pipe_diameter / 2
+                if height_gain > 1:
+                    outer_arc = math.sqrt((outer_r * arc_angle) ** 2 + height_gain ** 2)
+                else:
+                    outer_arc = outer_r * arc_angle
+
+                segments.append({
+                    'type': 'arc',
+                    'radius': round(arc_radius, 0),
+                    'angle_deg': arc_angle_deg,
+                    'arc_length': round(cl_arc, 1),
+                    'outer_arc_length': round(outer_arc, 0),
+                    'height_gain': round(height_gain, 1),
+                })
+            else:
+                # 退化情況（共線）→ 視為直管
+                d = (end_dx / end_dist, end_dy / end_dist, end_dz / end_dist) if end_dist > 0 else (0, 0, 0)
+                segments.append({
+                    'type': 'straight',
+                    'length': round(total_length, 1),
+                    'direction': d,
+                })
+
+        return {
+            'solid_id': feature_id,
+            'pipe_radius': round(pipe_diameter / 2, 2),
+            'pipe_diameter': round(pipe_diameter, 1),
+            'total_length': round(total_length, 1),
+            'segments': segments,
+            'start_point': centerline[0],
+            'end_point': centerline[-1],
+            'cylinder_faces': [],
+            'method': 'bspline',
+        }
+
     def _extract_pipe_centerlines(self) -> List[Dict]:
         """
         提取管路中心線資料
         對每個實體，檢查圓柱面以識別管件，提取中心線路徑
-        支援 OCP 精確分析與啟發式後備方案
+        支援 OCP 精確分析、BSpline 表面分析與啟發式後備方案
         """
         results = []
 
@@ -852,6 +1042,13 @@ class MockCADEngine:
                     log_print(f"[Pipe] OCP face exploration failed for {fid}: {e}", "warning")
 
             if not cylinder_faces:
+                # === 嘗試 BSpline 表面分析 ===
+                if ocp_available and solid_shape is not None:
+                    bspline_result = self._analyze_bspline_pipe(solid_shape, fid, params)
+                    if bspline_result:
+                        results.append(bspline_result)
+                        continue
+
                 # === 啟發式後備方案 ===
                 bbox_l = params.get('bbox_l', 0)
                 bbox_w = params.get('bbox_w', 0)
@@ -1130,14 +1327,12 @@ class MockCADEngine:
                 confidence = 0.85
                 group_counters['bracket'] += 1
 
-            # R1: 腳架（有圓柱面但管徑遠小於 bbox 截面 → 矩形管倒角）
+            # R1: 腳架（OCP 圓柱面偵測中，管徑遠小於 bbox 截面 → 矩形管倒角）
+            # 注意：只對 OCP 圓柱面偵測結果適用，BSpline 偵測的管件跳過此規則
             if classification is None and fid in pipe_solid_ids:
                 pipe_data = pipe_map.get(fid)
-                if pipe_data:
+                if pipe_data and pipe_data.get('method') == 'ocp':
                     pipe_d = pipe_data['pipe_diameter']
-                    # 管徑 vs bbox 最短邊的比值
-                    # 真正的管件：管徑 ≈ bbox 短邊（比值 > 0.7）
-                    # 矩形管倒角：管徑 << bbox 短邊（比值 < 0.7）
                     ratio = pipe_d / min_dim if min_dim > 0 else 0
                     if ratio < 0.7 and slenderness > 3.0:
                         classification = 'leg'
@@ -1397,80 +1592,148 @@ class MockCADEngine:
         # 軌道取料明細
         track_parts = [c for c in self._part_classifications if c['class'] == 'track']
 
-        # 依 Y 位置分上下軌道
+        def _estimate_pipe_diameter(feat):
+            """從 bbox 和體積估算管徑（適用於 BSpline 彎管）"""
+            p = feat.params
+            vol = p.get('volume', 0)
+            bl, bw, bh = p.get('bbox_l', 0), p.get('bbox_w', 0), p.get('bbox_h', 0)
+            dims = sorted([bl, bw, bh])
+            # 估算管長（最長維度或對角線）
+            est_length = max(dims[2], math.sqrt(dims[1]**2 + dims[2]**2))
+            if est_length > 0:
+                # 截面積 = vol / length
+                cross_area = vol / est_length
+                # 截面積 = π * r_outer² - π * r_inner² ≈ π * d * t
+                # 對薄壁管近似: cross_area ≈ π * d * t
+                # 無法精確求解 d 和 t，但可用其他軌道的管徑作參考
+                pass
+            return dims[0], est_length  # 返回 (估算管短邊尺寸, 估算長度)
+
+        def _build_track_items(tracks, prefix):
+            """為一組軌道零件生成取料項目"""
+            items = []
+            item_num = 1
+            # 從已知管路取得參考管徑
+            ref_diameter = None
+            for t in tracks:
+                pd = pipe_map.get(t['feature_id'])
+                if pd:
+                    ref_diameter = pd['pipe_diameter']
+                    break
+            # 如果沒有，從所有管路取
+            if ref_diameter is None and self._pipe_centerlines:
+                # 取最大管徑作為軌道參考
+                ref_diameter = max(pc['pipe_diameter'] for pc in self._pipe_centerlines)
+
+            for track in tracks:
+                fid = track['feature_id']
+                pipe_data = pipe_map.get(fid)
+
+                if pipe_data:
+                    # 有管路中心線資料 → 按段生成
+                    diameter = pipe_data['pipe_diameter']
+                    for seg in pipe_data['segments']:
+                        item_id = f"{prefix}{item_num}"
+                        if seg['type'] == 'straight':
+                            spec = f"直徑{diameter:.1f} 長度{seg['length']:.1f}"
+                            items.append({
+                                'item': item_id, 'diameter': diameter,
+                                'spec': spec, 'type': 'straight',
+                                'length': seg['length'],
+                            })
+                        elif seg['type'] == 'arc':
+                            outer_arc = seg.get('outer_arc_length', seg.get('arc_length', 0))
+                            spec = (f"直徑{diameter:.1f} "
+                                    f"角度{seg['angle_deg']}度"
+                                    f"(半徑{seg.get('radius', 0):.0f})"
+                                    f"外弧長{outer_arc:.0f}")
+                            items.append({
+                                'item': item_id, 'diameter': diameter,
+                                'spec': spec, 'type': 'arc',
+                                'angle_deg': seg['angle_deg'],
+                                'radius': seg.get('radius', 0),
+                                'outer_arc_length': outer_arc,
+                            })
+                        item_num += 1
+                else:
+                    # 無管路中心線（BSpline 彎管）→ 從 bbox 估算
+                    feat = next((f for f in self.features if f.id == fid), None)
+                    if not feat:
+                        continue
+                    p = feat.params
+                    bl = p.get('bbox_l', 0)
+                    bw = p.get('bbox_w', 0)
+                    bh = p.get('bbox_h', 0)
+                    dims = sorted([bl, bw, bh])
+                    diameter = ref_diameter if ref_diameter else dims[0]
+                    est_length = dims[2]  # 最長邊作為估算長度
+
+                    item_id = f"{prefix}{item_num}"
+                    spec = f"直徑{diameter:.1f} 長度{est_length:.1f}"
+                    items.append({
+                        'item': item_id, 'diameter': diameter,
+                        'spec': spec, 'type': 'straight',
+                        'length': est_length,
+                        'estimated': True,
+                    })
+                    item_num += 1
+
+            return items
+
+        # 依 Z 間距配對軌道，分為兩條平行軌道（上軌/下軌）
         if track_parts:
-            y_positions = [c['centroid'][1] for c in track_parts]
-            y_mid = (max(y_positions) + min(y_positions)) / 2
-            upper_tracks = [c for c in track_parts if c['centroid'][1] >= y_mid]
-            lower_tracks = [c for c in track_parts if c['centroid'][1] < y_mid]
+            # 配對法：找出 XY 接近但 Z 不同的軌道對
+            track_infos = []
+            for tp in track_parts:
+                cx, cy, cz = tp['centroid']
+                track_infos.append({'data': tp, 'cx': cx, 'cy': cy, 'cz': cz})
 
-            # 上軌道
-            for i, track in enumerate(upper_tracks, 1):
-                fid = track['feature_id']
-                pipe_data = pipe_map.get(fid)
-                if pipe_data:
-                    for seg in pipe_data['segments']:
-                        item_id = f"U{i}"
-                        diameter = pipe_data['pipe_diameter']
-                        if seg['type'] == 'straight':
-                            spec = f"直徑{diameter:.1f} 長度{seg['length']:.1f}"
-                            result['track_items'].append({
-                                'item': item_id,
-                                'diameter': diameter,
-                                'spec': spec,
-                                'type': 'straight',
-                                'length': seg['length'],
-                            })
-                        elif seg['type'] == 'arc':
-                            outer_arc = seg.get('outer_arc_length', seg.get('arc_length', 0))
-                            spec = (f"直徑{diameter:.1f} "
-                                    f"角度{seg['angle_deg']}度"
-                                    f"(半徑{seg.get('radius', 0):.0f})"
-                                    f"外弧長{outer_arc:.0f}")
-                            result['track_items'].append({
-                                'item': item_id,
-                                'diameter': diameter,
-                                'spec': spec,
-                                'type': 'arc',
-                                'angle_deg': seg['angle_deg'],
-                                'radius': seg.get('radius', 0),
-                                'outer_arc_length': outer_arc,
-                            })
-                        i += 1
+            paired = set()
+            pairs = []
+            for i in range(len(track_infos)):
+                if i in paired:
+                    continue
+                best_j = None
+                best_xy = float('inf')
+                for j in range(i + 1, len(track_infos)):
+                    if j in paired:
+                        continue
+                    xy_d = math.sqrt(
+                        (track_infos[i]['cx'] - track_infos[j]['cx']) ** 2 +
+                        (track_infos[i]['cy'] - track_infos[j]['cy']) ** 2)
+                    z_d = abs(track_infos[i]['cz'] - track_infos[j]['cz'])
+                    if z_d > 50 and xy_d < z_d and xy_d < best_xy:
+                        best_xy = xy_d
+                        best_j = j
+                if best_j is not None:
+                    paired.add(i)
+                    paired.add(best_j)
+                    pairs.append((i, best_j))
 
-            # 下軌道
-            for i, track in enumerate(lower_tracks, 1):
-                fid = track['feature_id']
-                pipe_data = pipe_map.get(fid)
-                if pipe_data:
-                    for seg in pipe_data['segments']:
-                        item_id = f"D{i}"
-                        diameter = pipe_data['pipe_diameter']
-                        if seg['type'] == 'straight':
-                            spec = f"直徑{diameter:.1f} 長度{seg['length']:.1f}"
-                            result['track_items'].append({
-                                'item': item_id,
-                                'diameter': diameter,
-                                'spec': spec,
-                                'type': 'straight',
-                                'length': seg['length'],
-                            })
-                        elif seg['type'] == 'arc':
-                            outer_arc = seg.get('outer_arc_length', seg.get('arc_length', 0))
-                            spec = (f"直徑{diameter:.1f} "
-                                    f"角度{seg['angle_deg']}度"
-                                    f"(半徑{seg.get('radius', 0):.0f})"
-                                    f"外弧長{outer_arc:.0f}")
-                            result['track_items'].append({
-                                'item': item_id,
-                                'diameter': diameter,
-                                'spec': spec,
-                                'type': 'arc',
-                                'angle_deg': seg['angle_deg'],
-                                'radius': seg.get('radius', 0),
-                                'outer_arc_length': outer_arc,
-                            })
-                        i += 1
+            rail_a, rail_b = [], []
+            for i, j in pairs:
+                if track_infos[i]['cz'] < track_infos[j]['cz']:
+                    rail_a.append(track_infos[i])
+                    rail_b.append(track_infos[j])
+                else:
+                    rail_a.append(track_infos[j])
+                    rail_b.append(track_infos[i])
+
+            for i, ti in enumerate(track_infos):
+                if i not in paired:
+                    rail_a.append(ti)
+
+            # 各軌道內依 Y 位置排序（沿軌道路徑方向）
+            rail_a.sort(key=lambda t: t['cy'])
+            rail_b.sort(key=lambda t: t['cy'])
+
+            upper_tracks = [t['data'] for t in rail_a]
+            lower_tracks = [t['data'] for t in rail_b]
+
+            result['track_items'] = (
+                _build_track_items(upper_tracks, "U") +
+                _build_track_items(lower_tracks, "D")
+            )
 
         # 腳架明細
         leg_parts = [c for c in self._part_classifications if c['class'] == 'leg']
