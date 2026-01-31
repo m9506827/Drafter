@@ -1029,8 +1029,42 @@ class MockCADEngine:
 
         # 建立管路查詢表
         pipe_solid_ids = set()
+        pipe_map = {pc['solid_id']: pc for pc in self._pipe_centerlines}
         for pc in self._pipe_centerlines:
             pipe_solid_ids.add(pc['solid_id'])
+
+        # 偵測 BSpline 曲面零件（彎管軌道的特徵）
+        bspline_solid_ids = set()
+        try:
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.TopoDS import TopoDS
+            from OCP.BRepAdaptor import BRepAdaptor_Surface
+            from OCP.GeomAbs import GeomAbs_BSplineSurface, GeomAbs_Plane
+            for feat in solid_features:
+                fid = feat.id
+                solid_shape = self._solid_shapes.get(fid)
+                if solid_shape is None:
+                    continue
+                face_exp = TopExp_Explorer(solid_shape, TopAbs_FACE)
+                has_bspline = False
+                plane_count = 0
+                bspline_count = 0
+                while face_exp.More():
+                    face = TopoDS.Face_s(face_exp.Current())
+                    try:
+                        surf = BRepAdaptor_Surface(face)
+                        if surf.GetType() == GeomAbs_BSplineSurface:
+                            bspline_count += 1
+                        elif surf.GetType() == GeomAbs_Plane:
+                            plane_count += 1
+                    except Exception:
+                        pass
+                    face_exp.Next()
+                if bspline_count > 0:
+                    bspline_solid_ids.add(fid)
+        except ImportError:
+            pass
 
         # 收集所有 solid 的統計資料
         volumes = [f.params.get('volume', 0) for f in solid_features]
@@ -1090,28 +1124,51 @@ class MockCADEngine:
             classification = None
             confidence = 0.5
 
-            # R2: 支撐架（3+ 個相同體積的零件，優先於軌道判定）
+            # R2: 支撐架（3+ 個相同體積的零件，優先於所有判定）
             if i in bracket_indices:
                 classification = 'bracket'
                 confidence = 0.85
                 group_counters['bracket'] += 1
 
-            # R3: 有圓柱面且體積較大 → 軌道
+            # R1: 腳架（有圓柱面但管徑遠小於 bbox 截面 → 矩形管倒角）
             if classification is None and fid in pipe_solid_ids:
-                pipe_data = next((pc for pc in self._pipe_centerlines if pc['solid_id'] == fid), None)
-                if pipe_data and volume > max_volume * 0.05:
-                    classification = 'track'
-                    confidence = 0.9 if pipe_data.get('method') == 'ocp' else 0.7
-                    group_counters['track'] += 1
+                pipe_data = pipe_map.get(fid)
+                if pipe_data:
+                    pipe_d = pipe_data['pipe_diameter']
+                    # 管徑 vs bbox 最短邊的比值
+                    # 真正的管件：管徑 ≈ bbox 短邊（比值 > 0.7）
+                    # 矩形管倒角：管徑 << bbox 短邊（比值 < 0.7）
+                    ratio = pipe_d / min_dim if min_dim > 0 else 0
+                    if ratio < 0.7 and slenderness > 3.0:
+                        classification = 'leg'
+                        confidence = 0.85
+                        group_counters['leg'] += 1
 
-            # R1: 腳架（細長且截面近似矩形）
+            # R3a: 有 BSpline 曲面 → 軌道（彎管）
+            if classification is None and fid in bspline_solid_ids:
+                classification = 'track'
+                confidence = 0.85
+                group_counters['track'] += 1
+
+            # R3b: 有圓柱面且管徑接近 bbox 截面 → 軌道（直管）
+            if classification is None and fid in pipe_solid_ids:
+                pipe_data = pipe_map.get(fid)
+                if pipe_data and volume > max_volume * 0.05:
+                    pipe_d = pipe_data['pipe_diameter']
+                    ratio = pipe_d / min_dim if min_dim > 0 else 0
+                    if ratio >= 0.7:
+                        classification = 'track'
+                        confidence = 0.9 if pipe_data.get('method') == 'ocp' else 0.7
+                        group_counters['track'] += 1
+
+            # R1b: 細長矩形截面 → 腳架（後備）
             if classification is None and slenderness > 4.0:
                 if mid_dim / min_dim < 2.5:
                     classification = 'leg'
-                    confidence = 0.85
+                    confidence = 0.75
                     group_counters['leg'] += 1
 
-            # R4: 底座/連接件（剩餘，通常位於組件極端位置）
+            # R4: 底座/連接件（剩餘）
             if classification is None:
                 classification = 'base'
                 confidence = 0.6
