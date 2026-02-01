@@ -270,7 +270,7 @@ class MockCADEngine:
 
             for i in range(1, free_shapes.Length() + 1):
                 label = free_shapes.Value(i)
-                shape = shape_tool.GetShape(label)
+                shape = shape_tool.GetShape_s(label)
                 if not shape.IsNull():
                     builder.Add(compound, shape)
 
@@ -440,7 +440,7 @@ class MockCADEngine:
                 nonlocal feature_id
 
                 # 獲取此標籤的位置變換
-                loc = shape_tool.GetLocation(label)
+                loc = shape_tool.GetLocation_s(label)
                 current_trsf = loc.Transformation()
 
                 # 累積變換
@@ -449,17 +449,17 @@ class MockCADEngine:
                 accumulated_trsf.Multiply(current_trsf)
 
                 # 檢查是否為組件（有子組件）
-                if shape_tool.IsAssembly(label):
+                if shape_tool.IsAssembly_s(label):
                     # 獲取子組件
                     components = TDF_LabelSequence()
-                    shape_tool.GetComponents(label, components)
+                    shape_tool.GetComponents_s(label, components)
                     for i in range(1, components.Length() + 1):
                         child_label = components.Value(i)
                         process_label(child_label, accumulated_trsf)
 
-                elif shape_tool.IsSimpleShape(label):
+                elif shape_tool.IsSimpleShape_s(label):
                     # 這是一個簡單形狀（可能包含實體）
-                    shape = shape_tool.GetShape(label)
+                    shape = shape_tool.GetShape_s(label)
                     if not shape.IsNull():
                         # 移除形狀自身的位置
                         shape_no_loc = shape.Located(TopLoc_Location())
@@ -507,10 +507,11 @@ class MockCADEngine:
                             except Exception as e:
                                 log_print(f"[CAD Kernel] Warning: Could not process XCAF solid: {e}", "warning")
 
-                elif shape_tool.IsReference(label):
+                elif shape_tool.IsReference_s(label):
                     # 這是一個引用（指向另一個標籤）
-                    ref_label = shape_tool.GetReferredShape(label)
-                    if not ref_label.IsNull():
+                    from OCP.TDF import TDF_Label
+                    ref_label = TDF_Label()
+                    if shape_tool.GetReferredShape_s(label, ref_label):
                         process_label(ref_label, accumulated_trsf)
 
             # 獲取所有自由形狀並處理
