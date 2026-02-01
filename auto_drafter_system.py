@@ -673,52 +673,27 @@ class MockCADEngine:
 
                 log_print(f"[CAD Kernel] 提取了 {len(seen_solids)} 個實體特徵（全域座標，累積變換）")
 
-            # ===== 提取圓形特徵（應用全域變換）=====
-            # 重要：必須將邊緣的 TopLoc_Location 應用到圓心座標
+            # ===== 提取圓形特徵（使用 TopExp_Explorer 直接遍歷所有邊緣）=====
+            # TopExp_Explorer 會正確累積位置變換，BRepAdaptor_Curve 直接回傳全域座標
             seen_circles = set()
 
-            def extract_circles_with_transform(shape, parent_trsf: gp_Trsf):
-                """
-                遞歸遍歷形狀樹，提取圓形邊緣並應用累積變換
-                """
-                nonlocal feature_id
-
-                # 獲取當前形狀的位置變換
-                loc = shape.Location()
-                current_trsf = loc.Transformation()
-
-                # 累積變換
-                accumulated_trsf = gp_Trsf()
-                accumulated_trsf.Multiply(parent_trsf)
-                accumulated_trsf.Multiply(current_trsf)
-
-                shape_type = shape.ShapeType()
-                from OCP.TopAbs import TopAbs_EDGE, TopAbs_COMPOUND, TopAbs_COMPSOLID, TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_WIRE
-
-                if shape_type == TopAbs_EDGE:
-                    # 這是一條邊緣
+            try:
+                from OCP.TopoDS import TopoDS
+                edge_explorer = TopExp_Explorer(root_shape, TopAbs_EDGE)
+                while edge_explorer.More():
                     try:
-                        # 移除邊緣的位置（使用累積變換）
-                        edge_no_loc = shape.Located(TopLoc_Location())
-                        curve = BRepAdaptor_Curve(edge_no_loc)
+                        edge = TopoDS.Edge_s(edge_explorer.Current())
+                        curve = BRepAdaptor_Curve(edge)
 
                         if curve.GetType() == GeomAbs_Circle:
                             circle = curve.Circle()
-
-                            # 獲取局部圓心
-                            local_center = circle.Location()
-
-                            # 應用累積變換到圓心
-                            from OCP.gp import gp_Pnt
-                            global_center = gp_Pnt(local_center.X(), local_center.Y(), local_center.Z())
-                            global_center.Transform(accumulated_trsf)
-
-                            cx = global_center.X()
-                            cy = global_center.Y()
-                            cz = global_center.Z()
+                            center = circle.Location()
+                            cx = center.X()
+                            cy = center.Y()
+                            cz = center.Z()
                             radius = circle.Radius()
 
-                            # 去重
+                            # 去重（相同位置與半徑的圓只保留一個）
                             key = (round(cx, 2), round(cy, 2), round(cz, 2), round(radius, 2))
                             if key not in seen_circles:
                                 seen_circles.add(key)
@@ -732,20 +707,7 @@ class MockCADEngine:
 
                     except Exception:
                         pass
-
-                elif shape_type in (TopAbs_COMPOUND, TopAbs_COMPSOLID, TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_WIRE):
-                    # 遞歸處理子元素
-                    from OCP.TopoDS import TopoDS_Iterator
-                    iterator = TopoDS_Iterator(shape)
-                    while iterator.More():
-                        child_shape = iterator.Value()
-                        extract_circles_with_transform(child_shape, accumulated_trsf)
-                        iterator.Next()
-
-            try:
-                # 從根形狀開始遞歸提取圓形
-                identity_trsf = gp_Trsf()
-                extract_circles_with_transform(root_shape, identity_trsf)
+                    edge_explorer.Next()
 
             except Exception as e:
                 log_print(f"[CAD Kernel] Warning: Could not extract circles: {e}", "warning")
