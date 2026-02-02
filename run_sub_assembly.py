@@ -41,14 +41,8 @@ def main():
 
     if result:
         print(f"\n[Done] 共 {len(result)} 張施工圖:")
-        base = os.path.splitext(os.path.basename(step_file))[0]
         for i, dxf_path in enumerate(result, 1):
             print(f"  [{i}] DXF: {dxf_path}")
-            # 檢查對應預覽
-            preview_name = f"{base}_子系統施工圖_{i}_preview.png"
-            preview = os.path.join(output_dir, preview_name)
-            if os.path.exists(preview):
-                print(f"      Preview: {preview}")
         return 0
     else:
         print("[Error] 生成失敗")
