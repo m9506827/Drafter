@@ -1462,19 +1462,38 @@ class MockCADEngine:
             dot = max(-1.0, min(1.0, dot))
             return math.degrees(math.acos(abs(dot)))
 
-        # 偵測模型朝向：Y 軸向上假設（以組件最低點判斷地面）
-        ground_normal = (0, 1, 0)  # Y-up
-
-        # 計算各類角度
+        # 偵測模型朝向：自動偵測 Y-up 或 Z-up
+        # 先以 Y-up 測試腳架角度，若全部接近 0° 則改用 Z-up
         legs = [c for c in self._part_classifications if c['class'] == 'leg']
         tracks = [c for c in self._part_classifications if c['class'] == 'track']
 
+        ground_normal = (0, 1, 0)  # 預設 Y-up
+        if legs:
+            y_up_results = []
+            for leg in legs:
+                axis = get_principal_axis(leg['feature_id'])
+                if axis:
+                    a = angle_between(axis, (0, 1, 0))
+                    ga = 90.0 - a if a < 90 else a - 90.0
+                    y_up_results.append(ga)
+            # 若 Y-up 計算結果全部 < 5°（不合理），改試 Z-up
+            if y_up_results and all(a < 5 for a in y_up_results):
+                z_up_results = []
+                for leg in legs:
+                    axis = get_principal_axis(leg['feature_id'])
+                    if axis:
+                        a = angle_between(axis, (0, 0, 1))
+                        ga = 90.0 - a if a < 90 else a - 90.0
+                        z_up_results.append(ga)
+                if z_up_results and any(a > 5 for a in z_up_results):
+                    ground_normal = (0, 0, 1)  # Z-up 模型
+
+        # 計算各類角度
         # 腳架 vs 地面
         for leg in legs:
             axis = get_principal_axis(leg['feature_id'])
             if axis:
                 angle = angle_between(axis, ground_normal)
-                # 腳架角度通常相對於地面法線量測
                 # 與地面的夾角 = 90 - 與法線的夾角
                 ground_angle = 90.0 - angle if angle < 90 else angle - 90.0
                 angles.append({
@@ -1486,14 +1505,20 @@ class MockCADEngine:
                     'axis': axis,
                 })
 
-        # 軌道仰角
+        # 軌道仰角（投影到水平面，計算仰角）
         for track in tracks:
             axis = get_principal_axis(track['feature_id'])
             if axis:
-                horizontal = (axis[0], 0, axis[2])
-                hmag = math.sqrt(horizontal[0]**2 + horizontal[2]**2)
+                # 投影到水平面（移除垂直分量）
+                if ground_normal == (0, 0, 1):
+                    # Z-up: 水平面 = XY 平面
+                    horizontal = (axis[0], axis[1], 0)
+                else:
+                    # Y-up: 水平面 = XZ 平面
+                    horizontal = (axis[0], 0, axis[2])
+                hmag = math.sqrt(sum(h**2 for h in horizontal))
                 if hmag > 1e-6:
-                    horizontal = (horizontal[0]/hmag, 0, horizontal[2]/hmag)
+                    horizontal = tuple(h/hmag for h in horizontal)
                     elevation = angle_between(axis, horizontal)
                     angles.append({
                         'type': 'track_elevation',
@@ -2000,7 +2025,11 @@ class MockCADEngine:
                 'y_mid': sum(ys) / len(ys),
             })
 
-        MAX_LEG_TOLERANCE = 50  # mm — 超過此距離不分配到該 section
+        # 若只有一個 straight section，所有腳架都歸屬於它
+        if len(section_ranges) == 1:
+            return {section_ranges[0]['section_idx']: list(leg_items)}
+
+        MAX_LEG_TOLERANCE = 200  # mm — 放寬容差，避免漏掉腳架
 
         assignment = {}
         for leg in leg_items:
@@ -4199,8 +4228,6 @@ Solid 名稱: {solid_name}
 
         # 建立 track_elevation 查表
         elev_map = {}
-        for te_entry in leg_angles_map:
-            pass  # leg_angles_map is per-leg; we need per-track
         # 重建 per-track elevation from track_elevations passed via section data
         # track_elevations were used in _compute_transition_bends; rebuild from pipe_data
         for ut in upper_tracks:
@@ -4242,25 +4269,15 @@ Solid 名稱: {solid_name}
         upper_elevations = [s[1] for s in upper_segs_info]
         lower_elevations = [s[1] for s in lower_segs_info]
 
-        # 腳架角度
-        leg_angle_list = []
-        for leg in section_legs:
-            fid = leg.get('feature_id', '')
-            la = leg_angles_map.get(fid, 70)
-            leg_angle_list.append(la)
-
-        # 各腳架垂直高度（下軌以下的長度 * sin）
+        # 各腳架垂直高度（下軌以下的長度）
         leg_below_heights = []
         for li, leg in enumerate(section_legs):
-            la = leg_angle_list[li] if li < len(leg_angle_list) else 70
-            la_rad = math.radians(la)
             ll = leg.get('line_length', 450)
-            through = rail_spacing / math.sin(la_rad) if math.sin(la_rad) > 0.01 else rail_spacing
+            through = rail_spacing  # 垂直穿越 = 軌道間距
             remain = max(0, ll - through)
             above = min(remain * 0.08, 40)
             below = remain - above
-            below_vert = below * math.sin(la_rad)
-            leg_below_heights.append(below_vert)
+            leg_below_heights.append(below)
 
         # ---- 計算軌道展開的 bounding box（考慮斜面）----
         def _compute_track_points(segs_info, start_x, start_y):
@@ -4289,17 +4306,10 @@ Solid 名稱: {solid_name}
         for p in lo_pts_raw:
             all_ys.extend([p[1] - rail_spacing, p[3] - rail_spacing])
 
-        # 腳架 extent
+        # 腳架 extent（垂直腳架，無水平偏移）
         max_below_vert = max(leg_below_heights) if leg_below_heights else 100
-        max_leg_horiz = 0
-        for li, leg in enumerate(section_legs):
-            la = leg_angle_list[li] if li < len(leg_angle_list) else 70
-            la_rad = math.radians(la)
-            below_h = leg_below_heights[li] if li < len(leg_below_heights) else 100
-            horiz = below_h / math.tan(la_rad) if math.tan(la_rad) > 0.01 else 0
-            max_leg_horiz = max(max_leg_horiz, horiz)
 
-        model_width = (max(all_xs) - min(all_xs)) + max_leg_horiz + 80
+        model_width = (max(all_xs) - min(all_xs)) + 80
         model_max_y = max(all_ys) + 50
         model_min_y = min(all_ys) - rail_spacing - max_below_vert - 50
         model_height = model_max_y - model_min_y
@@ -4316,7 +4326,7 @@ Solid 名稱: {solid_name}
         pipe_hw = min(max(pipe_diameter * scale * 0.5, 1.5), 3.5)
 
         # 基準點定位：上軌左端點
-        base_x = draw_area_x + max_leg_horiz * scale + 30
+        base_x = draw_area_x + 30
         base_y_upper = draw_area_y + (model_max_y - 0) * scale + max_below_vert * scale + 25
 
         # ========== 繪製軌道（斜面）==========
@@ -4438,10 +4448,8 @@ Solid 名稱: {solid_name}
                                       f"{rail_spacing:.1f}",
                                       vertical=True)
 
-        # ========== 腳架（從軌道交點垂直向下到地面）==========
+        # ========== 腳架（垂直向下到地面）==========
         for li, leg in enumerate(section_legs):
-            la = leg_angle_list[li] if li < len(leg_angle_list) else 70
-            la_rad = math.radians(la)
             ll = leg.get('line_length', 450)
 
             # 腳架位置：放在第 li 段上軌的中點
@@ -4451,41 +4459,34 @@ Solid 名稱: {solid_name}
             else:
                 leg_upper_pt = (base_x + (li + 1) * 50 * scale, base_y_upper)
 
-            # 對應的下軌交點
+            # 對應的下軌交點（垂直正下方）
             if li < len(lower_seg_positions):
                 lsp = lower_seg_positions[li]
-                leg_lower_pt = ((lsp[0] + lsp[2]) / 2, (lsp[1] + lsp[3]) / 2)
+                # 垂直投影：取上軌 X 座標，找下軌對應 Y
+                leg_lower_pt = (leg_upper_pt[0], leg_upper_pt[1] - rail_spacing * scale)
             else:
                 leg_lower_pt = (leg_upper_pt[0], leg_upper_pt[1] - rail_spacing * scale)
 
-            # 腳架幾何
-            sin_a = math.sin(la_rad)
-            cos_a = math.cos(la_rad)
-            through = rail_spacing / sin_a if sin_a > 0.01 else rail_spacing
+            # 腳架幾何（垂直）
+            through = rail_spacing
             remain = max(0, ll - through)
             above_len = min(remain * 0.08, 40)
             below_len = remain - above_len
 
-            # 頂端（上軌之上）
-            tip_dx = above_len * scale * cos_a
-            tip_dy = above_len * scale * sin_a
-            leg_top = (leg_upper_pt[0] - tip_dx, leg_upper_pt[1] + tip_dy)
+            # 頂端（上軌之上，垂直向上）
+            leg_top = (leg_upper_pt[0], leg_upper_pt[1] + above_len * scale)
 
-            # 底端（下軌之下，向下延伸）
-            btm_dx = below_len * scale * cos_a
-            btm_dy = below_len * scale * sin_a
-            leg_foot = (leg_lower_pt[0] + btm_dx, leg_lower_pt[1] - btm_dy)
+            # 底端（下軌之下，垂直向下）
+            leg_foot = (leg_lower_pt[0], leg_lower_pt[1] - below_len * scale)
 
-            # 管寬
+            # 管寬（垂直腳架，管壁在左右兩側）
             leg_hw = min(pipe_hw * 0.8, 2.5)
-            nx_l = leg_hw * sin_a
-            ny_l = leg_hw * cos_a
 
             # 管壁雙線
-            msp.add_line((leg_top[0] - nx_l, leg_top[1] + ny_l),
-                         (leg_foot[0] - nx_l, leg_foot[1] + ny_l))
-            msp.add_line((leg_top[0] + nx_l, leg_top[1] - ny_l),
-                         (leg_foot[0] + nx_l, leg_foot[1] - ny_l))
+            msp.add_line((leg_top[0] - leg_hw, leg_top[1]),
+                         (leg_foot[0] - leg_hw, leg_foot[1]))
+            msp.add_line((leg_top[0] + leg_hw, leg_top[1]),
+                         (leg_foot[0] + leg_hw, leg_foot[1]))
             # 中心線
             msp.add_line(leg_top, leg_foot, dxfattribs={'color': 1})
 
@@ -4518,14 +4519,8 @@ Solid 名稱: {solid_name}
                              (gx - 2, col_bot_y - 4))
 
             # ===== 尺寸標註 =====
-            # 角度弧（在下軌交點，相對於水平面）
-            angle_r = 15
-            self._draw_angle_arc(msp, leg_lower_pt, angle_r,
-                                 180, 180 + la,
-                                 f"{la:.0f}°")
-
             # 腳架垂直高度（下軌以下）
-            below_vert = below_len * sin_a
+            below_vert = below_len
             if below_vert > 1:
                 self._draw_dimension_line(msp,
                                           leg_lower_pt,
@@ -4698,21 +4693,8 @@ Solid 名稱: {solid_name}
                     elev = track_elev_by_id.get(fid, 0)
                     track_centroids.append({'fid': fid, 'cx': cx, 'cy': cy, 'cz': cz, 'elev': elev})
 
-            # 每個 leg 找最近的 track centroid → 用其 track_elevation 當 leg angle
+            # 腳架在圖面上繪製為垂直（0°），不需要角度映射
             leg_angles_map = {}
-            for leg in leg_items:
-                fid = leg.get('feature_id', '')
-                leg_c = leg.get('centroid', (0, 0, 0))
-                best_elev = 70.0
-                best_dist = float('inf')
-                for tc in track_centroids:
-                    d = math.sqrt((leg_c[0] - tc['cx'])**2 +
-                                  (leg_c[1] - tc['cy'])**2 +
-                                  (leg_c[2] - tc['cz'])**2)
-                    if d < best_dist:
-                        best_dist = d
-                        best_elev = tc['elev'] if tc['elev'] > 1 else 70.0
-                leg_angles_map[fid] = best_elev
 
             # 分段分析
             sections = self._detect_track_sections(pipe_centerlines,
@@ -4765,8 +4747,13 @@ Solid 名稱: {solid_name}
             output_paths.append(path1)
             log_print(f"  [OK] {path1}")
 
-            # DXF 預覽
-            self._open_dxf_preview(path1)
+            # 產生 PNG 預覽圖（使用 EngineeringViewer，非阻塞）
+            try:
+                preview_png = os.path.join(output_dir, f"{base_name}-1_preview.png")
+                EngineeringViewer.view_2d_dxf(path1, fast_mode=True, save_path=preview_png)
+                log_print(f"  [Preview] PNG 預覽: {preview_png}")
+            except Exception as pve:
+                log_print(f"  [Preview] 預覽生成失敗: {pve}", "warning")
 
         except Exception as e:
             log_print(f"[Error] Drawing 1 失敗: {e}", "error")
@@ -4994,8 +4981,13 @@ Solid 名稱: {solid_name}
             output_paths.append(path2)
             log_print(f"  [OK] {path2}")
 
-            # DXF 預覽（開啟預設檢視器）
-            self._open_dxf_preview(path2)
+            # 產生 PNG 預覽圖
+            try:
+                preview2 = os.path.join(output_dir, f"{base_name}_2_preview.png")
+                EngineeringViewer.view_2d_dxf(path2, fast_mode=True, save_path=preview2)
+                log_print(f"  [Preview] PNG 預覽: {preview2}")
+            except Exception as pve:
+                log_print(f"  [Preview] 預覽生成失敗: {pve}", "warning")
 
         except Exception as e:
             log_print(f"[Error] Drawing 2 失敗: {e}", "error")
@@ -5346,8 +5338,13 @@ Solid 名稱: {solid_name}
             output_paths.append(path3)
             log_print(f"  [OK] {path3}")
 
-            # DXF 預覽（開啟預設檢視器）
-            self._open_dxf_preview(path3)
+            # 產生 PNG 預覽圖
+            try:
+                preview3 = os.path.join(output_dir, f"{base_name}_3_preview.png")
+                EngineeringViewer.view_2d_dxf(path3, fast_mode=True, save_path=preview3)
+                log_print(f"  [Preview] PNG 預覽: {preview3}")
+            except Exception as pve:
+                log_print(f"  [Preview] 預覽生成失敗: {pve}", "warning")
 
         except Exception as e:
             log_print(f"[Error] Drawing 3 失敗: {e}", "error")
@@ -6693,6 +6690,15 @@ if __name__ == "__main__":
             log_print(f"[System] 共 {len(sub_drawings)} 張施工圖已生成")
             for i, dxf_path in enumerate(sub_drawings, 1):
                 log_print(f"  [{i}] {dxf_path}")
+
+            # 使用 EngineeringViewer 預覽每張施工圖
+            for dxf_path in sub_drawings:
+                if os.path.exists(dxf_path):
+                    try:
+                        log_print(f"正在預覽: {os.path.basename(dxf_path)}")
+                        EngineeringViewer.view_2d_dxf(dxf_path, fast_mode=True)
+                    except Exception as e:
+                        log_print(f"[Warning] 無法預覽 {dxf_path}: {e}", "warning")
         else:
             log_print("[Warning] 未能生成子系統施工圖", "warning")
     else:

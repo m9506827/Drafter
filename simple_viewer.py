@@ -4,6 +4,8 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
+import matplotlib.patches as mpatches
+import matplotlib.font_manager as fm
 import ezdxf
 from ezdxf import bbox
 from ezdxf.addons.drawing import RenderContext, Frontend
@@ -13,6 +15,29 @@ import pyvista as pv
 # 強制使用白色背景主題
 matplotlib.rcParams['figure.facecolor'] = 'white'
 matplotlib.rcParams['axes.facecolor'] = 'white'
+
+# DXF color index → matplotlib color (white bg: 0 and 7 map to black)
+_DXF_COLOR_MAP = {
+    0: 'black', 1: 'red', 2: 'yellow', 3: 'green',
+    4: 'cyan', 5: 'blue', 6: 'magenta', 7: 'black',
+}
+
+
+def _dxf_color(entity):
+    """Return matplotlib color string from DXF entity color index."""
+    c = entity.dxf.get('color', 7)
+    return _DXF_COLOR_MAP.get(c, 'black')
+
+
+def _find_cjk_font():
+    """Find a CJK-capable font available on the system."""
+    candidates = ['Microsoft JhengHei', 'SimHei', 'Noto Sans CJK TC',
+                  'Noto Sans CJK SC', 'MS Gothic', 'Arial Unicode MS']
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            return name
+    return None
 
 try:
     import cadquery as cq
@@ -292,33 +317,56 @@ class EngineeringViewer:
                 print("[Viewer] 使用快速渲染模式...")
                 fig, ax = plt.subplots(figsize=(10, 8), facecolor='white')
                 ax.set_facecolor('white')
-                
+
+                # CJK font for Chinese text
+                cjk_font = _find_cjk_font()
+                font_props = {'family': cjk_font} if cjk_font else {}
+                if cjk_font:
+                    print(f"[Viewer] 使用 CJK 字型: {cjk_font}")
+
                 # 直接讀取所有 LINE 實體
                 line_count = 0
                 for entity in msp.query('LINE'):
                     start = entity.dxf.start
                     end = entity.dxf.end
-                    ax.plot([start[0], end[0]], [start[1], end[1]], 
-                           'k-', linewidth=0.5)
+                    ax.plot([start[0], end[0]], [start[1], end[1]],
+                           color=_dxf_color(entity), linewidth=0.5)
                     line_count += 1
-                
+
                 print(f"[Viewer] 已繪製 {line_count} 條線段")
-                
-                # 繪製其他實體類型（如果需要）
+
+                # LWPOLYLINE
                 for entity in msp.query('LWPOLYLINE'):
                     points = list(entity.get_points('xy'))
                     if points:
                         xs = [p[0] for p in points]
                         ys = [p[1] for p in points]
-                        ax.plot(xs, ys, 'k-', linewidth=0.5)
-                
+                        ax.plot(xs, ys, color=_dxf_color(entity), linewidth=0.5)
+
+                # CIRCLE
                 for entity in msp.query('CIRCLE'):
                     center = entity.dxf.center
                     radius = entity.dxf.radius
                     circle = plt.Circle((center[0], center[1]), radius,
-                                       fill=False, edgecolor='black', linewidth=0.5)
+                                       fill=False, edgecolor=_dxf_color(entity),
+                                       linewidth=0.5)
                     ax.add_patch(circle)
 
+                # ARC
+                for entity in msp.query('ARC'):
+                    center = entity.dxf.center
+                    radius = entity.dxf.radius
+                    start_angle = entity.dxf.get('start_angle', 0)
+                    end_angle = entity.dxf.get('end_angle', 360)
+                    arc = mpatches.Arc((center[0], center[1]),
+                                      2 * radius, 2 * radius,
+                                      angle=0,
+                                      theta1=start_angle, theta2=end_angle,
+                                      edgecolor=_dxf_color(entity),
+                                      linewidth=0.5)
+                    ax.add_patch(arc)
+
+                # TEXT
                 for entity in msp.query('TEXT'):
                     insert = entity.dxf.insert
                     text = entity.dxf.text
@@ -327,8 +375,22 @@ class EngineeringViewer:
                     ax.text(insert[0], insert[1], text,
                             fontsize=max(6, height * 0.8),
                             rotation=rotation,
-                            color='black',
-                            ha='left', va='bottom')
+                            color=_dxf_color(entity),
+                            ha='left', va='bottom',
+                            **font_props)
+
+                # MTEXT
+                for entity in msp.query('MTEXT'):
+                    insert = entity.dxf.insert
+                    raw = entity.text  # plain text content
+                    height = entity.dxf.get('char_height', 10)
+                    rotation = entity.dxf.get('rotation', 0)
+                    ax.text(insert[0], insert[1], raw,
+                            fontsize=max(6, height * 0.8),
+                            rotation=rotation,
+                            color=_dxf_color(entity),
+                            ha='left', va='bottom',
+                            **font_props)
 
                 # 設定視圖
                 ax.set_xlim(xmin, xmax)
