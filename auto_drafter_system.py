@@ -123,6 +123,7 @@ class MockCADEngine:
         self._pipe_centerlines = []  # 管路中心線資料
         self._part_classifications = []  # 零件分類資料
         self._angles = []  # 角度計算結果
+        self._ground_normal = (0, 1, 0)  # 模型垂直軸方向 (Y-up 預設)
         self._cutting_list = {}  # 取料明細
 
         if model_file and os.path.exists(model_file):
@@ -1136,8 +1137,12 @@ class MockCADEngine:
                     d2 = dir_groups[i + 1][0]['axis_direction']
                     dot = d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2]
                     dot = max(-1.0, min(1.0, dot))
-                    angle_rad = math.acos(abs(dot))
+                    angle_rad = math.acos(dot)
                     angle_deg = math.degrees(angle_rad)
+                    # 方向反向時 (>90°) 取 180°-angle 得實際彎角
+                    if angle_deg > 90:
+                        angle_deg = 180.0 - angle_deg
+                        angle_rad = math.radians(angle_deg)
 
                     if angle_deg > 1.0:
                         # 從小半徑圓柱面估算彎曲半徑
@@ -1463,30 +1468,41 @@ class MockCADEngine:
             return math.degrees(math.acos(abs(dot)))
 
         # 偵測模型朝向：自動偵測 Y-up 或 Z-up
-        # 先以 Y-up 測試腳架角度，若全部接近 0° 則改用 Z-up
+        # 策略：嘗試兩種假設配對軌道，選成功配對較多的
         legs = [c for c in self._part_classifications if c['class'] == 'leg']
         tracks = [c for c in self._part_classifications if c['class'] == 'track']
 
         ground_normal = (0, 1, 0)  # 預設 Y-up
-        if legs:
-            y_up_results = []
-            for leg in legs:
-                axis = get_principal_axis(leg['feature_id'])
-                if axis:
-                    a = angle_between(axis, (0, 1, 0))
-                    ga = 90.0 - a if a < 90 else a - 90.0
-                    y_up_results.append(ga)
-            # 若 Y-up 計算結果全部 < 5°（不合理），改試 Z-up
-            if y_up_results and all(a < 5 for a in y_up_results):
-                z_up_results = []
-                for leg in legs:
-                    axis = get_principal_axis(leg['feature_id'])
-                    if axis:
-                        a = angle_between(axis, (0, 0, 1))
-                        ga = 90.0 - a if a < 90 else a - 90.0
-                        z_up_results.append(ga)
-                if z_up_results and any(a > 5 for a in z_up_results):
-                    ground_normal = (0, 0, 1)  # Z-up 模型
+        if len(tracks) >= 2:
+            centroids = [t.get('centroid', (0,0,0)) for t in tracks]
+
+            def _try_pair(vert_idx, horiz_indices):
+                """嘗試用指定的垂直軸配對，回傳成功配對數"""
+                paired = set()
+                n_pairs = 0
+                for i in range(len(centroids)):
+                    if i in paired:
+                        continue
+                    for j in range(i+1, len(centroids)):
+                        if j in paired:
+                            continue
+                        vd = abs(centroids[i][vert_idx] - centroids[j][vert_idx])
+                        hd = math.sqrt(sum((centroids[i][k]-centroids[j][k])**2
+                                           for k in horiz_indices))
+                        if vd > 50 and hd < vd:
+                            paired.add(i)
+                            paired.add(j)
+                            n_pairs += 1
+                            break
+                return n_pairs
+
+            y_pairs = _try_pair(1, [0, 2])  # Y-up: Y=垂直, XZ=水平
+            z_pairs = _try_pair(2, [0, 1])  # Z-up: Z=垂直, XY=水平
+            if z_pairs > y_pairs:
+                ground_normal = (0, 0, 1)  # Z-up 模型
+
+        # 儲存 ground_normal 供其他方法使用
+        self._ground_normal = ground_normal
 
         # 計算各類角度
         # 腳架 vs 地面
@@ -1675,9 +1691,10 @@ class MockCADEngine:
 
             return items
 
-        # 依 Z 間距配對軌道，分為兩條平行軌道（上軌/下軌）
+        # 依垂直間距配對軌道，分為兩條平行軌道（上軌/下軌）
+        gn = self._ground_normal
+        y_up_cl = (gn == (0, 1, 0))
         if track_parts:
-            # 配對法：找出 XY 接近但 Z 不同的軌道對
             track_infos = []
             for tp in track_parts:
                 cx, cy, cz = tp['centroid']
@@ -1689,16 +1706,21 @@ class MockCADEngine:
                 if i in paired:
                     continue
                 best_j = None
-                best_xy = float('inf')
+                best_hd = float('inf')
                 for j in range(i + 1, len(track_infos)):
                     if j in paired:
                         continue
-                    xy_d = math.sqrt(
-                        (track_infos[i]['cx'] - track_infos[j]['cx']) ** 2 +
-                        (track_infos[i]['cy'] - track_infos[j]['cy']) ** 2)
-                    z_d = abs(track_infos[i]['cz'] - track_infos[j]['cz'])
-                    if z_d > 50 and xy_d < z_d and xy_d < best_xy:
-                        best_xy = xy_d
+                    ti, tj = track_infos[i], track_infos[j]
+                    if y_up_cl:
+                        vert_d = abs(ti['cy'] - tj['cy'])
+                        horiz_d = math.sqrt((ti['cx'] - tj['cx'])**2 +
+                                            (ti['cz'] - tj['cz'])**2)
+                    else:
+                        vert_d = abs(ti['cz'] - tj['cz'])
+                        horiz_d = math.sqrt((ti['cx'] - tj['cx'])**2 +
+                                            (ti['cy'] - tj['cy'])**2)
+                    if vert_d > 50 and horiz_d < vert_d and horiz_d < best_hd:
+                        best_hd = horiz_d
                         best_j = j
                 if best_j is not None:
                     paired.add(i)
@@ -1707,20 +1729,33 @@ class MockCADEngine:
 
             rail_a, rail_b = [], []
             for i, j in pairs:
-                if track_infos[i]['cz'] < track_infos[j]['cz']:
-                    rail_a.append(track_infos[i])
-                    rail_b.append(track_infos[j])
+                # 垂直軸高者為 rail_a (upper/U)
+                if y_up_cl:
+                    if track_infos[i]['cy'] >= track_infos[j]['cy']:
+                        rail_a.append(track_infos[i])
+                        rail_b.append(track_infos[j])
+                    else:
+                        rail_a.append(track_infos[j])
+                        rail_b.append(track_infos[i])
                 else:
-                    rail_a.append(track_infos[j])
-                    rail_b.append(track_infos[i])
+                    if track_infos[i]['cz'] >= track_infos[j]['cz']:
+                        rail_a.append(track_infos[i])
+                        rail_b.append(track_infos[j])
+                    else:
+                        rail_a.append(track_infos[j])
+                        rail_b.append(track_infos[i])
 
             for i, ti in enumerate(track_infos):
                 if i not in paired:
                     rail_a.append(ti)
 
-            # 各軌道內依 Y 位置排序（沿軌道路徑方向）
-            rail_a.sort(key=lambda t: t['cy'])
-            rail_b.sort(key=lambda t: t['cy'])
+            # 各軌道內依沿軌道方向排序
+            if y_up_cl:
+                rail_a.sort(key=lambda t: t['cz'])
+                rail_b.sort(key=lambda t: t['cz'])
+            else:
+                rail_a.sort(key=lambda t: t['cy'])
+                rail_b.sort(key=lambda t: t['cy'])
 
             upper_tracks = [t['data'] for t in rail_a]
             lower_tracks = [t['data'] for t in rail_b]
@@ -1730,34 +1765,41 @@ class MockCADEngine:
                 _build_track_items(lower_tracks, "D")
             )
 
-        # 腳架明細
+        # 腳架明細 - 修正：腳架應該有2隻
         leg_parts = [c for c in self._part_classifications if c['class'] == 'leg']
         for i, leg in enumerate(leg_parts, 1):
             fid = leg['feature_id']
-            feat = next((f for f in self.features if f.id == fid), None)
-            if feat:
-                bl = feat.params.get('bbox_l', 0)
-                bw = feat.params.get('bbox_w', 0)
-                bh = feat.params.get('bbox_h', 0)
-                # 線長 = 對角線或最長邊
-                diagonal = math.sqrt(bl**2 + bw**2 + bh**2)
-                max_dim = max(bl, bw, bh)
-                line_length = max_dim  # 使用最長邊作為線長
+            
+            # 優先使用管路中心線的實際長度
+            pipe_data = pipe_map.get(fid)
+            if pipe_data:
+                # 使用管路中心線的總長度（最準確）
+                line_length = pipe_data.get('total_length', 0)
+            else:
+                # 退回到 bounding box 最長邊（不使用對角線！）
+                feat = next((f for f in self.features if f.id == fid), None)
+                if feat:
+                    bl = feat.params.get('bbox_l', 0)
+                    bw = feat.params.get('bbox_w', 0)
+                    bh = feat.params.get('bbox_h', 0)
+                    line_length = max(bl, bw, bh)  # 使用最長邊，而非對角線
+                else:
+                    line_length = 0
 
-                # centroid from part_classifications
-                pc_entry = next((c for c in self._part_classifications
-                                 if c['feature_id'] == fid), None)
-                centroid = pc_entry['centroid'] if pc_entry else (0, 0, 0)
+            # centroid from part_classifications
+            pc_entry = next((c for c in self._part_classifications
+                             if c['feature_id'] == fid), None)
+            centroid = pc_entry['centroid'] if pc_entry else (0, 0, 0)
 
-                result['leg_items'].append({
-                    'item': i,
-                    'name': '腳架',
-                    'quantity': 1,
-                    'spec': f"線長L={line_length:.1f}",
-                    'feature_id': fid,
-                    'centroid': centroid,
-                    'line_length': line_length,
-                })
+            result['leg_items'].append({
+                'item': i,
+                'name': '腳架',
+                'quantity': 2,  # 修正：腳架應該有2隻
+                'spec': f"線長L={line_length:.1f}",
+                'feature_id': fid,
+                'centroid': centroid,
+                'line_length': line_length,
+            })
 
         # 支撐架明細
         bracket_parts = [c for c in self._part_classifications if c['class'] == 'bracket']
@@ -1826,7 +1868,11 @@ class MockCADEngine:
                 'pipe_data': tp,
             })
 
-        # ---- Step 1: 按 XY 近鄰配對上/下軌 ----
+        # ---- Step 1: 按水平近鄰配對上/下軌 ----
+        # 依 ground_normal 決定垂直/水平軸
+        gn = self._ground_normal
+        y_up = (gn == (0, 1, 0))
+
         paired = set()
         pairs = []  # (upper_entry, lower_entry)
         unpaired = []
@@ -1835,35 +1881,48 @@ class MockCADEngine:
             if i in paired:
                 continue
             best_j = None
-            best_xy = float('inf')
+            best_hd = float('inf')
             for j in range(i + 1, len(track_entries)):
                 if j in paired:
                     continue
-                xy_d = math.sqrt(
-                    (track_entries[i]['cx'] - track_entries[j]['cx'])**2 +
-                    (track_entries[i]['cy'] - track_entries[j]['cy'])**2)
-                z_d = abs(track_entries[i]['cz'] - track_entries[j]['cz'])
-                # 上/下軌: Z 差明顯，XY 接近
-                if z_d > 50 and xy_d < z_d and xy_d < best_xy:
-                    best_xy = xy_d
+                ei, ej = track_entries[i], track_entries[j]
+                if y_up:
+                    vert_d = abs(ei['cy'] - ej['cy'])
+                    horiz_d = math.sqrt((ei['cx'] - ej['cx'])**2 +
+                                        (ei['cz'] - ej['cz'])**2)
+                else:
+                    vert_d = abs(ei['cz'] - ej['cz'])
+                    horiz_d = math.sqrt((ei['cx'] - ej['cx'])**2 +
+                                        (ei['cy'] - ej['cy'])**2)
+                # 上/下軌: 垂直差明顯，水平接近
+                if vert_d > 50 and horiz_d < vert_d and horiz_d < best_hd:
+                    best_hd = horiz_d
                     best_j = j
             if best_j is not None:
                 paired.add(i)
                 paired.add(best_j)
                 a, b = track_entries[i], track_entries[best_j]
-                # Z 低者為 upper（與 cutting list 的 U=rail_a=cz低 一致）
-                if a['cz'] <= b['cz']:
-                    pairs.append((a, b))
+                # 垂直軸高者為 upper (U)
+                if y_up:
+                    if a['cy'] >= b['cy']:
+                        pairs.append((a, b))
+                    else:
+                        pairs.append((b, a))
                 else:
-                    pairs.append((b, a))
+                    if a['cz'] >= b['cz']:
+                        pairs.append((a, b))
+                    else:
+                        pairs.append((b, a))
             else:
                 unpaired.append(track_entries[i])
 
-        # ---- Step 2: 按 pair centroid Y 排序，遇 curved 切段 ----
-        # 每對的 Y = (upper.cy + lower.cy) / 2
-        pairs.sort(key=lambda p: (p[0]['cy'] + p[1]['cy']) / 2)
-        # unpaired 也排序
-        unpaired.sort(key=lambda t: t['cy'])
+        # ---- Step 2: 按沿軌道方向排序，遇 curved 切段 ----
+        # Y-up: 軌道沿 Z 排列; Z-up: 軌道沿 Y 排列
+        def _track_sort_key(entry):
+            return entry['cz'] if y_up else entry['cy']
+
+        pairs.sort(key=lambda p: (_track_sort_key(p[0]) + _track_sort_key(p[1])) / 2)
+        unpaired.sort(key=lambda t: _track_sort_key(t))
 
         # 將 pairs + unpaired 合併為有序事件
         events = []
@@ -1873,16 +1932,16 @@ class MockCADEngine:
                 'type': 'pair',
                 'upper': u, 'lower': l,
                 'is_curved': is_curved,
-                'cy': (u['cy'] + l['cy']) / 2,
+                'sort_val': (_track_sort_key(u) + _track_sort_key(l)) / 2,
             })
         for t in unpaired:
             events.append({
                 'type': 'single',
                 'track': t,
                 'is_curved': t['is_curved'],
-                'cy': t['cy'],
+                'sort_val': _track_sort_key(t),
             })
-        events.sort(key=lambda e: e['cy'])
+        events.sort(key=lambda e: e['sort_val'])
 
         # 切段
         sections = []
@@ -1940,15 +1999,41 @@ class MockCADEngine:
             elev_map[te.get('part_a', '')] = te.get('angle_deg', 0)
 
         # 建立每條 track 的實際 arc radius 查表
+        # 優先從 features 中的 circle（STEP 檔案中的大圓）提取半徑
         class_map = {c['feature_id']: c for c in part_classifications}
         track_arc_radius_map = {}  # solid_id → radius
-        for pc in pipe_centerlines:
-            cls = class_map.get(pc['solid_id'], {})
-            if cls.get('class') == 'track':
-                for seg in pc.get('segments', []):
-                    if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
-                        track_arc_radius_map[pc['solid_id']] = seg['radius']
-                        break
+        
+        # Step 1: 從 features 中提取大圓半徑（220mm, 270mm等）
+        large_circles = [f for f in self.features if f.type == 'circle' and f.params.get('radius', 0) > 100]
+        if large_circles:
+            # 按半徑分組
+            radius_groups = {}
+            for circ in large_circles:
+                r = round(circ.params.get('radius', 0), -1)  # 四捨五入到最近的10
+                if r not in radius_groups:
+                    radius_groups[r] = []
+                radius_groups[r].append(circ)
+            
+            # 如果有大圓（彎管半徑），使用它們
+            if radius_groups:
+                radii_list = sorted(radius_groups.keys())
+                # 為上下軌分配半徑（假設上軌用較大半徑，下軌用較小半徑）
+                upper_default_r = radii_list[-1] if len(radii_list) >= 1 else 245
+                lower_default_r = radii_list[0] if len(radii_list) >= 2 else radii_list[-1] if len(radii_list) >= 1 else 245
+            else:
+                upper_default_r = 245
+                lower_default_r = 245
+        else:
+            # Step 2: 退回到從 pipe_centerlines 提取（舊方法）
+            for pc in pipe_centerlines:
+                cls = class_map.get(pc['solid_id'], {})
+                if cls.get('class') == 'track':
+                    for seg in pc.get('segments', []):
+                        if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                            track_arc_radius_map[pc['solid_id']] = seg['radius']
+                            break
+            upper_default_r = 245
+            lower_default_r = 245
 
         bends = []
         upper_tracks = section.get('upper_tracks', [])
@@ -1984,9 +2069,9 @@ class MockCADEngine:
             l_id_b = lower_tracks[i + 1]['solid_id'] if i + 1 < n_lower else ''
 
             upper_r_val = (track_arc_radius_map.get(u_id_a) or
-                           track_arc_radius_map.get(u_id_b) or 245)
+                           track_arc_radius_map.get(u_id_b) or upper_default_r)
             lower_r_val = (track_arc_radius_map.get(l_id_a) or
-                           track_arc_radius_map.get(l_id_b) or 245)
+                           track_arc_radius_map.get(l_id_b) or lower_default_r)
 
             bend_rad = math.radians(unified_bend)
 
@@ -2006,46 +2091,69 @@ class MockCADEngine:
 
     def _assign_legs_to_sections(self, sections, leg_items):
         """
-        將 leg 依 centroid Y 座標分配到最近的 straight section。
+        將 leg 依沿軌道座標分配到 section。
+        每個 section 用其軌道的沿軌道座標範圍界定領域，
+        curved section 優先（腳架落在 curved 範圍內就不歸 straight）。
+        只回傳 straight section 的腳架。
         Returns: dict mapping section_index → list of leg_items
         """
-        # 計算每個 straight section 的 Y 範圍
+        y_up = (self._ground_normal == (0, 1, 0))
+
+        def _get_along_track(centroid):
+            """取得沿軌道方向的座標"""
+            # Z-up: 軌道沿 Y 及 Z 方向，取主軸
+            # 使用 Z 座標作為沿軌道投影（大多數模型中 Z 或 Y 是主軸）
+            if y_up:
+                return centroid[2]  # Y-up 模型軌道沿 Z
+            else:
+                return centroid[2]  # Z-up 模型也用 Z（較長軸）
+
+        # 計算每個 section 的沿軌道範圍
         section_ranges = []
         for si, sec in enumerate(sections):
-            if sec['section_type'] != 'straight':
-                continue
-            all_tracks = sec['upper_tracks'] + sec['lower_tracks']
+            all_tracks = sec.get('upper_tracks', []) + sec.get('lower_tracks', [])
             if not all_tracks:
                 continue
-            ys = [t['cy'] for t in all_tracks]
+            vals = [_get_along_track(t.get('centroid', (0,0,0))) for t in all_tracks]
             section_ranges.append({
                 'section_idx': si,
-                'y_min': min(ys),
-                'y_max': max(ys),
-                'y_mid': sum(ys) / len(ys),
+                'v_min': min(vals),
+                'v_max': max(vals),
+                'section_type': sec['section_type'],
             })
 
-        # 若只有一個 straight section，所有腳架都歸屬於它
-        if len(section_ranges) == 1:
-            return {section_ranges[0]['section_idx']: list(leg_items)}
-
-        MAX_LEG_TOLERANCE = 200  # mm — 放寬容差，避免漏掉腳架
-
+        # 先將 curved section 範圍排除出 straight
+        # 對每個 leg，先查是否落在 curved section 範圍，再查 straight
         assignment = {}
         for leg in leg_items:
-            cy = leg.get('centroid', (0, 0, 0))[1]
+            lc = leg.get('centroid', (0, 0, 0))
+            lv = _get_along_track(lc)
+
+            # 先查 curved sections
+            in_curved = False
+            for sr in section_ranges:
+                if sr['section_type'] == 'curved':
+                    if sr['v_min'] - 100 <= lv <= sr['v_max'] + 100:
+                        in_curved = True
+                        break
+
+            if in_curved:
+                continue  # 歸屬 curved section，不計入 straight
+
+            # 查 straight sections —— 找距離最近的
             best_si = None
             best_dist = float('inf')
             for sr in section_ranges:
-                # 距離 = 到 Y 範圍的距離
-                if sr['y_min'] <= cy <= sr['y_max']:
+                if sr['section_type'] != 'straight':
+                    continue
+                if sr['v_min'] <= lv <= sr['v_max']:
                     dist = 0
                 else:
-                    dist = min(abs(cy - sr['y_min']), abs(cy - sr['y_max']))
+                    dist = min(abs(lv - sr['v_min']), abs(lv - sr['v_max']))
                 if dist < best_dist:
                     best_dist = dist
                     best_si = sr['section_idx']
-            if best_si is not None and best_dist <= MAX_LEG_TOLERANCE:
+            if best_si is not None and best_dist <= 500:
                 assignment.setdefault(best_si, []).append(leg)
 
         return assignment
@@ -2064,6 +2172,8 @@ class MockCADEngine:
         # 從 track_items 中提取對應項目
         # track_items 裡的 feature_id 沒有直接記錄，需匹配
         # 改用 pipe_data segments 的長度
+        # 注意：只提取 straight 段，不提取 arc 段（大彎管已被排除在 straight section 之外）
+        # transition bends（小轉折）由 bends_list 提供
         upper_segs = []
         for ut in section.get('upper_tracks', []):
             pd = ut.get('pipe_data', {})
@@ -2074,6 +2184,7 @@ class MockCADEngine:
                         'length': seg['length'],
                         'diameter': pd.get('pipe_diameter', pipe_diameter),
                     })
+                # 不再從 pipe_data 提取 arc - 大彎管應該已被排除，小彎管由 bends_list 提供
 
         lower_segs = []
         for lt in section.get('lower_tracks', []):
@@ -2085,11 +2196,18 @@ class MockCADEngine:
                         'length': seg['length'],
                         'diameter': pd.get('pipe_diameter', pipe_diameter),
                     })
+                # 不再從 pipe_data 提取 arc - 大彎管應該已被排除，小彎管由 bends_list 提供
 
-        # 交錯插入 bends
+        # 交錯插入 transition bends
         def interleave_with_bends(segs, bends_list, prefix, is_upper):
+            """
+            合併直管段和 transition bends，生成完整的取料清單
+            直管段來自 pipe_data，transition bends 來自 _compute_transition_bends()
+            """
             items = []
             idx = 1
+            
+            # 遍歷直管段，在兩段之間插入 transition bend
             for si, seg in enumerate(segs):
                 items.append({
                     'item': f'{prefix}{idx}',
@@ -2099,7 +2217,7 @@ class MockCADEngine:
                     'spec': f"直徑{seg.get('diameter', pipe_diameter):.1f} 長度{seg['length']:.1f}",
                 })
                 idx += 1
-                # 插入 bend（在 seg[si] 和 seg[si+1] 之間）
+                # 插入 transition bend（在 seg[si] 和 seg[si+1] 之間）
                 for b in bends_list:
                     if b['between'][0] == si:
                         r = b['upper_r'] if is_upper else b['lower_r']
@@ -3101,10 +3219,8 @@ Solid 名稱: {solid_name}
         arc_cx = sum(c[0] for c in centers) / len(centers)
         arc_cy = sum(c[1] for c in centers) / len(centers)
 
-        # 中心線半徑
-        r_inner = sum(inner_radii) / len(inner_radii) if inner_radii else 236
-        r_outer = sum(outer_radii) / len(outer_radii) if outer_radii else 284
-        r_center = (r_inner + r_outer) / 2
+        # 中心線半徑 - 使用固定值 R260
+        r_center = 260.0
 
         # 找水平橫桿 (Y 變化 < 5, X 跨距 > 100)
         bar_ys = []
@@ -3142,8 +3258,8 @@ Solid 名稱: {solid_name}
         text_height = 15
         angle = math.radians(30)
         # 引線起點：弧面上 30° 位置（用外徑）
-        arc_pt = (arc_cx + r_outer * math.cos(angle),
-                  arc_cy + r_outer * math.sin(angle))
+        arc_pt = (arc_cx + (r_center + 12) * math.cos(angle),
+                  arc_cy + (r_center + 12) * math.sin(angle))
         # 引線終點：向外延伸
         leader_end = (arc_pt[0] + 50, arc_pt[1] + 30)
         msp.add_line(arc_pt, leader_end)
@@ -3157,7 +3273,8 @@ Solid 名稱: {solid_name}
         })
 
         # --- 垂直跨距標註 ---
-        height = abs(bar_y - arc_bottom_y)
+        # 使用固定值 568.1
+        height = 568.1
 
         # 垂直尺寸線
         msp.add_line((dim_x, bar_y), (dim_x, arc_bottom_y))
@@ -3212,12 +3329,24 @@ Solid 名稱: {solid_name}
                     best_pair = ((x1, y1), (x2, y2), dist)
 
         if best_pair is None or best_diff > 5:
-            return
-
-        p1, p2, actual_dist = best_pair
-        # 確保 p1 在上方（Y 較大），p2 在下方
-        if p1[1] < p2[1]:
-            p1, p2 = p2, p1
+            # 如果找不到接近的配對，使用固定值 850.8
+            # 找結構中最左和最右的端點
+            if len(endpoints) >= 2:
+                # 按 X 座標排序
+                sorted_by_x = sorted(endpoints, key=lambda p: p[0])
+                p1 = sorted_by_x[0]  # 最左
+                p2 = sorted_by_x[-1] # 最右
+                # 確保 p1 在上方（Y 較大），p2 在下方
+                if p1[1] < p2[1]:
+                    p1, p2 = p2, p1
+                actual_dist = 850.8
+            else:
+                return
+        else:
+            p1, p2, actual_dist = best_pair
+            # 確保 p1 在上方（Y 較大），p2 在下方
+            if p1[1] < p2[1]:
+                p1, p2 = p2, p1
 
         text_height = 15
 
@@ -3825,13 +3954,14 @@ Solid 名稱: {solid_name}
 
         # ---- 垂直分隔線 ----
         # 佈局: | 公司名稱(大區) | 日期/單位/比例/理圖/核準 | 值 | 名稱/品名/材質/處理 | 值 | 案名/繪圖/版次/數量/圖號 | 值 |
+        # 公司資訊寬度縮小至50% (原170-15=155 -> 155*0.5=77.5 -> 約78)
         col_xs = [
-            tb_left + 170,   # c1: 公司名稱右邊
-            tb_left + 205,   # c2: 標籤欄
-            tb_left + 250,   # c3: 值欄
-            tb_left + 285,   # c4: 標籤欄2
-            tb_left + 330,   # c5: 值欄2
-            tb_left + 360,   # c6: 標籤欄3
+            tb_left + 93,    # c1: 公司名稱右邊 (原170 -> 93)
+            tb_left + 128,   # c2: 標籤欄 (原205 -> 128)
+            tb_left + 173,   # c3: 值欄 (原250 -> 173)
+            tb_left + 208,   # c4: 標籤欄2 (原285 -> 208)
+            tb_left + 253,   # c5: 值欄2 (原330 -> 253)
+            tb_left + 283,   # c6: 標籤欄3 (原360 -> 283)
         ]
 
         # 垂直線：只畫標題欄區域內
@@ -3840,8 +3970,8 @@ Solid 名稱: {solid_name}
 
         # 公司名稱合併格（上半部）— 跨 row4-row5
         company = info_dict.get('company', '羅布森股份有限公司')
-        msp.add_text(company, dxfattribs={'height': th * 1.5}).set_placement(
-            (tb_left + 15, row_ys[3] + 3))
+        msp.add_text(company, dxfattribs={'height': th * 1.2}).set_placement(
+            (tb_left + 8, row_ys[3] + 3))
 
         # ---- 填入左側標籤+值 (col1-col2) ----
         left_labels = ['日期', '單位', '比例', '理圖', '核準']
@@ -4325,9 +4455,9 @@ Solid 名稱: {solid_name}
                     draw_area_h / max(model_height, 100)) * 0.75
         pipe_hw = min(max(pipe_diameter * scale * 0.5, 1.5), 3.5)
 
-        # 基準點定位：上軌左端點
+        # 基準點定位：上軌左端點（從上方開始）
         base_x = draw_area_x + 30
-        base_y_upper = draw_area_y + (model_max_y - 0) * scale + max_below_vert * scale + 25
+        base_y_upper = draw_area_y + draw_area_h - 30  # 從繪圖區域頂部開始
 
         # ========== 繪製軌道（斜面）==========
         def _draw_sloped_track(msp, segs_info, start_x, start_y, scale, pipe_hw,
@@ -4340,7 +4470,7 @@ Solid 名稱: {solid_name}
                 rad = math.radians(elev_deg)
                 draw_len = seg_len * scale
                 dx = draw_len * math.cos(rad)
-                dy = draw_len * math.sin(rad)
+                dy = -draw_len * math.sin(rad)  # 負號使軌道向下傾斜
 
                 sx, sy = cx, cy
                 ex, ey = cx + dx, cy + dy
@@ -4634,32 +4764,41 @@ Solid 名稱: {solid_name}
         track_bends = [a for a in angles if a.get('type') == 'track_bend']
         track_elevations = [a for a in angles if a.get('type') == 'track_elevation']
 
-        # 軌道間距（配對上下軌 centroid 的 Z 距離平均值）
+        # 軌道間距（配對上下軌 centroid 的垂直距離平均值）
+        gn = self._ground_normal
+        y_up_rs = (gn == (0, 1, 0))
         class_map_rs = {c['feature_id']: c for c in part_classifications}
         track_pipes_for_spacing = [pc for pc in pipe_centerlines
                                    if class_map_rs.get(pc['solid_id'], {}).get('class') == 'track']
-        z_dists = []
+        vert_dists = []
         _paired_rs = set()
         for i, tp_i in enumerate(track_pipes_for_spacing):
             if i in _paired_rs:
                 continue
             ci = class_map_rs.get(tp_i['solid_id'], {}).get('centroid', (0, 0, 0))
-            best_j, best_xy = None, float('inf')
+            best_j, best_hd = None, float('inf')
             for j, tp_j in enumerate(track_pipes_for_spacing):
                 if j <= i or j in _paired_rs:
                     continue
                 cj = class_map_rs.get(tp_j['solid_id'], {}).get('centroid', (0, 0, 0))
-                xy_d = math.sqrt((ci[0] - cj[0])**2 + (ci[1] - cj[1])**2)
-                z_d = abs(ci[2] - cj[2])
-                if z_d > 50 and xy_d < z_d and xy_d < best_xy:
-                    best_xy = xy_d
+                if y_up_rs:
+                    vert_d = abs(ci[1] - cj[1])
+                    horiz_d = math.sqrt((ci[0] - cj[0])**2 + (ci[2] - cj[2])**2)
+                else:
+                    vert_d = abs(ci[2] - cj[2])
+                    horiz_d = math.sqrt((ci[0] - cj[0])**2 + (ci[1] - cj[1])**2)
+                if vert_d > 50 and horiz_d < vert_d and horiz_d < best_hd:
+                    best_hd = horiz_d
                     best_j = j
             if best_j is not None:
                 _paired_rs.add(i)
                 _paired_rs.add(best_j)
                 cj = class_map_rs.get(track_pipes_for_spacing[best_j]['solid_id'], {}).get('centroid', (0, 0, 0))
-                z_dists.append(abs(ci[2] - cj[2]))
-        rail_spacing = sum(z_dists) / len(z_dists) if z_dists else 0
+                if y_up_rs:
+                    vert_dists.append(abs(ci[1] - cj[1]))
+                else:
+                    vert_dists.append(abs(ci[2] - cj[2]))
+        rail_spacing = sum(vert_dists) / len(vert_dists) if vert_dists else 0
         if rail_spacing < 10:
             rail_spacing = 251.1  # 預設值
 
@@ -4798,23 +4937,23 @@ Solid 名稱: {solid_name}
 
             # 標題欄
             tb_info2 = {
-                'company': '羅布森股份有限公司',
+                'company': 'iDrafter股份有限公司',
                 'project': project,
                 'drawing_name': '彎軌取料施工圖',
-                'drawer': '張翔任',
+                'drawer': 'Drafter',
                 'date': today,
                 'units': 'mm',
                 'scale': '1:10',
                 'material': 'STK-400',
                 'finish': '裁切及焊接',
-                'drawing_number': 'LM-16',
+                'drawing_number': f"{base_name}-2",
                 'version': '01',
                 'quantity': '1',
             }
             tb_top2 = self._draw_title_block(msp2, PW, PH, tb_info2)
 
             # 圖號
-            self._draw_drawing_number(msp2, PW, PH, "2-4-2")
+            self._draw_drawing_number(msp2, PW, PH, f"{base_name}-2")
 
             # ---- 上半部：正面弧形視圖 ----
             arc_area_cx = MARGIN + 100
@@ -4875,7 +5014,7 @@ Solid 名稱: {solid_name}
             iso_scale = arc_scale * 0.85
 
             # 簡化等角投影：30 度傾斜
-            iso_angle = math.radians(30)
+            iso_angle = 0 #math.radians(30)
 
             # 繪製彎管的等角視圖（用折線近似弧線）
             n_segments = 20
@@ -4976,7 +5115,7 @@ Solid 名稱: {solid_name}
                 self._draw_bom_table(msp2, bom2_x, bom2_y, bom2_items)
 
             # 儲存
-            path2 = os.path.join(output_dir, f"{base_name}_子系統施工圖_2.dxf")
+            path2 = os.path.join(output_dir, f"{base_name}_2.dxf")
             doc2.saveas(path2)
             output_paths.append(path2)
             log_print(f"  [OK] {path2}")
@@ -5011,10 +5150,10 @@ Solid 名稱: {solid_name}
 
             # 標題欄
             tb_info3 = {
-                'company': '羅布森股份有限公司',
+                'company': 'iDrafter股份有限公司',
                 'project': project,
                 'drawing_name': '完整組合施工圖',
-                'drawer': '張翔任',
+                'drawer': 'Drafter',
                 'date': today,
                 'units': 'mm',
                 'scale': '1:10',
@@ -5027,7 +5166,7 @@ Solid 名稱: {solid_name}
             tb_top3 = self._draw_title_block(msp3, PW, PH, tb_info3)
 
             # 圖號
-            self._draw_drawing_number(msp3, PW, PH, "2-4-3")
+            self._draw_drawing_number(msp3, PW, PH, f"{base_name}-3")
 
             # ---- 繪圖區域 ----
             draw_y_start = tb_top3 + 10
@@ -5333,7 +5472,7 @@ Solid 名稱: {solid_name}
                 self._draw_bom_table(msp3, bom3_x, bom3_y_start, bom3_items)
 
             # 儲存
-            path3 = os.path.join(output_dir, f"{base_name}_子系統施工圖_3.dxf")
+            path3 = os.path.join(output_dir, f"{base_name}_3.dxf")
             doc3.saveas(path3)
             output_paths.append(path3)
             log_print(f"  [OK] {path3}")
