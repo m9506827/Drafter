@@ -3927,52 +3927,56 @@ Solid 名稱: {solid_name}
 
     def _draw_title_block(self, msp, pw, ph, info_dict):
         """
-        繪製標準標題欄（匹配參考圖樣式）
+        繪製標準標題欄（匹配參考圖樣式）- 50%大小，右下角
         info_dict keys: company, project, drawing_name, drawer, date,
                         units, scale, material, finish, drawing_number,
                         version, quantity
         """
         margin = 10
-        th = 3.0  # 基準文字高度
-
-        # 標題欄區域：圖框底部，高度 55
-        tb_h = 55
+        scale_factor = 0.5  # 縮小至 50%
+        th = 3.0 * scale_factor  # 基準文字高度縮小
+        
+        # 標題欄區域：縮小至 50%
+        tb_h = 55 * scale_factor  # 高度縮小
+        tb_w = 360 * scale_factor  # 原始寬度約360，縮小至180
+        
+        # 位置：右下角
         tb_y = margin  # 底邊
         tb_top = tb_y + tb_h
-        tb_left = margin
-        tb_right = pw - margin
-
-        # 外框（標題欄上緣線）
-        msp.add_line((tb_left, tb_top), (tb_right, tb_top))
+        tb_right = pw - margin  # 右對齊
+        tb_left = tb_right - tb_w  # 左邊界
+        
+        # 外框
+        msp.add_line((tb_left, tb_y), (tb_right, tb_y))  # 底邊
+        msp.add_line((tb_left, tb_top), (tb_right, tb_top))  # 頂邊
+        msp.add_line((tb_left, tb_y), (tb_left, tb_top))  # 左邊
+        msp.add_line((tb_right, tb_y), (tb_right, tb_top))  # 右邊
 
         # ---- 水平分隔線 ----
-        row_h = 9  # 每列高度
+        row_h = 9 * scale_factor  # 每列高度縮小
         # 從底部往上的水平線 y 座標
         row_ys = [tb_y + row_h * i for i in range(1, 6)]
         for ry in row_ys:
             msp.add_line((tb_left, ry), (tb_right, ry))
 
-        # ---- 垂直分隔線 ----
-        # 佈局: | 公司名稱(大區) | 日期/單位/比例/理圖/核準 | 值 | 名稱/品名/材質/處理 | 值 | 案名/繪圖/版次/數量/圖號 | 值 |
-        # 公司資訊寬度縮小至50% (原170-15=155 -> 155*0.5=77.5 -> 約78)
+        # ---- 垂直分隔線（所有距離縮小50%）----
         col_xs = [
-            tb_left + 93,    # c1: 公司名稱右邊 (原170 -> 93)
-            tb_left + 128,   # c2: 標籤欄 (原205 -> 128)
-            tb_left + 173,   # c3: 值欄 (原250 -> 173)
-            tb_left + 208,   # c4: 標籤欄2 (原285 -> 208)
-            tb_left + 253,   # c5: 值欄2 (原330 -> 253)
-            tb_left + 283,   # c6: 標籤欄3 (原360 -> 283)
+            tb_left + 85 * scale_factor,   # c1: 公司名稱右邊
+            tb_left + 120 * scale_factor,  # c2: 標籤欄
+            tb_left + 165 * scale_factor,  # c3: 值欄
+            tb_left + 200 * scale_factor,  # c4: 標籤欄2
+            tb_left + 245 * scale_factor,  # c5: 值欄2
+            tb_left + 280 * scale_factor,  # c6: 標籤欄3
         ]
 
         # 垂直線：只畫標題欄區域內
         for cx in col_xs:
             msp.add_line((cx, tb_y), (cx, tb_top))
 
-        # 公司名稱合併格（上半部）— 跨 row4-row5（參考2-2-1.jpg格式）
+        # 公司名稱合併格（上半部）— 跨 row4-row5
         company = info_dict.get('company', '羅布森股份有限公司')
         company_h = th * 2.0  # 字體大小
-        # 參考圖中公司名稱位置：左側偏中，垂直置中
-        company_x = tb_left + 20
+        company_x = tb_left + 10 * scale_factor
         company_y = row_ys[3] + (tb_top - row_ys[3]) / 2 - company_h / 2.5
         msp.add_text(company, dxfattribs={'height': company_h}).set_placement(
             (company_x, company_y))
@@ -3995,11 +3999,11 @@ Solid 名稱: {solid_name}
             '',
         ]
         for i, (lbl, val) in enumerate(zip(left_labels, left_values)):
-            y_pos = tb_y + i * row_h + 2
+            y_pos = tb_y + i * row_h + 1 * scale_factor
             msp.add_text(lbl, dxfattribs={'height': th}).set_placement(
-                (col_xs[0] + 5, y_pos))
+                (col_xs[0] + 2 * scale_factor, y_pos))
             msp.add_text(val, dxfattribs={'height': th}).set_placement(
-                (col_xs[1] + 5, y_pos))
+                (col_xs[1] + 2 * scale_factor, y_pos))
 
         # ---- 中間標籤+值 (col3-col4) ----
         mid_labels = ['名稱', '品名', '材質', '處理', '']
@@ -4011,11 +4015,11 @@ Solid 名稱: {solid_name}
             '',
         ]
         for i, (lbl, val) in enumerate(zip(mid_labels, mid_values)):
-            y_pos = tb_y + i * row_h + 2
+            y_pos = tb_y + i * row_h + 1 * scale_factor
             msp.add_text(lbl, dxfattribs={'height': th}).set_placement(
-                (col_xs[2] + 5, y_pos))
+                (col_xs[2] + 2 * scale_factor, y_pos))
             msp.add_text(val, dxfattribs={'height': th}).set_placement(
-                (col_xs[3] + 5, y_pos))
+                (col_xs[3] + 2 * scale_factor, y_pos))
 
         # ---- 右側標籤+值 (col5-右邊界) ----
         right_labels = ['案名', '繪圖', '版次', '數量', '圖號']
@@ -4029,16 +4033,16 @@ Solid 名稱: {solid_name}
         ]
         # 案名跨頂部大格
         msp.add_text('案名', dxfattribs={'height': th}).set_placement(
-            (col_xs[4] + 3, row_ys[4] + 2))
+            (col_xs[4] + 2 * scale_factor, row_ys[4] + 1 * scale_factor))
         msp.add_text(project, dxfattribs={'height': th}).set_placement(
-            (col_xs[5] + 3, row_ys[4] + 2))
+            (col_xs[5] + 2 * scale_factor, row_ys[4] + 1 * scale_factor))
         # 繪圖 ~ 圖號
         for i, (lbl, val) in enumerate(zip(right_labels[1:], right_values[1:])):
-            y_pos = tb_y + i * row_h + 2
+            y_pos = tb_y + i * row_h + 1 * scale_factor
             msp.add_text(lbl, dxfattribs={'height': th}).set_placement(
-                (col_xs[4] + 3, y_pos))
+                (col_xs[4] + 2 * scale_factor, y_pos))
             msp.add_text(val, dxfattribs={'height': th}).set_placement(
-                (col_xs[5] + 3, y_pos))
+                (col_xs[5] + 2 * scale_factor, y_pos))
 
         return tb_top  # 返回標題欄頂部 y 座標
 
