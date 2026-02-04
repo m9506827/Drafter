@@ -3968,10 +3968,14 @@ Solid 名稱: {solid_name}
         for cx in col_xs:
             msp.add_line((cx, tb_y), (cx, tb_top))
 
-        # 公司名稱合併格（上半部）— 跨 row4-row5
+        # 公司名稱合併格（上半部）— 跨 row4-row5（參考2-2-1.jpg格式）
         company = info_dict.get('company', '羅布森股份有限公司')
-        msp.add_text(company, dxfattribs={'height': th * 1.2}).set_placement(
-            (tb_left + 8, row_ys[3] + 3))
+        company_h = th * 2.0  # 字體大小
+        # 參考圖中公司名稱位置：左側偏中，垂直置中
+        company_x = tb_left + 20
+        company_y = row_ys[3] + (tb_top - row_ys[3]) / 2 - company_h / 2.5
+        msp.add_text(company, dxfattribs={'height': company_h}).set_placement(
+            (company_x, company_y))
 
         # ---- 填入左側標籤+值 (col1-col2) ----
         left_labels = ['日期', '單位', '比例', '理圖', '核準']
