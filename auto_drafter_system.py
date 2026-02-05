@@ -4990,8 +4990,13 @@ Solid 名稱: {solid_name}
             if arc_radius == 0:
                 arc_radius = 260
 
-            # 仰角 - 使用固定測試值 32 度
-            elevation_deg = 32  # 固定測試仰角
+            # 仰角 - 從第一個軌道仰角取得（非彎管的軌道）
+            elevation_deg = 0
+            for te in track_elevations:
+                angle = te.get('angle_deg', 0)
+                if angle > 0:  # 排除彎管（仰角為 0）
+                    elevation_deg = angle
+                    break
 
             # 弦長
             chord_length = 2 * arc_radius * math.sin(math.radians(arc_angle_deg / 2))
