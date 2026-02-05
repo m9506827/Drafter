@@ -2080,9 +2080,21 @@ class MockCADEngine:
                  upper_r, lower_r, upper_arc, lower_arc, position}
                  position: 'entry' (彎軌出口), 'exit' (彎軌入口), 或 'between' (軌道間)
         """
+        # 建立 elev_map：從 pipe_data 的 start_point/end_point 計算仰角
+        # 原來的 track_elevations 計算不正確（全部是 0），改用直接計算
         elev_map = {}
-        for te in track_elevations:
-            elev_map[te.get('part_a', '')] = te.get('angle_deg', 0)
+        class_map = {c['feature_id']: c for c in part_classifications}
+        
+        for pc in pipe_centerlines:
+            fid = pc['solid_id']
+            cls = class_map.get(fid, {})
+            if cls.get('class') == 'track':
+                sp = pc.get('start_point', (0, 0, 0))
+                ep = pc.get('end_point', (0, 0, 0))
+                dz = abs(ep[2] - sp[2])
+                dxy = math.sqrt((ep[0] - sp[0])**2 + (ep[1] - sp[1])**2)
+                elev = math.degrees(math.atan2(dz, dxy)) if dxy > 1e-6 else 0
+                elev_map[fid] = elev
 
         # 建立每條 track 的實際 arc radius 查表
         # 優先從 features 中的 circle（STEP 檔律中的大圓）提取半徑
@@ -2220,32 +2232,51 @@ class MockCADEngine:
         # - 上軌：U1(直線) → U2(12°彎) → U3(直線過渡段)
         # - 下軌：D1(直線過渡段) → D2(12°彎) → D3(直線)
         if is_before_curved and n_pairs >= 1:
-            # 計算上下軌的仰角差
-            u_elev = elev_map.get(upper_tracks[0]['solid_id'], 0) if n_upper >= 1 else 0
-            l_elev = elev_map.get(lower_tracks[0]['solid_id'], 0) if n_lower >= 1 else 0
-            elev_diff = abs(u_elev - l_elev)
+            # 計算 section 內所有軌道的仰角差（上下軌配對的仰角差）
+            # Drawing 1: F02(上軌, 32°) 和 F05(下軌, 44°) → 差 12°
+            all_elevs = []
+            for t in upper_tracks:
+                e = elev_map.get(t['solid_id'], 0)
+                if e > 0:
+                    all_elevs.append(e)
+            for t in lower_tracks:
+                e = elev_map.get(t['solid_id'], 0)
+                if e > 0:
+                    all_elevs.append(e)
             
-            # 如果有仰角差，使用 12° 作為 transition bend 角度
-            if elev_diff > 0.5:
-                exit_bend_deg = 12.0  # 設計規範角度
-                bend_rad = math.radians(exit_bend_deg)
-                
-                # 添加彎軌入口的 exit bend
-                # 注意：不分割現有軌道，因為過渡段在模型中沒有獨立建模
-                # 只在直軌末端添加 exit bend（連接到大彎軌）
-                bends.append({
-                    'angle_deg': exit_bend_deg,
-                    'upper_bend_deg': exit_bend_deg,
-                    'lower_bend_deg': exit_bend_deg,
-                    'arc_r': round((upper_default_r + lower_default_r) / 2, 0),
-                    'upper_r': round(upper_default_r, 0),
-                    'lower_r': round(lower_default_r, 0),
-                    'upper_arc': round((upper_default_r + pipe_diameter / 2) * bend_rad, 0),
-                    'lower_arc': round((lower_default_r + pipe_diameter / 2) * bend_rad, 0),
-                    'position': 'exit',
-                    'exit_straight_upper': 0,  # 不添加額外過渡段
-                    'exit_straight_lower': 0,  # 不添加額外過渡段
-                })
+            if len(all_elevs) >= 2:
+                # 使用最大和最小仰角的差
+                exit_bend_deg = round(abs(max(all_elevs) - min(all_elevs)))
+                log_print(f"  計算仰角差: max={max(all_elevs):.1f}° min={min(all_elevs):.1f}° → {exit_bend_deg}°")
+            elif len(all_elevs) == 1:
+                # 只有一個仰角，無法計算差
+                exit_bend_deg = 12.0
+            else:
+                exit_bend_deg = 12.0
+            
+            # 確保角度合理
+            if exit_bend_deg < 1:
+                exit_bend_deg = 12.0  # 回退到預設值
+            
+            log_print(f"  彎軌入口 transition bend: {exit_bend_deg:.0f}°")
+            bend_rad = math.radians(exit_bend_deg)
+            
+            # 添加彎軌入口的 exit bend
+            # 注意：不分割現有軌道，因為過渡段在模型中沒有獨立建模
+            # 只在直軌末端添加 exit bend（連接到大彎軌）
+            bends.append({
+                'angle_deg': exit_bend_deg,
+                'upper_bend_deg': exit_bend_deg,
+                'lower_bend_deg': exit_bend_deg,
+                'arc_r': round((upper_default_r + lower_default_r) / 2, 0),
+                'upper_r': round(upper_default_r, 0),
+                'lower_r': round(lower_default_r, 0),
+                'upper_arc': round((upper_default_r + pipe_diameter / 2) * bend_rad, 0),
+                'lower_arc': round((lower_default_r + pipe_diameter / 2) * bend_rad, 0),
+                'position': 'exit',
+                'exit_straight_upper': 0,  # 不添加額外過渡段
+                'exit_straight_lower': 0,  # 不添加額外過渡段
+            })
 
         # ========== 原有邏輯：軌道間 transition bends ==========
         if n_pairs < 2:
@@ -2258,16 +2289,18 @@ class MockCADEngine:
             l_elev_a = elev_map.get(lower_tracks[i]['solid_id'], 0) if i < n_lower else 0
             l_elev_b = elev_map.get(lower_tracks[i + 1]['solid_id'], 0) if i + 1 < n_lower else 0
 
-            # Fix 3: 使用固定彎角 12° (設計規範值)
-            # 原計算方法無法得到正確角度，改用設計規範
+            # 計算相鄰軌道的平均仰角差
             avg_elev_a = (u_elev_a + l_elev_a) / 2
             avg_elev_b = (u_elev_b + l_elev_b) / 2
             calculated_bend = abs(avg_elev_b - avg_elev_a)
             
-            # 如果計算出有仰角差，使用固定設計角度 12°
+            # 如果計算出的仰角差太小，跳過
             if calculated_bend < 0.5:
                 continue
-            unified_bend = 12.0  # 固定設計規範角度
+            
+            # 使用計算出的彎角（四捨五入到整數）
+            unified_bend = round(calculated_bend)
+            log_print(f"  軌道間 transition bend: {unified_bend:.0f}° (計算值: {calculated_bend:.1f}°)")
 
             # Fix 4: 從 track_arc_radius_map 查表取各軌的實際半徑
             # 取 transition 兩側 track 中有 arc 資料的半徑
