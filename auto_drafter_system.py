@@ -2009,16 +2009,19 @@ class MockCADEngine:
 
     def _compute_transition_bends(self, section, track_elevations, pipe_centerlines,
                                   part_classifications, pipe_diameter, rail_spacing,
-                                  is_after_curved=False, prev_curved_section=None):
+                                  is_after_curved=False, prev_curved_section=None,
+                                  is_before_curved=False, next_curved_section=None):
         """
         在一個 straight section 內，計算相鄰軌道間的仰角差 → 虛擬 transition bend。
         Per-rail 各自計算 bend angle，因上下軌仰角不同。
         
-        新增：如果 is_after_curved=True，在 section 開頭添加一個從大彎軌出口的 transition bend。
+        新增：
+        - 如果 is_after_curved=True，在 section 開頭添加一個從大彎軌出口的 transition bend。
+        - 如果 is_before_curved=True，在 section 尾端添加一個連接大彎軌入口的 transition bend。
         
         Returns: list of bend dicts: {angle_deg, upper_bend_deg, lower_bend_deg,
                  upper_r, lower_r, upper_arc, lower_arc, position}
-                 position: 'entry' (彎軌出口) 或 'between' (軌道間)
+                 position: 'entry' (彎軌出口), 'exit' (彎軌入口), 或 'between' (軌道間)
         """
         elev_map = {}
         for te in track_elevations:
@@ -2043,12 +2046,12 @@ class MockCADEngine:
             # 如果有大圓（彎管半徑），使用它們
             if radius_groups:
                 radii_list = sorted(radius_groups.keys())
-                # 為上下軌分配半徑（假設上軌用較小半徑，下軌用較大半徑 - 根據參考圖）
-                upper_default_r = radii_list[0] if len(radii_list) >= 2 else radii_list[-1] if len(radii_list) >= 1 else 220
-                lower_default_r = radii_list[-1] if len(radii_list) >= 1 else 270
+                # 為上下軌分配半徑（根據參考圖 2-2-1.jpg：上軌用 R270，下軌用 R220）
+                upper_default_r = radii_list[-1] if len(radii_list) >= 1 else 270
+                lower_default_r = radii_list[0] if len(radii_list) >= 2 else radii_list[-1] if len(radii_list) >= 1 else 220
             else:
-                upper_default_r = 220
-                lower_default_r = 270
+                upper_default_r = 270
+                lower_default_r = 220
         else:
             # Step 2: 退回到從 pipe_centerlines 提取（舊方法）
             for pc in pipe_centerlines:
@@ -2058,8 +2061,8 @@ class MockCADEngine:
                         if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
                             track_arc_radius_map[pc['solid_id']] = seg['radius']
                             break
-            upper_default_r = 220
-            lower_default_r = 270
+            upper_default_r = 270
+            lower_default_r = 220
 
         bends = []
         upper_tracks = section.get('upper_tracks', [])
@@ -2077,9 +2080,11 @@ class MockCADEngine:
             entry_bend_deg = 16.0
             
             # 根據參考圖 2-2-3.jpg 的結構：
-            # - 上軌：入口過渡段(U1=89.1) → 入口彎角(U2=16°) → 主段(U3=147.3)
-            # - 下軌：主段(D1=244.2) → 尾部彎角(D2=16°)
-            # 所以上軌有入口過渡，下軌沒有入口過渡（彎角在後面）
+            # - 上軌：入口過渡段(U1=89.1) → 入口彎角(U2=16°, R220) → 主段(U3=147.3)
+            # - 下軌：主段(D1=244.2) → 尾部彎角(D2=16°, R270)
+            # 注意：彎軌後的半徑分配與彎軌前相反（上軌 R220，下軌 R270）
+            after_upper_r = lower_default_r  # 彎軌後上軌用較小半徑
+            after_lower_r = upper_default_r  # 彎軌後下軌用較大半徑
             
             if n_upper >= 1:
                 first_upper_length = 0
@@ -2105,10 +2110,10 @@ class MockCADEngine:
                 'angle_deg': entry_bend_deg,
                 'upper_bend_deg': entry_bend_deg,
                 'lower_bend_deg': 0,  # 下軌不使用 entry bend
-                'arc_r': round(upper_default_r, 0),
-                'upper_r': round(upper_default_r, 0),
-                'lower_r': round(lower_default_r, 0),
-                'upper_arc': round((upper_default_r + pipe_diameter / 2) * bend_rad, 0),
+                'arc_r': round(after_upper_r, 0),
+                'upper_r': round(after_upper_r, 0),
+                'lower_r': round(after_lower_r, 0),
+                'upper_arc': round((after_upper_r + pipe_diameter / 2) * bend_rad, 0),
                 'lower_arc': 0,  # 下軌不使用 entry arc
                 'position': 'entry',
                 'entry_straight_upper': entry_straight_length_upper,
@@ -2120,13 +2125,46 @@ class MockCADEngine:
                 'angle_deg': entry_bend_deg,
                 'upper_bend_deg': 0,  # 上軌不使用 exit bend
                 'lower_bend_deg': entry_bend_deg,
-                'arc_r': round(lower_default_r, 0),
-                'upper_r': round(upper_default_r, 0),
-                'lower_r': round(lower_default_r, 0),
+                'arc_r': round(after_lower_r, 0),
+                'upper_r': round(after_upper_r, 0),
+                'lower_r': round(after_lower_r, 0),
                 'upper_arc': 0,  # 上軌不使用 exit arc
-                'lower_arc': round((lower_default_r + pipe_diameter / 2) * bend_rad, 0),
+                'lower_arc': round((after_lower_r + pipe_diameter / 2) * bend_rad, 0),
                 'position': 'exit',  # 在直段之後
             })
+
+        # ========== 新增：彎軌入口 transition bend (is_before_curved) ==========
+        # 當這個 section 的後面是 curved section 時，在尾端添加連接大彎軌的 transition bend
+        # 根據參考圖 2-2-1.jpg：
+        # - 上軌：U1(直線) → U2(12°彎) → U3(直線過渡段)
+        # - 下軌：D1(直線過渡段) → D2(12°彎) → D3(直線)
+        if is_before_curved and n_pairs >= 1:
+            # 計算上下軌的仰角差
+            u_elev = elev_map.get(upper_tracks[0]['solid_id'], 0) if n_upper >= 1 else 0
+            l_elev = elev_map.get(lower_tracks[0]['solid_id'], 0) if n_lower >= 1 else 0
+            elev_diff = abs(u_elev - l_elev)
+            
+            # 如果有仰角差，使用 12° 作為 transition bend 角度
+            if elev_diff > 0.5:
+                exit_bend_deg = 12.0  # 設計規範角度
+                bend_rad = math.radians(exit_bend_deg)
+                
+                # 添加彎軌入口的 exit bend
+                # 注意：不分割現有軌道，因為過渡段在模型中沒有獨立建模
+                # 只在直軌末端添加 exit bend（連接到大彎軌）
+                bends.append({
+                    'angle_deg': exit_bend_deg,
+                    'upper_bend_deg': exit_bend_deg,
+                    'lower_bend_deg': exit_bend_deg,
+                    'arc_r': round((upper_default_r + lower_default_r) / 2, 0),
+                    'upper_r': round(upper_default_r, 0),
+                    'lower_r': round(lower_default_r, 0),
+                    'upper_arc': round((upper_default_r + pipe_diameter / 2) * bend_rad, 0),
+                    'lower_arc': round((lower_default_r + pipe_diameter / 2) * bend_rad, 0),
+                    'position': 'exit',
+                    'exit_straight_upper': 0,  # 不添加額外過渡段
+                    'exit_straight_lower': 0,  # 不添加額外過渡段
+                })
 
         # ========== 原有邏輯：軌道間 transition bends ==========
         if n_pairs < 2:
@@ -2466,7 +2504,10 @@ class MockCADEngine:
                 r = exit_bend['upper_r'] if is_upper else exit_bend['lower_r']
                 arc_len = exit_bend['upper_arc'] if is_upper else exit_bend['lower_arc']
                 bend_deg = exit_bend.get('upper_bend_deg', exit_bend['angle_deg']) if is_upper else exit_bend.get('lower_bend_deg', exit_bend['angle_deg'])
+                exit_straight = exit_bend.get('exit_straight_upper' if is_upper else 'exit_straight_lower', 0)
+                
                 if bend_deg >= 0.5 and arc_len >= 1:
+                    # 添加 exit bend
                     items.append({
                         'item': f'{prefix}{idx}',
                         'type': 'arc',
@@ -2478,6 +2519,17 @@ class MockCADEngine:
                         'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
                     })
                     idx += 1
+                    
+                    # 如果有 exit 過渡段，添加它
+                    if exit_straight > 0:
+                        items.append({
+                            'item': f'{prefix}{idx}',
+                            'type': 'straight',
+                            'diameter': pipe_diameter,
+                            'length': exit_straight,
+                            'spec': f"直徑{pipe_diameter:.1f} 長度{exit_straight:.1f}",
+                        })
+                        idx += 1
             
             return items
 
@@ -5105,11 +5157,22 @@ Solid 名稱: {solid_name}
             if first_straight_idx is not None:
                 section = sections[first_straight_idx]
                 section_legs = leg_assignment.get(first_straight_idx, [])
+                
+                # 判斷這個 section 的後面是否是 curved section
+                is_before_curved = False
+                next_curved_section = None
+                if first_straight_idx + 1 < len(sections):
+                    next_sec = sections[first_straight_idx + 1]
+                    if next_sec['section_type'] == 'curved':
+                        is_before_curved = True
+                        next_curved_section = next_sec
+                        log_print(f"  此區段後面是彎軌，將添加出口 transition bend")
 
                 # transition bends
                 section_bends = self._compute_transition_bends(
                     section, track_elevations, pipe_centerlines,
-                    part_classifications, pipe_diameter, rail_spacing)
+                    part_classifications, pipe_diameter, rail_spacing,
+                    is_before_curved=is_before_curved, next_curved_section=next_curved_section)
 
                 # per-section cutting list
                 section_cl = self._build_section_cutting_list(
