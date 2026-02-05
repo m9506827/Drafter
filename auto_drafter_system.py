@@ -4681,11 +4681,10 @@ Solid 名稱: {solid_name}
                          (leg_foot[0] - leg_hw, leg_foot[1]))
             msp.add_line((leg_top[0] + leg_hw, leg_top[1]),
                          (leg_foot[0] + leg_hw, leg_foot[1]))
-            # 中心線
-            msp.add_line(leg_top, leg_foot, dxfattribs={'color': 1})
+            # 移除紅色中心線，改用 X 標記（follow 2-2-1.jpg）
 
-            # 上下軌穿越處的交叉標記 (X)
-            x_sz = min(3, rail_spacing * scale * 0.15)
+            # 上下軌穿越處的交叉標記 (X) - 腳架中心標記
+            x_sz = min(4, rail_spacing * scale * 0.2)
             for rail_pt in [leg_upper_pt, leg_lower_pt]:
                 msp.add_line((rail_pt[0] - x_sz, rail_pt[1] - x_sz),
                              (rail_pt[0] + x_sz, rail_pt[1] + x_sz))
