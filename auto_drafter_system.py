@@ -1830,6 +1830,61 @@ class MockCADEngine:
     # 軌道分段分析 (用於 *-1.dxf 直線段施工圖)
     # ------------------------------------------------------------------
 
+    def _detect_bend_direction(self, pipe_centerlines, part_classifications):
+        """
+        判斷軌道的彎曲方向：'left'（左彎）或 'right'（右彎）
+        
+        判斷邏輯：
+        - 從彎軌的 start_point 到 end_point 的 X 座標變化
+        - X 增加 → 右彎
+        - X 減少 → 左彎
+        
+        Returns: 'left', 'right', 或 'straight'（無明顯彎曲）
+        """
+        class_map = {c['feature_id']: c for c in part_classifications}
+        
+        # 找出所有彎軌（arc angle >= 60°）
+        curved_tracks = []
+        for pc in pipe_centerlines:
+            fid = pc['solid_id']
+            cls = class_map.get(fid, {})
+            if cls.get('class') != 'track':
+                continue
+            
+            for seg in pc.get('segments', []):
+                if seg.get('type') == 'arc' and seg.get('angle_deg', 0) >= 60:
+                    start_p = pc.get('start_point', (0, 0, 0))
+                    end_p = pc.get('end_point', (0, 0, 0))
+                    curved_tracks.append({
+                        'fid': fid,
+                        'start_point': start_p,
+                        'end_point': end_p,
+                        'angle_deg': seg.get('angle_deg', 0),
+                    })
+                    break
+        
+        if not curved_tracks:
+            return 'straight'
+        
+        # 使用第一個彎軌來判斷方向
+        ct = curved_tracks[0]
+        x_diff = ct['end_point'][0] - ct['start_point'][0]
+        
+        # 閾值設為 50mm
+        if x_diff > 50:
+            return 'right'
+        elif x_diff < -50:
+            return 'left'
+        else:
+            # 如果 X 變化不大，檢查 Y 座標
+            y_diff = ct['end_point'][1] - ct['start_point'][1]
+            if y_diff > 50:
+                return 'right'
+            elif y_diff < -50:
+                return 'left'
+        
+        return 'straight'
+
     def _detect_track_sections(self, pipe_centerlines, part_classifications, track_items):
         """
         將軌道分段為 straight / curved sections.
@@ -2010,7 +2065,8 @@ class MockCADEngine:
     def _compute_transition_bends(self, section, track_elevations, pipe_centerlines,
                                   part_classifications, pipe_diameter, rail_spacing,
                                   is_after_curved=False, prev_curved_section=None,
-                                  is_before_curved=False, next_curved_section=None):
+                                  is_before_curved=False, next_curved_section=None,
+                                  bend_direction='left'):
         """
         在一個 straight section 內，計算相鄰軌道間的仰角差 → 虛擬 transition bend。
         Per-rail 各自計算 bend angle，因上下軌仰角不同。
@@ -2018,6 +2074,7 @@ class MockCADEngine:
         新增：
         - 如果 is_after_curved=True，在 section 開頭添加一個從大彎軌出口的 transition bend。
         - 如果 is_before_curved=True，在 section 尾端添加一個連接大彎軌入口的 transition bend。
+        - bend_direction: 'left'（左彎）或 'right'（右彎），影響上下軌半徑分配
         
         Returns: list of bend dicts: {angle_deg, upper_bend_deg, lower_bend_deg,
                  upper_r, lower_r, upper_arc, lower_arc, position}
@@ -2046,12 +2103,25 @@ class MockCADEngine:
             # 如果有大圓（彎管半徑），使用它們
             if radius_groups:
                 radii_list = sorted(radius_groups.keys())
-                # 為上下軌分配半徑（根據參考圖 2-2-1.jpg：上軌用 R270，下軌用 R220）
-                upper_default_r = radii_list[-1] if len(radii_list) >= 1 else 270
-                lower_default_r = radii_list[0] if len(radii_list) >= 2 else radii_list[-1] if len(radii_list) >= 1 else 220
+                r_large = radii_list[-1] if len(radii_list) >= 1 else 270
+                r_small = radii_list[0] if len(radii_list) >= 2 else r_large
+                
+                # 根據彎曲方向分配半徑
+                # 左彎（預設）：上軌在外側（用大半徑），下軌在內側（用小半徑）
+                # 右彎：上軌在內側（用小半徑），下軌在外側（用大半徑）
+                if bend_direction == 'right':
+                    upper_default_r = r_small
+                    lower_default_r = r_large
+                else:  # left（預設）
+                    upper_default_r = r_large
+                    lower_default_r = r_small
             else:
-                upper_default_r = 270
-                lower_default_r = 220
+                if bend_direction == 'right':
+                    upper_default_r = 220
+                    lower_default_r = 270
+                else:
+                    upper_default_r = 270
+                    lower_default_r = 220
         else:
             # Step 2: 退回到從 pipe_centerlines 提取（舊方法）
             for pc in pipe_centerlines:
@@ -2061,8 +2131,12 @@ class MockCADEngine:
                         if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
                             track_arc_radius_map[pc['solid_id']] = seg['radius']
                             break
-            upper_default_r = 270
-            lower_default_r = 220
+            if bend_direction == 'right':
+                upper_default_r = 220
+                lower_default_r = 270
+            else:
+                upper_default_r = 270
+                lower_default_r = 220
 
         bends = []
         upper_tracks = section.get('upper_tracks', [])
@@ -2079,12 +2153,19 @@ class MockCADEngine:
             # 這個 16° 是設計規範值
             entry_bend_deg = 16.0
             
-            # 根據參考圖 2-2-3.jpg 的結構：
+            # 根據參考圖 2-2-3.jpg 的結構（左彎時）：
             # - 上軌：入口過渡段(U1=89.1) → 入口彎角(U2=16°, R220) → 主段(U3=147.3)
             # - 下軌：主段(D1=244.2) → 尾部彎角(D2=16°, R270)
-            # 注意：彎軌後的半徑分配與彎軌前相反（上軌 R220，下軌 R270）
-            after_upper_r = lower_default_r  # 彎軌後上軌用較小半徑
-            after_lower_r = upper_default_r  # 彎軌後下軌用較大半徑
+            # 注意：彎軌後的半徑分配與彎軌前相反
+            # 對於右彎，邏輯再次反轉
+            if bend_direction == 'right':
+                # 右彎後：上軌用大半徑，下軌用小半徑
+                after_upper_r = upper_default_r
+                after_lower_r = lower_default_r
+            else:
+                # 左彎後：上軌用小半徑，下軌用大半徑
+                after_upper_r = lower_default_r
+                after_lower_r = upper_default_r
             
             if n_upper >= 1:
                 first_upper_length = 0
@@ -5062,6 +5143,10 @@ Solid 名稱: {solid_name}
         # 分離上軌/下軌
         upper_items = [t for t in track_items if str(t.get('item', '')).startswith('U')]
         lower_items = [t for t in track_items if str(t.get('item', '')).startswith('D')]
+        
+        # 偵測彎曲方向（用於調整繪圖和半徑分配）
+        bend_direction = self._detect_bend_direction(pipe_centerlines, part_classifications)
+        log_print(f"軌道彎曲方向: {bend_direction}")
 
         # 角度資料
         leg_angles = [a for a in angles if a.get('type') == 'leg_to_ground']
@@ -5172,7 +5257,8 @@ Solid 名稱: {solid_name}
                 section_bends = self._compute_transition_bends(
                     section, track_elevations, pipe_centerlines,
                     part_classifications, pipe_diameter, rail_spacing,
-                    is_before_curved=is_before_curved, next_curved_section=next_curved_section)
+                    is_before_curved=is_before_curved, next_curved_section=next_curved_section,
+                    bend_direction=bend_direction)
 
                 # per-section cutting list
                 section_cl = self._build_section_cutting_list(
@@ -5228,6 +5314,10 @@ Solid 名稱: {solid_name}
                 (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
                 (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
 
+            # 偵測彎曲方向
+            bend_direction = self._detect_bend_direction(pipe_centerlines, part_classifications)
+            log_print(f"  彎曲方向: {bend_direction}")
+
             # 收集彎管資料
             arc_items = [t for t in track_items if t.get('type') == 'arc']
             arc_radius = 0
@@ -5255,7 +5345,7 @@ Solid 名稱: {solid_name}
 
             # 標題欄
             tb_info2 = {
-                'company': 'iDrafter股份有限公司',
+                'company': '羅布森股份有限公司',
                 'project': project,
                 'drawing_name': '彎軌取料施工圖',
                 'drawer': 'Drafter',
@@ -5283,12 +5373,20 @@ Solid 名稱: {solid_name}
             r_inner_draw = (arc_radius - pipe_diameter / 2) * arc_scale
             r_center_draw = arc_radius * arc_scale
 
-            # 弧形（假設 180 度弧，從 0 到 180）
+            # 弧形角度 - 根據彎曲方向調整開口方向
             start_angle = 0
             end_angle = arc_angle_deg
-            # 使正面圖朝上
-            arc_start = 90 - end_angle / 2
-            arc_end = 90 + end_angle / 2
+            
+            if bend_direction == 'right':
+                # 右彎：弧線開口朝右（中心角 0°）
+                arc_start = -end_angle / 2
+                arc_end = end_angle / 2
+                log_print(f"  右彎模式: 弧線開口朝右")
+            else:
+                # 左彎（預設）：弧線開口朝上（中心角 90°）
+                arc_start = 90 - end_angle / 2
+                arc_end = 90 + end_angle / 2
+                log_print(f"  左彎模式: 弧線開口朝上")
 
             msp2.add_arc((arc_area_cx, arc_area_cy), r_outer_draw, arc_start, arc_end)
             msp2.add_arc((arc_area_cx, arc_area_cy), r_inner_draw, arc_start, arc_end)
@@ -5506,7 +5604,8 @@ Solid 名稱: {solid_name}
             section3_bends = self._compute_transition_bends(
                 section3, track_elevations, pipe_centerlines,
                 part_classifications, pipe_diameter, rail_spacing,
-                is_after_curved=is_after_curved, prev_curved_section=prev_curved_section)
+                is_after_curved=is_after_curved, prev_curved_section=prev_curved_section,
+                bend_direction=bend_direction)
             
             section3_cl = self._build_section_cutting_list(
                 section3, section3_bends, track_items,
