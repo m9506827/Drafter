@@ -5200,7 +5200,7 @@ Solid 名稱: {solid_name}
             log_print(traceback.format_exc(), "error")
 
         # ================================================================
-        # Drawing 3: 直段+彎段施工圖 (Section Assembly)
+        # Drawing 3: 直段+彎段施工圖 (Section Assembly) - 第二個直軌區段
         # ================================================================
         try:
             import re
@@ -5214,18 +5214,57 @@ Solid 名稱: {solid_name}
                 (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
                 (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
 
+            # 找出第二個 straight section（與 Drawing 1 不同的區段）
+            second_straight_idx = None
+            straight_count = 0
+            for si, sec in enumerate(sections):
+                if sec['section_type'] == 'straight':
+                    straight_count += 1
+                    if straight_count == 2:  # 第二個 straight section
+                        second_straight_idx = si
+                        break
+            
+            # 使用第二個 straight section 或 fallback 到第一個
+            if second_straight_idx is not None:
+                section3 = sections[second_straight_idx]
+                section3_legs = leg_assignment.get(second_straight_idx, [])
+                log_print(f"  使用第二個直軌區段 (section {second_straight_idx})")
+            elif first_straight_idx is not None:
+                # 只有一個 straight section，使用同一個但標記為 Drawing 3
+                section3 = sections[first_straight_idx]
+                section3_legs = leg_assignment.get(first_straight_idx, [])
+                log_print(f"  只有一個直軌區段，使用 section {first_straight_idx}")
+            else:
+                section3 = {'section_type': 'straight', 'upper_tracks': [], 'lower_tracks': []}
+                section3_legs = []
+                log_print("  [Warning] 無直軌區段")
+            
+            # 計算 section3 的 transition bends 和取料明細
+            section3_bends = self._compute_transition_bends(
+                section3, track_elevations, pipe_centerlines,
+                part_classifications, pipe_diameter, rail_spacing)
+            
+            section3_cl = self._build_section_cutting_list(
+                section3, section3_bends, track_items,
+                part_classifications, pipe_diameter)
+            
+            # 取得 section3 的取料項目（section3_cl 是一個 list，包含 U* 和 D* 項目）
+            section3_upper = [it for it in section3_cl if it.get('item', '').startswith('U')]
+            section3_lower = [it for it in section3_cl if it.get('item', '').startswith('D')]
+            section3_track_items = section3_cl  # 已經是合併的 list
+
             # 標題欄
             tb_info3 = {
-                'company': 'iDrafter股份有限公司',
+                'company': '羅布森股份有限公司',
                 'project': project,
-                'drawing_name': '完整組合施工圖',
+                'drawing_name': '彎軌軌道製圖',
                 'drawer': 'Drafter',
                 'date': today,
                 'units': 'mm',
                 'scale': '1:10',
                 'material': 'STK-400',
                 'finish': '裁切及焊接',
-                'drawing_number': 'LM-17',
+                'drawing_number': 'LM-13',
                 'version': '01',
                 'quantity': '1',
             }
@@ -5240,10 +5279,8 @@ Solid 名稱: {solid_name}
             draw_w = PW * 0.58
             draw_x = MARGIN + 15
 
-            # ---- 重建軌道路徑（側面視圖） ----
-            # 從 cutting_list 重建軌道路徑
-            # 上軌 (U-series)
-            all_items = upper_items if upper_items else track_items
+            # ---- 使用 section3 的取料明細 ----
+            all_items = section3_upper if section3_upper else upper_items
 
             # 計算總展開長
             total_dev_length = 0
@@ -5395,27 +5432,27 @@ Solid 名稱: {solid_name}
 
                 return cursor_x, cursor_y, current_angle, segments_info
 
-            # 繪製上軌
-            if upper_items:
+            # 繪製上軌（使用 section3 的資料）
+            if section3_upper:
                 end_x_u, end_y_u, end_angle_u, segs_u = _draw_rail_path(
-                    msp3, upper_items,
+                    msp3, section3_upper,
                     path_base_x, path_base_y + rail_spacing * path_scale,
                     path_scale, pipe_hw3, "U", 12)
 
-            # 繪製下軌（偏移 rail_spacing）
-            if lower_items:
+            # 繪製下軌（使用 section3 的資料）
+            if section3_lower:
                 end_x_d, end_y_d, end_angle_d, segs_d = _draw_rail_path(
-                    msp3, lower_items,
+                    msp3, section3_lower,
                     path_base_x, path_base_y,
                     path_scale, pipe_hw3, "D", -12)
 
-            # ---- 腳架（沿路徑放置） ----
+            # ---- 腳架（沿路徑放置）- 使用 section3_legs ----
             leg_positions = []
-            if upper_items and lower_items:
+            if section3_upper and section3_lower:
                 # 在直段中點放置腳架
                 straight_mids = []
                 cx_acc = path_base_x
-                for it in upper_items:
+                for it in section3_upper:
                     if it.get('type') == 'straight':
                         seg_len = it.get('length', 0) * path_scale
                         straight_mids.append(cx_acc + seg_len / 2)
@@ -5426,7 +5463,7 @@ Solid 名稱: {solid_name}
                         cx_acc += arc_len
 
                 # 每個腳架放在直段中點
-                for li, leg in enumerate(leg_items):
+                for li, leg in enumerate(section3_legs):
                     if li < len(straight_mids):
                         lx = straight_mids[li]
                     else:
@@ -5501,47 +5538,28 @@ Solid 名稱: {solid_name}
                                           f"{rail_spacing:.1f}",
                                           vertical=True)
 
-            # ---- 軌道取料明細（右上） ----
-            if track_items:
+            # ---- 軌道取料明細（右上）- 使用 section3 的資料 ----
+            if section3_track_items:
                 self._draw_cutting_list_table(msp3,
                                               PW - MARGIN - 160,
                                               PH - MARGIN - 30,
-                                              track_items)
+                                              section3_track_items)
 
-            # ---- BOM 表 ----
+            # ---- BOM 表 - 使用 section3 的腳架 ----
             bom3_items = []
             bom_id = 1
-            # 軌道（上軌+下軌）
-            if track_items:
-                n_upper = len(upper_items)
-                n_lower = len(lower_items)
-                bom3_items.append({
-                    'id': bom_id, 'name': '軌道',
-                    'quantity': n_upper + n_lower,
-                    'remark': f"上軌{n_upper}段+下軌{n_lower}段"
-                })
-                bom_id += 1
-            # 腳架
-            for li, leg in enumerate(leg_items):
+            # 腳架（只顯示該區段的腳架）
+            for li, leg in enumerate(section3_legs):
                 spec = leg.get('spec', '')
                 bom3_items.append({
                     'id': bom_id, 'name': '腳架', 'quantity': 1,
                     'remark': f"線長{spec}"
                 })
                 bom_id += 1
-            # 支撐架
-            if bracket_items:
-                total_brackets = sum(b.get('quantity', 1) for b in bracket_items)
-                bom3_items.append({
-                    'id': bom_id, 'name': '支撐架',
-                    'quantity': total_brackets,
-                    'remark': bracket_items[0].get('spec', 'PSA20')
-                })
-                bom_id += 1
 
             if bom3_items:
                 bom3_x = PW - MARGIN - 155
-                bom3_y_start = PH - MARGIN - 30 - len(track_items) * 7 - 30
+                bom3_y_start = PH - MARGIN - 30 - len(section3_track_items) * 7 - 30
                 self._draw_bom_table(msp3, bom3_x, bom3_y_start, bom3_items)
 
             # 儲存
