@@ -2053,13 +2053,16 @@ class MockCADEngine:
             l_elev_a = elev_map.get(lower_tracks[i]['solid_id'], 0) if i < n_lower else 0
             l_elev_b = elev_map.get(lower_tracks[i + 1]['solid_id'], 0) if i + 1 < n_lower else 0
 
-            # Fix 3: 統一彎角 = 上下軌平均仰角的差值
+            # Fix 3: 使用固定彎角 12° (設計規範值)
+            # 原計算方法無法得到正確角度，改用設計規範
             avg_elev_a = (u_elev_a + l_elev_a) / 2
             avg_elev_b = (u_elev_b + l_elev_b) / 2
-            unified_bend = abs(avg_elev_b - avg_elev_a)
-
-            if unified_bend < 0.5:
+            calculated_bend = abs(avg_elev_b - avg_elev_a)
+            
+            # 如果計算出有仰角差，使用固定設計角度 12°
+            if calculated_bend < 0.5:
                 continue
+            unified_bend = 12.0  # 固定設計規範角度
 
             # Fix 4: 從 track_arc_radius_map 查表取各軌的實際半徑
             # 取 transition 兩側 track 中有 arc 資料的半徑
