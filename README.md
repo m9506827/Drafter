@@ -246,6 +246,44 @@ A: 這表示該項目在檔案中沒有相關資訊。例如：
 ### Q: 如何查看完整的圖檔資訊？
 A: 執行 `auto_drafter_system.py` 後，會自動彈出圖檔資訊視窗，顯示所有可提取的資訊，包含 BOM、來源軟體、零件列表、單位、幾何統計等。
 
+## 測試
+
+### 執行測試
+
+```bash
+# 執行所有測試
+python -m unittest discover test -v
+
+# 使用 PowerShell 腳本
+.\run_tests.ps1
+
+# 監控模式（檔案變更時自動執行）
+.\run_tests.ps1 -Watch
+
+# 快速測試
+.\run_tests.ps1 -Quick
+```
+
+### 自動測試設定
+
+**GitHub Actions**：推送到 GitHub 後自動執行測試（已設定）
+
+**本地 pre-commit hook**：
+```bash
+git config core.hooksPath .githooks
+```
+
+詳細說明請參閱 [測試文件](docs/testing.md)
+
+## 文件
+
+完整文件位於 `docs/` 目錄：
+- [快速入門](docs/getting-started.md)
+- [使用者手冊](docs/user-guide.md)
+- [系統架構](docs/architecture.md)
+- [API 參考](docs/api/)
+- [測試說明](docs/testing.md)
+
 ## 授權
 
 本專案為開源專案，可自由使用和修改。

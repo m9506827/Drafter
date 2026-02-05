@@ -1,0 +1,45 @@
+#!/bin/sh
+# pre-commit hook - 提交前自動執行測試
+# 安裝: git config core.hooksPath .githooks
+
+echo "================================"
+echo "  Pre-commit: 執行測試"
+echo "================================"
+
+# 檢查是否有 Python 檔案變更
+CHANGED_PY=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$')
+
+if [ -z "$CHANGED_PY" ]; then
+    echo "[Skip] 無 Python 檔案變更"
+    exit 0
+fi
+
+echo "[Test] 偵測到 Python 檔案變更:"
+echo "$CHANGED_PY"
+echo ""
+
+# 啟動虛擬環境（Windows）
+if [ -f ".venv/Scripts/activate" ]; then
+    source .venv/Scripts/activate
+fi
+
+# 執行快速測試
+echo "[Test] 執行快速測試..."
+python -m unittest test.test_components.TestSubAssemblyDrawings.test_01_load_model test.test_components.TestSubAssemblyDrawings.test_02_generates_3_dxf -v
+
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "================================"
+    echo "  [FAIL] 測試失敗，提交已取消"
+    echo "================================"
+    echo ""
+    echo "請修復測試後再提交，或使用 --no-verify 跳過測試:"
+    echo "  git commit --no-verify"
+    exit 1
+fi
+
+echo ""
+echo "================================"
+echo "  [PASS] 測試通過，繼續提交"
+echo "================================"
+exit 0
