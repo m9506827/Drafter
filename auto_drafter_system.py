@@ -1917,9 +1917,30 @@ class MockCADEngine:
                 unpaired.append(track_entries[i])
 
         # ---- Step 2: 按沿軌道方向排序，遇 curved 切段 ----
-        # Y-up: 軌道沿 Z 排列; Z-up: 軌道沿 Y 排列
+        # 自動偵測軌道的主要排列方向（變化最大的座標軸）
+        def _detect_primary_axis(entries):
+            """偵測軌道主要排列的座標軸"""
+            if not entries:
+                return 'cz'  # 預設
+            xs = [e['cx'] for e in entries]
+            ys = [e['cy'] for e in entries]
+            zs = [e['cz'] for e in entries]
+            x_range = max(xs) - min(xs) if xs else 0
+            y_range = max(ys) - min(ys) if ys else 0
+            z_range = max(zs) - min(zs) if zs else 0
+            # 使用變化最大的軸
+            if z_range >= x_range and z_range >= y_range:
+                return 'cz'
+            elif y_range >= x_range:
+                return 'cy'
+            else:
+                return 'cx'
+        
+        all_entries = [e for p in pairs for e in p] + unpaired
+        primary_axis = _detect_primary_axis(all_entries)
+        
         def _track_sort_key(entry):
-            return entry['cz'] if y_up else entry['cy']
+            return entry[primary_axis]
 
         pairs.sort(key=lambda p: (_track_sort_key(p[0]) + _track_sort_key(p[1])) / 2)
         unpaired.sort(key=lambda t: _track_sort_key(t))
