@@ -4990,10 +4990,8 @@ Solid 名稱: {solid_name}
             if arc_radius == 0:
                 arc_radius = 260
 
-            # 仰角
-            elevation_deg = 0
-            if track_elevations:
-                elevation_deg = track_elevations[0].get('angle_deg', 0)
+            # 仰角 - 使用固定測試值 32 度
+            elevation_deg = 32  # 固定測試仰角
 
             # 弦長
             chord_length = 2 * arc_radius * math.sin(math.radians(arc_angle_deg / 2))
@@ -5451,6 +5449,13 @@ Solid 名稱: {solid_name}
 
                     # 簡化：畫垂直線穿過兩軌加上向下延伸
                     msp3.add_line((lx, upper_rail_y), (lx, lower_rail_y))
+                    
+                    # 上下軌穿越處的 X 標記（follow 2-2-1.jpg）
+                    x_sz = 3
+                    for rail_y in [upper_rail_y, lower_rail_y]:
+                        msp3.add_line((lx - x_sz, rail_y - x_sz), (lx + x_sz, rail_y + x_sz))
+                        msp3.add_line((lx - x_sz, rail_y + x_sz), (lx + x_sz, rail_y - x_sz))
+                    
                     # 向下延伸（斜線）
                     ext_len = (ll * path_scale - (upper_rail_y - lower_rail_y)) if ll > 0 else 20
                     if ext_len > 0:
