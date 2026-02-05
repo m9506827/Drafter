@@ -2125,20 +2125,41 @@ class MockCADEngine:
                 'section_type': sec['section_type'],
             })
 
+        # 計算每個 curved section 的 X 座標中心（用於判斷腳架是否真的在 curved section 附近）
+        # 建立 section_idx -> x_center 的映射
+        curved_x_center_map = {}
+        for si, sec in enumerate(sections):
+            if sec['section_type'] == 'curved':
+                all_tracks = sec.get('upper_tracks', []) + sec.get('lower_tracks', [])
+                if all_tracks:
+                    x_vals = [t.get('centroid', (0,0,0))[0] for t in all_tracks]
+                    curved_x_center_map[si] = sum(x_vals) / len(x_vals)
+
         # 先將 curved section 範圍排除出 straight
         # 對每個 leg，先查是否落在 curved section 範圍，再查 straight
         assignment = {}
         for leg in leg_items:
             lc = leg.get('centroid', (0, 0, 0))
             lv = _get_along_track(lc)
+            lx = lc[0]  # X 座標
 
             # 先查 curved sections
+            # 只有當 leg 同時在 Z 範圍內且 X 座標接近 curved section 時才排除
             in_curved = False
             for sr in section_ranges:
                 if sr['section_type'] == 'curved':
                     if sr['v_min'] - 100 <= lv <= sr['v_max'] + 100:
-                        in_curved = True
-                        break
+                        # 額外檢查 X 座標是否接近 curved section
+                        sec_idx = sr['section_idx']
+                        if sec_idx in curved_x_center_map:
+                            x_dist = abs(lx - curved_x_center_map[sec_idx])
+                            if x_dist < 150:  # X 座標也要接近才算在 curved section
+                                in_curved = True
+                                break
+                        else:
+                            # 沒有 X 座標資訊，保守地認為在 curved section
+                            in_curved = True
+                            break
 
             if in_curved:
                 continue  # 歸屬 curved section，不計入 straight
@@ -2158,6 +2179,38 @@ class MockCADEngine:
                     best_si = sr['section_idx']
             if best_si is not None and best_dist <= 500:
                 assignment.setdefault(best_si, []).append(leg)
+
+        # 按 X 座標位置分組，每個位置只保留一支腳架
+        # 這確保每個軌道位置只顯示一支腳架
+        for sec_idx, legs in assignment.items():
+            if len(legs) <= 1:
+                continue
+            
+            # 按 X 座標分組
+            x_groups = {}
+            for leg in legs:
+                lx = leg.get('centroid', (0, 0, 0))[0]
+                # 將 X 座標四捨五入到最近的 100mm 進行分組
+                x_key = round(lx / 100) * 100
+                if x_key not in x_groups:
+                    x_groups[x_key] = []
+                x_groups[x_key].append(leg)
+            
+            # 每個 X 位置選擇一支腳架
+            # 如果同一位置有多支，選擇 Z 座標最大的（離軌道後端最近）
+            selected_legs = []
+            for x_key in sorted(x_groups.keys()):
+                group = x_groups[x_key]
+                if len(group) == 1:
+                    selected_legs.append(group[0])
+                else:
+                    # 同一 X 位置有多支腳架，選 Z 最大的
+                    best_leg = max(group, key=lambda l: l.get('centroid', (0, 0, 0))[2])
+                    selected_legs.append(best_leg)
+            
+            # 按 Z 座標排序（沿軌道方向）
+            selected_legs.sort(key=lambda l: l.get('centroid', (0, 0, 0))[2])
+            assignment[sec_idx] = selected_legs
 
         return assignment
 
