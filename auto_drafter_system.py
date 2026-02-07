@@ -4702,6 +4702,94 @@ Solid 名稱: {solid_name}
                 (cx + r_outer + 3, cy - 1))
 
     # ====================================================================
+    # HLR 投影 helper (3D 模型 → 2D 邊線折線)
+    # ====================================================================
+
+    def _hlr_project_to_polylines(self, main_dir_xyz, x_dir_xyz, flip_v=False):
+        """
+        使用 HLR (Hidden Line Removal) 投影 3D 模型，返回 2D 可見邊線。
+
+        Args:
+            main_dir_xyz: (mx, my, mz) 視線方向（從相機指向模型）
+            x_dir_xyz: (xx, xy, xz) 投影平面水平軸
+            flip_v: 是否翻轉垂直方向
+
+        Returns:
+            (polylines, bbox):
+            - polylines: list of list of (x, y) 2D 座標
+            - bbox: (x_min, y_min, x_max, y_max)
+        """
+        if not CADQUERY_AVAILABLE or self.cad_model is None:
+            return [], (0, 0, 1, 1)
+
+        from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
+        from OCP.HLRAlgo import HLRAlgo_Projector
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.TopoDS import TopoDS
+
+        occ_shape = self.cad_model.val().wrapped
+        O = gp_Pnt(0, 0, 0)
+        main_dir = gp_Dir(*main_dir_xyz)
+        x_dir = gp_Dir(*x_dir_xyz)
+
+        hlr = HLRBRep_Algo()
+        hlr.Add(occ_shape)
+
+        ax2 = gp_Ax2(O, main_dir, x_dir)
+        projector = HLRAlgo_Projector(ax2)
+        hlr.Projector(projector)
+        hlr.Update()
+        hlr.Hide()
+
+        hlr_shapes = HLRBRep_HLRToShape(hlr)
+
+        # 收集可見邊（銳邊 + 平滑邊 + 縫合邊 + 輪廓線）
+        visible_compounds = [
+            hlr_shapes.VCompound(),
+            hlr_shapes.Rg1LineVCompound(),
+            hlr_shapes.RgNLineVCompound(),
+            hlr_shapes.OutLineVCompound(),
+        ]
+
+        polylines = []
+        for compound in visible_compounds:
+            if compound.IsNull():
+                continue
+            exp = TopExp_Explorer(compound, TopAbs_EDGE)
+            while exp.More():
+                edge = TopoDS.Edge_s(exp.Current())
+                try:
+                    curve = BRepAdaptor_Curve(edge)
+                    u_start = curve.FirstParameter()
+                    u_end = curve.LastParameter()
+
+                    pts = []
+                    for i in range(21):
+                        u = u_start + (u_end - u_start) * i / 20
+                        pnt = curve.Value(u)
+                        px = pnt.X()
+                        py = -pnt.Y() if flip_v else pnt.Y()
+                        pts.append((px, py))
+
+                    if len(pts) >= 2:
+                        polylines.append(pts)
+                except Exception:
+                    pass
+                exp.Next()
+
+        if polylines:
+            all_pts = [p for pl in polylines for p in pl]
+            bbox = (min(p[0] for p in all_pts), min(p[1] for p in all_pts),
+                    max(p[0] for p in all_pts), max(p[1] for p in all_pts))
+        else:
+            bbox = (0, 0, 1, 1)
+
+        return polylines, bbox
+
+    # ====================================================================
     # 直線段施工圖 (per-section sheet for *-1.dxf)
     # ====================================================================
 
@@ -4732,10 +4820,10 @@ Solid 名稱: {solid_name}
 
         # 標題欄
         tb_info = {
-            'company': '羅布森股份有限公司',
+            'company': 'iDrafter股份有限公司',
             'project': project,
             'drawing_name': '直線段施工圖',
-            'drawer': '張翔任',
+            'drawer': 'Drafter',
             'date': today,
             'units': 'mm',
             'scale': '1:10',
@@ -5396,158 +5484,151 @@ Solid 名稱: {solid_name}
             # 圖號
             self._draw_drawing_number(msp2, PW, PH, f"{base_name}-2")
 
-            # ---- 上半部：正面弧形視圖 ----
-            arc_area_cx = MARGIN + 100
-            arc_area_cy = PH - MARGIN - 70
-            arc_scale = min(120 / (arc_radius * 2), 0.35)
+            # 計算弧長與高低差
+            arc_total_length = 0
+            arc_height_gain = 0
+            for ai in arc_items:
+                single_len = ai.get('outer_arc_length', ai.get('arc_length', 0))
+                arc_total_length = max(arc_total_length, single_len)
+                arc_height_gain = max(arc_height_gain, ai.get('height_gain', 0))
+            if arc_total_length == 0:
+                arc_total_length = 2 * math.pi * arc_radius * (arc_angle_deg / 360)
+            if arc_height_gain < 1 and elevation_deg > 0:
+                arc_height_gain = arc_total_length * math.sin(math.radians(elevation_deg))
 
-            # 外弧和內弧
-            r_outer_draw = (arc_radius + pipe_diameter / 2) * arc_scale
-            r_inner_draw = (arc_radius - pipe_diameter / 2) * arc_scale
-            r_center_draw = arc_radius * arc_scale
+            bracket_count = sum(b.get('quantity', 1) for b in bracket_items)
 
-            # 弧形角度 - 根據彎曲方向調整開口方向
-            start_angle = 0
-            end_angle = arc_angle_deg
-            
-            if bend_direction == 'right':
-                # 右彎：弧線開口朝右（中心角 0°）
-                arc_start = -end_angle / 2
-                arc_end = end_angle / 2
-                log_print(f"  右彎模式: 弧線開口朝右")
-            else:
-                # 左彎（預設）：弧線開口朝上（中心角 90°）
-                arc_start = 90 - end_angle / 2
-                arc_end = 90 + end_angle / 2
-                log_print(f"  左彎模式: 弧線開口朝上")
+            # ================================================================
+            # 上半部：HLR 投影 — Z 軸 32 度視角
+            # 使用 HLR 顯示完整軌道、支撐架、腳架邊線
+            # ================================================================
+            z_angle = 32  # Z 軸角度
+            z_rad = math.radians(z_angle)
+            # 視線方向：從 Z 軸傾斜 32° 向 -Y 方向（Y-up 模型）
+            upper_main = (0, -math.sin(z_rad), -math.cos(z_rad))
+            upper_xdir = (1, 0, 0)
 
-            msp2.add_arc((arc_area_cx, arc_area_cy), r_outer_draw, arc_start, arc_end)
-            msp2.add_arc((arc_area_cx, arc_area_cy), r_inner_draw, arc_start, arc_end)
-            # 中心線（虛線）
-            msp2.add_arc((arc_area_cx, arc_area_cy), r_center_draw, arc_start, arc_end,
-                         dxfattribs={'color': 1})
+            log_print(f"  上圖 HLR 投影: Z軸{z_angle}度")
+            upper_polylines, upper_bbox = self._hlr_project_to_polylines(
+                upper_main, upper_xdir)
 
-            # 端蓋（兩端的管截面）
-            for angle_pos in [arc_start, arc_end]:
-                rad = math.radians(angle_pos)
-                ex = arc_area_cx + r_center_draw * math.cos(rad)
-                ey = arc_area_cy + r_center_draw * math.sin(rad)
-                # 小圓表示截面
-                self._draw_pipe_cross_section(msp2, ex, ey, pipe_diameter * arc_scale * 0.5)
+            # 上圖可用空間（A3 上半部）
+            upper_area_x = MARGIN + 15
+            upper_area_y = PH * 0.52
+            upper_area_w = PW * 0.45
+            upper_area_h = PH - MARGIN - upper_area_y - 10
 
-            # R 尺寸標註
-            r_label_rad = math.radians(arc_start + (arc_end - arc_start) * 0.3)
-            r_lx = arc_area_cx + r_center_draw * 0.5 * math.cos(r_label_rad)
-            r_ly = arc_area_cy + r_center_draw * 0.5 * math.sin(r_label_rad)
-            msp2.add_line((arc_area_cx, arc_area_cy), (
-                arc_area_cx + r_center_draw * math.cos(r_label_rad),
-                arc_area_cy + r_center_draw * math.sin(r_label_rad)))
-            msp2.add_text(f"R{arc_radius:.0f}", dxfattribs={
-                'height': 4.0
-            }).set_placement((r_lx - 10, r_ly + 3))
+            ub_w = max(upper_bbox[2] - upper_bbox[0], 1)
+            ub_h = max(upper_bbox[3] - upper_bbox[1], 1)
+            upper_scale = min(upper_area_w / ub_w, upper_area_h / ub_h) * 0.85
+            upper_off_x = (upper_area_x + upper_area_w / 2
+                           - (upper_bbox[0] + upper_bbox[2]) / 2 * upper_scale)
+            upper_off_y = (upper_area_y + upper_area_h / 2
+                           - (upper_bbox[1] + upper_bbox[3]) / 2 * upper_scale)
 
-            # 弦長尺寸（弧底部水平）
-            chord_draw = chord_length * arc_scale
-            chord_y = arc_area_cy - r_outer_draw - 5
-            chord_x1 = arc_area_cx - chord_draw / 2
-            chord_x2 = arc_area_cx + chord_draw / 2
-            self._draw_dimension_line(msp2,
-                                      (chord_x1, chord_y),
-                                      (chord_x2, chord_y),
-                                      -8,
-                                      f"{chord_length:.0f}")
-
-            # ---- 下半部：等角視圖（彎管段含支撐架 X） ----
-            iso_cx = MARGIN + 100
-            iso_cy = tb_top2 + 60
-            iso_scale = arc_scale * 0.85
-
-            # 簡化等角投影：30 度傾斜
-            iso_angle = 0 #math.radians(30)
-
-            # 繪製彎管的等角視圖（用折線近似弧線）
-            n_segments = 20
-            for rail_offset in [-rail_spacing * iso_scale / 2, rail_spacing * iso_scale / 2]:
-                pts = []
-                for i in range(n_segments + 1):
-                    t = i / n_segments
-                    angle = math.radians(arc_start + t * (arc_end - arc_start))
-                    rx = arc_radius * iso_scale * math.cos(angle)
-                    ry = arc_radius * iso_scale * math.sin(angle)
-                    # 等角變換
-                    ix = iso_cx + rx
-                    iy = iso_cy + ry * 0.6 + rail_offset
-                    pts.append((ix, iy))
+            for pl in upper_polylines:
+                pts = [(p[0] * upper_scale + upper_off_x,
+                        p[1] * upper_scale + upper_off_y) for p in pl]
                 if len(pts) >= 2:
                     msp2.add_lwpolyline(pts)
 
-            # 支撐架 X 標記
-            bracket_count = sum(b.get('quantity', 1) for b in bracket_items)
-            if bracket_count > 0:
-                for bi in range(min(bracket_count, 8)):
-                    t = (bi + 0.5) / max(bracket_count, 1)
-                    angle = math.radians(arc_start + t * (arc_end - arc_start))
-                    bx = iso_cx + arc_radius * iso_scale * math.cos(angle)
-                    by = iso_cy + arc_radius * iso_scale * math.sin(angle) * 0.6
-                    # X 標記
-                    xsz = 3
-                    msp2.add_line((bx - xsz, by - xsz), (bx + xsz, by + xsz))
-                    msp2.add_line((bx - xsz, by + xsz), (bx + xsz, by - xsz))
+            log_print(f"  上圖邊數: {len(upper_polylines)}")
 
-            # 等角視圖尺寸標註
-            # 垂直尺寸（高低差）
+            # R 尺寸標註（上圖左上方）
+            r_label_x = upper_area_x + 5
+            r_label_y = upper_area_y + upper_area_h - 10
+            msp2.add_text(f"R{arc_radius:.0f}", dxfattribs={
+                'height': 4.0}).set_placement((r_label_x, r_label_y))
+
+            # 弦長尺寸標註（上圖下方）
+            ub_draw_left = upper_bbox[0] * upper_scale + upper_off_x
+            ub_draw_right = upper_bbox[2] * upper_scale + upper_off_x
+            ub_draw_bottom = upper_bbox[1] * upper_scale + upper_off_y
+            self._draw_dimension_line(msp2,
+                                      (ub_draw_left, ub_draw_bottom - 3),
+                                      (ub_draw_right, ub_draw_bottom - 3),
+                                      -8,
+                                      f"{chord_length:.0f}")
+
+            # ================================================================
+            # 下半部：HLR 等角投影
+            # 顯示完整軌道 + 支撐架 + 腳架邊線（follow Drawing 1 & 3）
+            # ================================================================
+            # 等角投影方向：從前上方偏右觀看
+            iso_main = (0.4, -0.6, 0.7)
+            iso_xdir = (-0.8, 0, 0.5)
+
+            log_print(f"  下圖 HLR 等角投影")
+            lower_polylines, lower_bbox = self._hlr_project_to_polylines(
+                iso_main, iso_xdir)
+
+            # 下圖可用空間（A3 下半部）
+            lower_area_x = MARGIN + 15
+            lower_area_y = tb_top2 + 5
+            lower_area_w = PW * 0.45
+            lower_area_h = PH * 0.42 - tb_top2
+
+            lb_w = max(lower_bbox[2] - lower_bbox[0], 1)
+            lb_h = max(lower_bbox[3] - lower_bbox[1], 1)
+            lower_scale = min(lower_area_w / lb_w, lower_area_h / lb_h) * 0.85
+            lower_off_x = (lower_area_x + lower_area_w / 2
+                           - (lower_bbox[0] + lower_bbox[2]) / 2 * lower_scale)
+            lower_off_y = (lower_area_y + lower_area_h / 2
+                           - (lower_bbox[1] + lower_bbox[3]) / 2 * lower_scale)
+
+            for pl in lower_polylines:
+                pts = [(p[0] * lower_scale + lower_off_x,
+                        p[1] * lower_scale + lower_off_y) for p in pl]
+                if len(pts) >= 2:
+                    msp2.add_lwpolyline(pts)
+
+            log_print(f"  下圖邊數: {len(lower_polylines)}")
+
+            # 等角視圖尺寸標註 — 軌道間距（右側垂直）
             if rail_spacing > 0:
-                iso_dim_x = iso_cx + arc_radius * iso_scale + 15
+                lb_draw_right = lower_bbox[2] * lower_scale + lower_off_x
+                lb_draw_top = lower_bbox[3] * lower_scale + lower_off_y
+                lb_draw_bottom = lower_bbox[1] * lower_scale + lower_off_y
+                rs_draw = rail_spacing * lower_scale
+                lb_mid_y = (lb_draw_top + lb_draw_bottom) / 2
                 self._draw_dimension_line(msp2,
-                                          (iso_dim_x, iso_cy - rail_spacing * iso_scale / 2),
-                                          (iso_dim_x, iso_cy + rail_spacing * iso_scale / 2),
+                                          (lb_draw_right + 5, lb_mid_y - rs_draw / 2),
+                                          (lb_draw_right + 5, lb_mid_y + rs_draw / 2),
                                           10,
                                           f"{rail_spacing:.1f}",
                                           vertical=True)
 
-            # ---- 大字標註：長度 + 仰角 + 高低差 + 旋向 ----
-            arc_total_length = 0
-            arc_height_gain = 0
-            for ai in arc_items:
-                arc_total_length += ai.get('outer_arc_length', ai.get('arc_length', 0))
-                arc_height_gain = max(arc_height_gain, ai.get('height_gain', 0))
-            if arc_total_length == 0:
-                arc_total_length = 2 * math.pi * arc_radius * (arc_angle_deg / 360)
-            # 高低差：若 cutting_list 無資料，從仰角 + 弧長估算
-            if arc_height_gain < 1 and elevation_deg > 0:
-                arc_height_gain = arc_total_length * math.sin(math.radians(elevation_deg))
-
-            big_text_x = PW * 0.42
-            big_text_y = PH * 0.45
-            big_text_h = 8
-            # 旋向（根據弧度方向判斷，180度以上視為完整旋向）
-            spiral_label = f"{arc_angle_deg:.0f}度" + ("左旋" if arc_angle_deg >= 90 else "")
-            msp2.add_text(spiral_label, dxfattribs={
-                'height': big_text_h
-            }).set_placement((big_text_x, big_text_y + 20))
-            msp2.add_text(f"仰角{elevation_deg:.0f}度", dxfattribs={
-                'height': big_text_h
-            }).set_placement((big_text_x, big_text_y + 8))
-            if arc_height_gain > 1:
-                msp2.add_text(f"高低差{arc_height_gain:.1f}", dxfattribs={
-                    'height': big_text_h
-                }).set_placement((big_text_x, big_text_y - 4))
-
-            # ---- 軌道取料明細（右上） ----
+            # ================================================================
+            # 軌道取料明細表（右上）— 先繪製以取得 bottom_y
+            # ================================================================
             cl_arc_items = [t for t in track_items if t.get('type') == 'arc']
-            # 包含彎管相關的上下軌項目
             cl_items_for_d2 = cl_arc_items if cl_arc_items else []
-            # 若無彎管項目，用所有 arc 類型
             if not cl_items_for_d2:
                 for ti in track_items:
                     if ti.get('type') == 'arc':
                         cl_items_for_d2.append(ti)
 
+            cl_table_x = PW - MARGIN - 160
+            cl_table_y = PH - MARGIN - 30
+            cl_bottom_y = cl_table_y
             if cl_items_for_d2:
-                self._draw_cutting_list_table(msp2, PW - MARGIN - 160,
-                                              PH - MARGIN - 30, cl_items_for_d2)
+                cl_bottom_y = self._draw_cutting_list_table(
+                    msp2, cl_table_x, cl_table_y, cl_items_for_d2)
 
-            # ---- BOM 表 ----
+            # ================================================================
+            # 長度 + 仰角標註 — 軌道取料明細表下方
+            # ================================================================
+            big_text_h = 8
+            big_text_x = cl_table_x
+            big_text_y = cl_bottom_y - 15
+            msp2.add_text(f"長度{arc_total_length:.0f}", dxfattribs={
+                'height': big_text_h
+            }).set_placement((big_text_x, big_text_y))
+            msp2.add_text(f"仰角{elevation_deg:.0f}度", dxfattribs={
+                'height': big_text_h
+            }).set_placement((big_text_x + 80, big_text_y))
+
+            # ---- BOM 表（長度/仰角標註下方） ----
             bom2_items = []
             if bracket_items:
                 total_brackets = sum(b.get('quantity', 1) for b in bracket_items)
@@ -5560,7 +5641,7 @@ Solid 名稱: {solid_name}
 
             if bom2_items:
                 bom2_x = PW - MARGIN - 155
-                bom2_y = PH * 0.45
+                bom2_y = big_text_y - 12
                 self._draw_bom_table(msp2, bom2_x, bom2_y, bom2_items)
 
             # 儲存
