@@ -2084,6 +2084,44 @@ class MockCADEngine:
                 'lower_tracks': list(cur_lower),
             })
 
+        # ---- Debug Log: 分段取用結果 ----
+        log_print(f"\n[TrackSections] 共 {len(sections)} 個分段, 主軸={primary_axis}")
+        log_print(f"[TrackSections] 配對: {len(pairs)} pairs, {len(unpaired)} unpaired")
+        for pi, (u, l) in enumerate(pairs):
+            log_print(f"  pair[{pi}]: upper={u['solid_id']}(cx={u['cx']:.0f},cy={u['cy']:.0f},cz={u['cz']:.0f},"
+                      f"curved={u['is_curved']}) "
+                      f"lower={l['solid_id']}(cx={l['cx']:.0f},cy={l['cy']:.0f},cz={l['cz']:.0f},"
+                      f"curved={l['is_curved']})")
+        for ui, u in enumerate(unpaired):
+            log_print(f"  unpaired[{ui}]: {u['solid_id']}(cx={u['cx']:.0f},cy={u['cy']:.0f},"
+                      f"cz={u['cz']:.0f},curved={u['is_curved']})")
+
+        for si, sec in enumerate(sections):
+            s_type = sec['section_type']
+            u_ids = [t['solid_id'] for t in sec.get('upper_tracks', [])]
+            l_ids = [t['solid_id'] for t in sec.get('lower_tracks', [])]
+            u_info = []
+            for t in sec.get('upper_tracks', []):
+                pd = t.get('pipe_data', {})
+                sp = pd.get('start_point', (0, 0, 0))
+                ep = pd.get('end_point', (0, 0, 0))
+                seg_types = [s.get('type', '?') for s in pd.get('segments', [])]
+                seg_lens = [f"{s.get('length', s.get('arc_length', 0)):.0f}" for s in pd.get('segments', [])]
+                u_info.append(f"{t['solid_id']}({','.join(seg_types)}:{','.join(seg_lens)})"
+                              f"[({sp[0]:.0f},{sp[1]:.0f},{sp[2]:.0f})->({ep[0]:.0f},{ep[1]:.0f},{ep[2]:.0f})]")
+            l_info = []
+            for t in sec.get('lower_tracks', []):
+                pd = t.get('pipe_data', {})
+                sp = pd.get('start_point', (0, 0, 0))
+                ep = pd.get('end_point', (0, 0, 0))
+                seg_types = [s.get('type', '?') for s in pd.get('segments', [])]
+                seg_lens = [f"{s.get('length', s.get('arc_length', 0)):.0f}" for s in pd.get('segments', [])]
+                l_info.append(f"{t['solid_id']}({','.join(seg_types)}:{','.join(seg_lens)})"
+                              f"[({sp[0]:.0f},{sp[1]:.0f},{sp[2]:.0f})->({ep[0]:.0f},{ep[1]:.0f},{ep[2]:.0f})]")
+            log_print(f"[Section {si}] {s_type}")
+            log_print(f"  upper: {', '.join(u_info) if u_info else '(none)'}")
+            log_print(f"  lower: {', '.join(l_info) if l_info else '(none)'}")
+
         return sections
 
     def _compute_transition_bends(self, section, track_elevations, pipe_centerlines,
@@ -2296,17 +2334,19 @@ class MockCADEngine:
                 'entry_straight_lower': entry_straight_length_lower,
             })
             
-            # 下軌的 exit bend（在主段之後）
+            # 下軌的 entry_tail bend（在主段之後，屬於入口方向的尾端過渡）
+            # 注意：這不是 'exit'（彎軌入口方向），而是 is_after_curved 入口過渡的下軌部分
+            # 下軌的彎角放在直段末端（靠近曲線段那側），但語意上仍屬於入口過渡
             bends.append({
                 'angle_deg': entry_bend_deg,
-                'upper_bend_deg': 0,  # 上軌不使用 exit bend
+                'upper_bend_deg': 0,  # 上軌不使用此 bend（已在 entry 中處理）
                 'lower_bend_deg': entry_bend_deg,
                 'arc_r': round(after_lower_r, 0),
                 'upper_r': round(after_upper_r, 0),
                 'lower_r': round(after_lower_r, 0),
-                'upper_arc': 0,  # 上軌不使用 exit arc
+                'upper_arc': 0,  # 上軌不使用此 arc
                 'lower_arc': round((after_lower_r + pipe_diameter / 2) * bend_rad, 0),
-                'position': 'exit',  # 在直段之後
+                'position': 'entry_tail',  # 入口過渡的尾端（下軌放在直段之後）
             })
 
         # ========== 新增：彎軌入口 transition bend (is_before_curved) ==========
@@ -2518,6 +2558,32 @@ class MockCADEngine:
                 'between': (i, i + 1),
             })
 
+        # ---- Debug Log: transition bends 結果 ----
+        log_print(f"\n[TransBends] 共 {len(bends)} 個 transition bends "
+                  f"(after_curved={is_after_curved}, before_curved={is_before_curved})")
+        for bi, b in enumerate(bends):
+            pos = b.get('position', '?')
+            angle = b.get('angle_deg', 0)
+            u_r = b.get('upper_r', 0)
+            l_r = b.get('lower_r', 0)
+            u_arc = b.get('upper_arc', 0)
+            l_arc = b.get('lower_arc', 0)
+            extra = ""
+            if pos == 'entry':
+                u_st = b.get('entry_straight_upper', 0)
+                l_st = b.get('entry_straight_lower', 0)
+                extra = f", entry_straight: U={u_st:.1f} L={l_st:.1f}"
+            elif pos == 'entry_tail':
+                extra = " (入口過渡尾端-下軌用)"
+            elif pos == 'exit':
+                u_st = b.get('exit_straight_upper', 0)
+                l_st = b.get('exit_straight_lower', 0)
+                u_pos = b.get('exit_pos_upper', '?')
+                l_pos = b.get('exit_pos_lower', '?')
+                extra = f", exit_straight: U={u_st:.1f}({u_pos}) L={l_st:.1f}({l_pos})"
+            log_print(f"  bend[{bi}]: pos={pos}, angle={angle:.1f}deg, "
+                      f"R: U={u_r:.0f}/L={l_r:.0f}, arc: U={u_arc:.0f}/L={l_arc:.0f}{extra}")
+
         return bends
 
     def _assign_legs_to_sections(self, sections, leg_items):
@@ -2642,6 +2708,17 @@ class MockCADEngine:
             selected_legs.sort(key=lambda l: l.get('centroid', (0, 0, 0))[2])
             assignment[sec_idx] = selected_legs
 
+        # ---- Debug Log: 腳架分配結果 ----
+        log_print(f"\n[LegAssign] 共 {len(leg_items)} 支腳架, 分配到 {len(assignment)} 個 section")
+        for sec_idx, legs in sorted(assignment.items()):
+            sec_type = sections[sec_idx]['section_type'] if sec_idx < len(sections) else '?'
+            log_print(f"[LegAssign] section[{sec_idx}] ({sec_type}): {len(legs)} 支腳架")
+            for li, leg in enumerate(legs):
+                lc = leg.get('centroid', (0, 0, 0))
+                ll = leg.get('line_length', 0)
+                log_print(f"  leg[{li}]: centroid=({lc[0]:.0f},{lc[1]:.0f},{lc[2]:.0f}), "
+                          f"line_length={ll:.0f}")
+
         return assignment
 
     def _build_section_cutting_list(self, section, bends, track_items,
@@ -2688,17 +2765,19 @@ class MockCADEngine:
 
         # 分離不同類型的 bends
         entry_bends = [b for b in bends if b.get('position') == 'entry']
+        entry_tail_bends = [b for b in bends if b.get('position') == 'entry_tail']
         exit_bends = [b for b in bends if b.get('position') == 'exit']
         between_bends = [b for b in bends if b.get('position') == 'between']
 
         # 交錯插入 transition bends
-        def interleave_with_bends(segs, between_bends_list, entry_bend, exit_bend, prefix, is_upper):
+        def interleave_with_bends(segs, between_bends_list, entry_bend, exit_bend, entry_tail_bend, prefix, is_upper):
             """
             合併直管段和 transition bends，生成完整的取料清單
             直管段來自 pipe_data，transition bends 來自 _compute_transition_bends()
             
             如果有 entry_bend（彎軌出口 bend），將第一個直軌分成入口過渡段和主段
-            如果有 exit_bend（尾部 bend），在所有直段之後添加
+            如果有 exit_bend（彎軌入口 bend），在所有直段之後添加
+            如果有 entry_tail_bend（入口過渡的尾端 bend，下軌用），在直段之後添加
             """
             items = []
             idx = 1
@@ -2787,7 +2866,27 @@ class MockCADEngine:
                         })
                         idx += 1
             
-            # 處理 exit bend — 不分割軌道，新增獨立過渡段
+            # 處理 entry_tail bend — 入口過渡的尾端 bend（下軌在直段之後）
+            # 這是 is_after_curved 產生的下軌 transition，放在直段末端（靠近曲線段）
+            if entry_tail_bend:
+                r = entry_tail_bend['upper_r'] if is_upper else entry_tail_bend['lower_r']
+                arc_len = entry_tail_bend['upper_arc'] if is_upper else entry_tail_bend['lower_arc']
+                bend_deg = entry_tail_bend.get('upper_bend_deg', entry_tail_bend['angle_deg']) if is_upper else entry_tail_bend.get('lower_bend_deg', entry_tail_bend['angle_deg'])
+                
+                if bend_deg >= 0.5 and arc_len >= 1:
+                    items.append({
+                        'item': f'{prefix}{idx}',
+                        'type': 'arc',
+                        'diameter': pipe_diameter,
+                        'angle_deg': bend_deg,
+                        'radius': r,
+                        'outer_arc_length': arc_len,
+                        'height_gain': 0,
+                        'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
+                    })
+                    idx += 1
+            
+            # 處理 exit bend — 不分割軌道，新增獨立過渡段（來自 is_before_curved）
             # exit_pos='after': 主軌 → 彎角 → 過渡段（外側軌道，朝向曲線）
             # exit_pos='before': 過渡段 → 彎角 → 主軌（內側軌道，section 起點處）
             if exit_bend:
@@ -2855,9 +2954,27 @@ class MockCADEngine:
             return items
 
         entry_bend = entry_bends[0] if entry_bends else None
+        entry_tail_bend = entry_tail_bends[0] if entry_tail_bends else None
         exit_bend = exit_bends[0] if exit_bends else None
-        result = interleave_with_bends(upper_segs, between_bends, entry_bend, exit_bend, 'U', True)
-        result += interleave_with_bends(lower_segs, between_bends, entry_bend, exit_bend, 'D', False)
+        result = interleave_with_bends(upper_segs, between_bends, entry_bend, exit_bend, entry_tail_bend, 'U', True)
+        result += interleave_with_bends(lower_segs, between_bends, entry_bend, exit_bend, entry_tail_bend, 'D', False)
+
+        # ---- Debug Log: 最終取料清單 ----
+        log_print(f"\n[CuttingList] 共 {len(result)} 項 "
+                  f"(upper_segs={len(upper_segs)}, lower_segs={len(lower_segs)}, "
+                  f"bends: entry={len(entry_bends)}, entry_tail={len(entry_tail_bends)}, "
+                  f"exit={len(exit_bends)}, between={len(between_bends)})")
+        for item in result:
+            item_id = item.get('item', '?')
+            itype = item.get('type', '?')
+            if itype == 'straight':
+                log_print(f"  {item_id}: straight, d={item.get('diameter', 0):.1f}, "
+                          f"L={item.get('length', 0):.1f}")
+            elif itype == 'arc':
+                log_print(f"  {item_id}: arc, d={item.get('diameter', 0):.1f}, "
+                          f"angle={item.get('angle_deg', 0):.0f}deg, "
+                          f"R={item.get('radius', 0):.0f}, "
+                          f"arc_L={item.get('outer_arc_length', 0):.0f}")
 
         return result
 
