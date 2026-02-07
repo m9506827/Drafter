@@ -1014,6 +1014,16 @@ class MockCADEngine:
                     bspline_result = self._analyze_bspline_pipe(solid_shape, fid, params)
                     if bspline_result:
                         results.append(bspline_result)
+                        log_print(f"[Pipe] {fid}: method=bspline, d={bspline_result['pipe_diameter']:.1f}, "
+                                  f"L={bspline_result['total_length']:.1f}, segs={len(bspline_result['segments'])}, "
+                                  f"start={tuple(round(v,1) for v in bspline_result['start_point'])}, "
+                                  f"end={tuple(round(v,1) for v in bspline_result['end_point'])}")
+                        for seg in bspline_result['segments']:
+                            if seg['type'] == 'straight':
+                                log_print(f"  straight: L={seg['length']:.1f}, dir={seg.get('direction', '-')}")
+                            elif seg['type'] == 'arc':
+                                log_print(f"  arc: R={seg['radius']:.0f}, angle={seg['angle_deg']:.1f}deg, "
+                                          f"arc_L={seg.get('arc_length', 0):.1f}, h_gain={seg.get('height_gain', 0):.1f}")
                         continue
 
                 # === 啟發式後備方案 ===
@@ -1064,6 +1074,8 @@ class MockCADEngine:
                         'cylinder_faces': [],
                         'method': 'heuristic',
                     })
+                    log_print(f"[Pipe] {fid}: method=heuristic, d={est_radius*2:.1f}, "
+                              f"L={est_length:.1f}, dir={direction}")
                 continue
 
             # === 處理 OCP 圓柱面資料 ===
@@ -1183,6 +1195,16 @@ class MockCADEngine:
                 'cylinder_faces': cylinder_faces,
                 'method': 'ocp',
             })
+            log_print(f"[Pipe] {fid}: method=ocp, d={dominant_radius*2:.2f}, "
+                      f"L={total_length:.1f}, segs={len(segments)}, "
+                      f"start=({cx - bbox_l/2:.1f}, {cy - bbox_w/2:.1f}, {cz - bbox_h/2:.1f}), "
+                      f"end=({cx + bbox_l/2:.1f}, {cy + bbox_w/2:.1f}, {cz + bbox_h/2:.1f})")
+            for seg in segments:
+                if seg['type'] == 'straight':
+                    log_print(f"  straight: L={seg['length']:.1f}, dir={seg.get('direction', '-')}")
+                elif seg['type'] == 'arc':
+                    log_print(f"  arc: R={seg['radius']:.0f}, angle={seg['angle_deg']:.1f}deg, "
+                              f"arc_L={seg.get('arc_length', 0):.1f}")
 
         return results
 
@@ -1650,6 +1672,7 @@ class MockCADEngine:
                             })
                         elif seg['type'] == 'arc':
                             outer_arc = seg.get('outer_arc_length', seg.get('arc_length', 0))
+                            cl_arc = seg.get('arc_length', 0)
                             h_gain = seg.get('height_gain', 0)
                             spec = (f"直徑{diameter:.1f} "
                                     f"角度{seg['angle_deg']}度"
@@ -1662,6 +1685,7 @@ class MockCADEngine:
                                 'spec': spec, 'type': 'arc',
                                 'angle_deg': seg['angle_deg'],
                                 'radius': seg.get('radius', 0),
+                                'arc_length': cl_arc,
                                 'outer_arc_length': outer_arc,
                                 'height_gain': h_gain,
                             })
@@ -2179,19 +2203,78 @@ class MockCADEngine:
                 after_upper_r = lower_default_r
                 after_lower_r = upper_default_r
             
-            if n_upper >= 1:
-                first_upper_length = 0
-                pd = upper_tracks[0].get('pipe_data', {})
-                for seg in pd.get('segments', []):
-                    if seg.get('type') == 'straight':
-                        first_upper_length = seg.get('length', 0)
-                        break
-                # 參考圖：U1=89.1, U3=147.3, 總計=236.4
-                # 模型中 F07 只有 147.3，無法完全匹配
-                # 使用比例：89.1 / 236.4 ≈ 0.377
-                entry_straight_length_upper = round(first_upper_length * 0.377, 1)
-            else:
-                entry_straight_length_upper = 89.1  # 預設值
+            # 從 3D 幾何位置計算入口過渡段長度（使用彎管幾何投影，不分割現有軌道）
+            entry_straight_length_upper = 0
+            if n_upper >= 1 and prev_curved_section:
+                curve_upper = prev_curved_section.get('upper_tracks', [])
+                if curve_upper:
+                    upper_pd = upper_tracks[0].get('pipe_data', {})
+                    u_sp = upper_pd.get('start_point', (0, 0, 0))
+                    u_ep = upper_pd.get('end_point', (0, 0, 0))
+                    
+                    # 找直軌最近的端點和曲線最近的端點
+                    best_curve_pt = None
+                    best_track_pt = None
+                    min_dist_yz = float('inf')
+                    for ct in curve_upper:
+                        cpd = ct.get('pipe_data', {})
+                        for cpt in [cpd.get('start_point', (0, 0, 0)),
+                                    cpd.get('end_point', (0, 0, 0))]:
+                            for tpt in [u_sp, u_ep]:
+                                d_yz = math.sqrt((tpt[1] - cpt[1])**2 + (tpt[2] - cpt[2])**2)
+                                if d_yz < min_dist_yz:
+                                    min_dist_yz = d_yz
+                                    best_curve_pt = cpt
+                                    best_track_pt = tpt
+                    
+                    if best_curve_pt and best_track_pt:
+                        entry_r = after_upper_r
+                        # 直軌方向（YZ 平面）
+                        dy_t = u_ep[1] - u_sp[1]
+                        dz_t = u_ep[2] - u_sp[2]
+                        len_yz_t = math.sqrt(dy_t**2 + dz_t**2)
+                        if len_yz_t > 1e-6:
+                            d_track_y = dy_t / len_yz_t
+                            d_track_z = dz_t / len_yz_t
+                        else:
+                            d_track_y = 0
+                            d_track_z = 1
+                        
+                        # 過渡段方向：彎管前的方向（根據直軌仰角反推）
+                        track_elev = elev_map.get(upper_tracks[0]['solid_id'], 48.0)
+                        trans_elev = track_elev - entry_bend_deg
+                        # 過渡段方向與直軌同向（Y 符號相同）
+                        sign_y = 1.0 if d_track_y >= 0 else -1.0
+                        d_trans_y = sign_y * math.cos(math.radians(trans_elev))
+                        d_trans_z = math.sin(math.radians(trans_elev))
+                        
+                        # 彎管幾何：CW 旋轉（仰角從 trans_elev 增加到 track_elev）
+                        # 在 YZ 平面中，旋轉中心在行進方向右側
+                        # 彎管出口 = 直軌起點（最近曲線的端點）
+                        # 使用投影法計算過渡段長度
+                        #   Center = exit + right_of_exit * R
+                        #   Entry = Center + left_of_entry * R (outward at entry for CW)
+                        right_track_y = d_track_z
+                        right_track_z = -d_track_y
+                        
+                        center_y = best_track_pt[1] + right_track_y * entry_r
+                        center_z = best_track_pt[2] + right_track_z * entry_r
+                        
+                        # 入口點（過渡段末端）
+                        left_trans_y = -d_trans_z
+                        left_trans_z = d_trans_y
+                        entry_pt_y = center_y + left_trans_y * entry_r
+                        entry_pt_z = center_z + left_trans_z * entry_r
+                        
+                        # 從曲線端點到彎管入口的間距，投影到過渡段方向
+                        gap_y = entry_pt_y - best_curve_pt[1]
+                        gap_z = entry_pt_z - best_curve_pt[2]
+                        proj = d_trans_y * gap_y + d_trans_z * gap_z
+                        entry_straight_length_upper = round(max(abs(proj), 0), 1)
+                        log_print(f"  Entry transition upper: bend_geom proj={proj:.1f} R={entry_r:.0f} → straight={entry_straight_length_upper:.1f}")
+            
+            if entry_straight_length_upper <= 0:
+                entry_straight_length_upper = 0  # 無法計算時不添加過渡段
             
             # 下軌沒有入口過渡段，彎角在直段後面
             entry_straight_length_lower = 0
@@ -2261,29 +2344,112 @@ class MockCADEngine:
             log_print(f"  彎軌入口 transition bend: {exit_bend_deg:.0f}°")
             bend_rad = math.radians(exit_bend_deg)
             
-            # 添加彎軌入口的 exit bend — 分割最後一個直段
-            # 結構：main_straight → exit_bend → exit_straight_to_curve
-            # 分割比例依彎曲方向：外側軌道過渡段較長，內側較短
-            if bend_direction == 'right':
-                exit_ratio_upper = 0.30  # 右彎時上軌在內側
-                exit_ratio_lower = 0.48  # 右彎時下軌在外側
-            else:  # left
-                exit_ratio_upper = 0.48  # 左彎時上軌在外側
-                exit_ratio_lower = 0.30  # 左彎時下軌在內側
-            
-            # 計算最後一個直段的長度
+            # 從 3D 座標計算過渡段長度（不分割現有軌道，新增獨立過渡段）
+            # 外側軌道：過渡段在主軌道之後（朝向曲線）exit_pos='after'
+            # 內側軌道：過渡段在主軌道之前（section 起點處）exit_pos='before'
             exit_straight_upper = 0
             exit_straight_lower = 0
-            if n_upper >= 1:
-                pd = upper_tracks[-1].get('pipe_data', {})
-                for seg in pd.get('segments', []):
-                    if seg.get('type') == 'straight':
-                        exit_straight_upper = round(seg.get('length', 0) * exit_ratio_upper, 1)
-            if n_lower >= 1:
-                pd = lower_tracks[-1].get('pipe_data', {})
-                for seg in pd.get('segments', []):
-                    if seg.get('type') == 'straight':
-                        exit_straight_lower = round(seg.get('length', 0) * exit_ratio_lower, 1)
+            exit_pos_upper = 'after'   # 預設
+            exit_pos_lower = 'before'  # 預設
+            
+            if next_curved_section and n_upper >= 1 and n_lower >= 1:
+                def _find_near_far_yz(track, curve_tracks):
+                    """找出軌道端點中離曲線最近和最遠的端點（使用 YZ 幾何距離）"""
+                    pd_t = track.get('pipe_data', {})
+                    sp = pd_t.get('start_point', (0, 0, 0))
+                    ep = pd_t.get('end_point', (0, 0, 0))
+                    min_sp_yz = float('inf')
+                    min_ep_yz = float('inf')
+                    best_curve_sp = None
+                    best_curve_ep = None
+                    for ct in curve_tracks:
+                        cpd = ct.get('pipe_data', {})
+                        for cpt in [cpd.get('start_point', (0, 0, 0)),
+                                    cpd.get('end_point', (0, 0, 0))]:
+                            d_sp = math.sqrt((sp[1] - cpt[1])**2 + (sp[2] - cpt[2])**2)
+                            d_ep = math.sqrt((ep[1] - cpt[1])**2 + (ep[2] - cpt[2])**2)
+                            if d_sp < min_sp_yz:
+                                min_sp_yz = d_sp
+                                best_curve_sp = cpt
+                            if d_ep < min_ep_yz:
+                                min_ep_yz = d_ep
+                                best_curve_ep = cpt
+                    if min_ep_yz <= min_sp_yz:
+                        return ep, sp, min_ep_yz, best_curve_ep
+                    else:
+                        return sp, ep, min_sp_yz, best_curve_sp
+                
+                curve_up = next_curved_section.get('upper_tracks', [])
+                curve_lo = next_curved_section.get('lower_tracks', [])
+                
+                u_near, u_far, u_gap_yz, u_curve_pt = _find_near_far_yz(upper_tracks[-1], curve_up) if curve_up else ((0,0,0),(0,0,0),0,None)
+                l_near, l_far, l_gap_yz, l_curve_pt = _find_near_far_yz(lower_tracks[-1], curve_lo) if curve_lo else ((0,0,0),(0,0,0),0,None)
+                
+                def _compute_outside_transition(track, near_pt, curve_pt, R, all_elevs):
+                    """用彎管幾何計算外側軌道過渡段長度（投影到 YZ 平面）"""
+                    pd_t = track.get('pipe_data', {})
+                    sp = pd_t.get('start_point', (0, 0, 0))
+                    ep = pd_t.get('end_point', (0, 0, 0))
+                    # 軌道方向（YZ 平面）
+                    dy = ep[1] - sp[1]
+                    dz = ep[2] - sp[2]
+                    len_yz = math.sqrt(dy**2 + dz**2)
+                    if len_yz < 1e-6:
+                        return 0
+                    d0_y = dy / len_yz
+                    d0_z = dz / len_yz
+                    
+                    # 過渡段方向（彎管後）= 另一軌的仰角
+                    track_elev = math.degrees(math.atan2(abs(dz), abs(dy)))
+                    post_elev = min(all_elevs) if track_elev > min(all_elevs) + 1 else max(all_elevs)
+                    sign_y = 1.0 if d0_y >= 0 else -1.0
+                    d1_y = sign_y * math.cos(math.radians(post_elev))
+                    d1_z = abs(d0_z) / d0_z * math.sin(math.radians(post_elev)) if abs(d0_z) > 1e-6 else math.sin(math.radians(post_elev))
+                    
+                    # CW 彎管（仰角從高→低）：中心在行進方向右側
+                    # 彎管入口 = 軌道近曲線端點
+                    # CW right normal: (d0_z, -d0_y)
+                    center_y = near_pt[1] + d0_z * R
+                    center_z = near_pt[2] + (-d0_y) * R
+                    
+                    # 彎管出口（CCW normal of d1 = outward for CW）
+                    exit_y = center_y + (-d1_z) * R
+                    exit_z = center_z + d1_y * R
+                    
+                    # 從出口到曲線端點的間距，投影到 d1
+                    if curve_pt:
+                        gap_y = curve_pt[1] - exit_y
+                        gap_z = curve_pt[2] - exit_z
+                        proj = d1_y * gap_y + d1_z * gap_z
+                        return max(proj, 0)
+                    return 0
+                
+                if bend_direction == 'left':
+                    # 上軌=外側（過渡段朝向曲線），下軌=內側（過渡段在 section 起點）
+                    outside_r = upper_default_r
+                    outside_elev = elev_map.get(upper_tracks[-1]['solid_id'], 44.0)
+                    inside_z_gap = abs(u_far[2] - l_far[2])
+                    
+                    exit_straight_upper = round(_compute_outside_transition(
+                        upper_tracks[-1], u_near, u_curve_pt, outside_r, all_elevs), 1)
+                    if outside_elev > 1:
+                        exit_straight_lower = round(max(inside_z_gap / math.sin(math.radians(outside_elev)), 0), 1)
+                    exit_pos_upper = 'after'
+                    exit_pos_lower = 'before'
+                else:  # right bend
+                    # 下軌=外側，上軌=內側
+                    outside_r = lower_default_r
+                    outside_elev = elev_map.get(lower_tracks[-1]['solid_id'], 44.0)
+                    inside_z_gap = abs(u_far[2] - l_far[2])
+                    
+                    exit_straight_lower = round(_compute_outside_transition(
+                        lower_tracks[-1], l_near, l_curve_pt, outside_r, all_elevs), 1)
+                    if outside_elev > 1:
+                        exit_straight_upper = round(max(inside_z_gap / math.sin(math.radians(outside_elev)), 0), 1)
+                    exit_pos_upper = 'before'
+                    exit_pos_lower = 'after'
+                
+                log_print(f"  Exit transitions: upper={exit_straight_upper:.1f}({exit_pos_upper}) lower={exit_straight_lower:.1f}({exit_pos_lower})")
             
             bends.append({
                 'angle_deg': exit_bend_deg,
@@ -2297,6 +2463,8 @@ class MockCADEngine:
                 'position': 'exit',
                 'exit_straight_upper': exit_straight_upper,
                 'exit_straight_lower': exit_straight_lower,
+                'exit_pos_upper': exit_pos_upper,
+                'exit_pos_lower': exit_pos_lower,
             })
 
         # ========== 原有邏輯：軌道間 transition bends ==========
@@ -2440,32 +2608,34 @@ class MockCADEngine:
             if best_si is not None and best_dist <= 500:
                 assignment.setdefault(best_si, []).append(leg)
 
-        # 按 X 座標位置分組，每個位置只保留一支腳架
-        # 這確保每個軌道位置只顯示一支腳架
+        # 按沿軌道方向（Z 座標）分組，同一 Z 位置且同一 X 位置才合併
+        # 使用 Z+X 複合鍵確保不同位置的腳架都保留
         for sec_idx, legs in assignment.items():
             if len(legs) <= 1:
                 continue
             
-            # 按 X 座標分組
-            x_groups = {}
+            # 按 Z 座標（沿軌道方向）分組，容差 50mm
+            z_groups = {}
             for leg in legs:
+                lz = leg.get('centroid', (0, 0, 0))[2]
                 lx = leg.get('centroid', (0, 0, 0))[0]
-                # 將 X 座標四捨五入到最近的 100mm 進行分組
-                x_key = round(lx / 100) * 100
-                if x_key not in x_groups:
-                    x_groups[x_key] = []
-                x_groups[x_key].append(leg)
+                # 複合鍵：Z (50mm 容差) + X (50mm 容差)
+                z_key = round(lz / 50) * 50
+                x_key = round(lx / 50) * 50
+                group_key = (z_key, x_key)
+                if group_key not in z_groups:
+                    z_groups[group_key] = []
+                z_groups[group_key].append(leg)
             
-            # 每個 X 位置選擇一支腳架
-            # 如果同一位置有多支，選擇 Z 座標最大的（離軌道後端最近）
+            # 每個位置選擇一支腳架（同一精確位置有多支時取一支）
             selected_legs = []
-            for x_key in sorted(x_groups.keys()):
-                group = x_groups[x_key]
+            for group_key in sorted(z_groups.keys()):
+                group = z_groups[group_key]
                 if len(group) == 1:
                     selected_legs.append(group[0])
                 else:
-                    # 同一 X 位置有多支腳架，選 Z 最大的
-                    best_leg = max(group, key=lambda l: l.get('centroid', (0, 0, 0))[2])
+                    # 同一位置有多支腳架，選線長最長的
+                    best_leg = max(group, key=lambda l: l.get('line_length', 0))
                     selected_legs.append(best_leg)
             
             # 按 Z 座標排序（沿軌道方向）
@@ -2533,19 +2703,14 @@ class MockCADEngine:
             items = []
             idx = 1
             
-            # 處理入口 transition bend (彎軌出口)
+            # 處理入口 transition bend (彎軌出口) — 不分割原有軌道，新增獨立過渡段
             if entry_bend and segs:
                 entry_straight = entry_bend.get('entry_straight_upper' if is_upper else 'entry_straight_lower', 0)
                 arc_len_check = entry_bend['upper_arc'] if is_upper else entry_bend['lower_arc']
-                first_seg = segs[0]
-                main_length = first_seg['length']
                 
-                # 只有當有入口過渡段或有效弧長時才處理
-                if entry_straight > 0 and entry_straight < main_length and arc_len_check > 0:
-                    # 分成入口過渡段和主段
-                    remaining_length = main_length - entry_straight
-                    
-                    # U1/D1: 入口過渡直線段
+                if entry_straight > 0 and arc_len_check > 0:
+                    # 新增入口過渡直線段（獨立段，不從主軌分割）
+                    first_seg = segs[0]
                     items.append({
                         'item': f'{prefix}{idx}',
                         'type': 'straight',
@@ -2555,7 +2720,7 @@ class MockCADEngine:
                     })
                     idx += 1
                     
-                    # U2/D2: entry transition bend
+                    # 入口彎角
                     r = entry_bend['upper_r'] if is_upper else entry_bend['lower_r']
                     arc_len = entry_bend['upper_arc'] if is_upper else entry_bend['lower_arc']
                     bend_deg = entry_bend['angle_deg']
@@ -2570,21 +2735,9 @@ class MockCADEngine:
                         'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
                     })
                     idx += 1
-                    
-                    # U3/D3: 主直線段（剩餘長度）
-                    items.append({
-                        'item': f'{prefix}{idx}',
-                        'type': 'straight',
-                        'diameter': first_seg.get('diameter', pipe_diameter),
-                        'length': round(remaining_length, 1),
-                        'spec': f"直徑{first_seg.get('diameter', pipe_diameter):.1f} 長度{remaining_length:.1f}",
-                    })
-                    idx += 1
-                    
-                    # 跳過第一個 seg，繼續處理剩餘的
-                    segs = segs[1:]
+                    # 主軌道保持全長，不跳過（segs 不變）
                 elif arc_len_check > 0:
-                    # 入口過渡段長度無效但有有效弧長，只添加 entry bend 在直軌前
+                    # 無入口過渡段但有有效弧長，只添加 entry bend 在直軌前
                     r = entry_bend['upper_r'] if is_upper else entry_bend['lower_r']
                     arc_len = entry_bend['upper_arc'] if is_upper else entry_bend['lower_arc']
                     bend_deg = entry_bend['angle_deg']
@@ -2634,79 +2787,69 @@ class MockCADEngine:
                         })
                         idx += 1
             
-            # 處理 exit bend（在所有直段之後）
-            # 如果有 exit_straight > 0，分割最後一個直段：
-            #   main_part → exit_bend → exit_transition_part
+            # 處理 exit bend — 不分割軌道，新增獨立過渡段
+            # exit_pos='after': 主軌 → 彎角 → 過渡段（外側軌道，朝向曲線）
+            # exit_pos='before': 過渡段 → 彎角 → 主軌（內側軌道，section 起點處）
             if exit_bend:
                 r = exit_bend['upper_r'] if is_upper else exit_bend['lower_r']
                 arc_len = exit_bend['upper_arc'] if is_upper else exit_bend['lower_arc']
                 bend_deg = exit_bend.get('upper_bend_deg', exit_bend['angle_deg']) if is_upper else exit_bend.get('lower_bend_deg', exit_bend['angle_deg'])
                 exit_straight = exit_bend.get('exit_straight_upper' if is_upper else 'exit_straight_lower', 0)
+                exit_pos = exit_bend.get('exit_pos_upper' if is_upper else 'exit_pos_lower', 'after')
                 
                 if bend_deg >= 0.5 and arc_len >= 1:
-                    # 如果有 exit 過渡段且最後一個項目是直管，分割它
-                    if exit_straight > 0 and items and items[-1].get('type') == 'straight':
-                        last_item = items[-1]
-                        total_len = last_item['length']
-                        
-                        if exit_straight < total_len:
-                            # 縮短最後一個直管為主段
-                            main_len = round(total_len - exit_straight, 1)
-                            items[-1] = {
-                                'item': last_item['item'],
-                                'type': 'straight',
-                                'diameter': last_item.get('diameter', pipe_diameter),
-                                'length': main_len,
-                                'spec': f"直徑{last_item.get('diameter', pipe_diameter):.1f} 長度{main_len:.1f}",
-                            }
-                            
-                            # 添加 exit bend
-                            items.append({
-                                'item': f'{prefix}{idx}',
-                                'type': 'arc',
-                                'diameter': pipe_diameter,
-                                'angle_deg': bend_deg,
-                                'radius': r,
-                                'outer_arc_length': arc_len,
-                                'height_gain': 0,
-                                'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
-                            })
-                            idx += 1
-                            
-                            # 添加 exit 過渡直段
-                            items.append({
-                                'item': f'{prefix}{idx}',
-                                'type': 'straight',
-                                'diameter': pipe_diameter,
-                                'length': exit_straight,
-                                'spec': f"直徑{pipe_diameter:.1f} 長度{exit_straight:.1f}",
-                            })
-                            idx += 1
-                        else:
-                            # exit_straight >= total_len，不分割，只加 bend
-                            items.append({
-                                'item': f'{prefix}{idx}',
-                                'type': 'arc',
-                                'diameter': pipe_diameter,
-                                'angle_deg': bend_deg,
-                                'radius': r,
-                                'outer_arc_length': arc_len,
-                                'height_gain': 0,
-                                'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
-                            })
-                            idx += 1
-                    else:
-                        # 無法分割，直接添加 exit bend
-                        items.append({
-                            'item': f'{prefix}{idx}',
-                            'type': 'arc',
+                    bend_item = {
+                        'type': 'arc',
+                        'diameter': pipe_diameter,
+                        'angle_deg': bend_deg,
+                        'radius': r,
+                        'outer_arc_length': arc_len,
+                        'height_gain': 0,
+                        'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
+                    }
+                    
+                    if exit_pos == 'before' and exit_straight > 0:
+                        # 內側軌道：過渡段 → 彎角 → 主軌（插入到最前面）
+                        trans_item = {
+                            'type': 'straight',
                             'diameter': pipe_diameter,
-                            'angle_deg': bend_deg,
-                            'radius': r,
-                            'outer_arc_length': arc_len,
-                            'height_gain': 0,
-                            'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
-                        })
+                            'length': exit_straight,
+                            'spec': f"直徑{pipe_diameter:.1f} 長度{exit_straight:.1f}",
+                        }
+                        # 重新編號：過渡段在前、彎角在中、主軌在後
+                        new_items = []
+                        new_idx = 1
+                        trans_item['item'] = f'{prefix}{new_idx}'
+                        new_items.append(trans_item)
+                        new_idx += 1
+                        bend_item['item'] = f'{prefix}{new_idx}'
+                        new_items.append(bend_item)
+                        new_idx += 1
+                        for old_item in items:
+                            old_item['item'] = f'{prefix}{new_idx}'
+                            new_items.append(old_item)
+                            new_idx += 1
+                        items = new_items
+                        idx = new_idx
+                    elif exit_straight > 0:
+                        # 外側軌道：主軌 → 彎角 → 過渡段（附加在後面）
+                        bend_item['item'] = f'{prefix}{idx}'
+                        items.append(bend_item)
+                        idx += 1
+                        
+                        trans_item = {
+                            'item': f'{prefix}{idx}',
+                            'type': 'straight',
+                            'diameter': pipe_diameter,
+                            'length': exit_straight,
+                            'spec': f"直徑{pipe_diameter:.1f} 長度{exit_straight:.1f}",
+                        }
+                        items.append(trans_item)
+                        idx += 1
+                    else:
+                        # 無過渡段，只加彎角
+                        bend_item['item'] = f'{prefix}{idx}'
+                        items.append(bend_item)
                         idx += 1
             
             return items
@@ -5555,13 +5698,23 @@ Solid 名稱: {solid_name}
             # 圖號
             self._draw_drawing_number(msp2, PW, PH, f"{base_name}-2")
 
-            # 計算弧長與高低差
+            # 計算弧長與高低差 — 使用中心線弧長（非外弧長）
             arc_total_length = 0
             arc_height_gain = 0
             for ai in arc_items:
-                single_len = ai.get('outer_arc_length', ai.get('arc_length', 0))
+                # 使用中心線弧長公式: sqrt((R*θ)² + h²)
+                r_cl = ai.get('radius', 0)
+                theta_rad = math.radians(ai.get('angle_deg', 0))
+                h_g = ai.get('height_gain', 0)
+                if r_cl > 0 and theta_rad > 0:
+                    if h_g > 1:
+                        single_len = math.sqrt((r_cl * theta_rad) ** 2 + h_g ** 2)
+                    else:
+                        single_len = r_cl * theta_rad
+                else:
+                    single_len = ai.get('outer_arc_length', ai.get('arc_length', 0))
                 arc_total_length = max(arc_total_length, single_len)
-                arc_height_gain = max(arc_height_gain, ai.get('height_gain', 0))
+                arc_height_gain = max(arc_height_gain, h_g)
             if arc_total_length == 0:
                 arc_total_length = 2 * math.pi * arc_radius * (arc_angle_deg / 360)
             if arc_height_gain < 1 and elevation_deg > 0:
@@ -5570,40 +5723,169 @@ Solid 名稱: {solid_name}
             bracket_count = sum(b.get('quantity', 1) for b in bracket_items)
 
             # ================================================================
-            # 上半部：HLR 投影 — Z 軸 32 度視角
-            # 使用 HLR 顯示完整軌道、支撐架、腳架邊線
+            # 上半部：俯視圖（Top View）— 使用 pipe_data 繪製弧形軌道
+            # 從上方往下看，顯示弧形軌道 XY 平面投影
             # ================================================================
-            z_angle = 32  # Z 軸角度
-            z_rad = math.radians(z_angle)
-            # 視線方向：從 Z 軸傾斜 32° 向 -Y 方向（Y-up 模型）
-            upper_main = (0, -math.sin(z_rad), -math.cos(z_rad))
-            upper_xdir = (1, 0, 0)
+            log_print(f"  上圖：俯視圖（pipe_data）")
 
-            log_print(f"  上圖 HLR 投影: Z軸{z_angle}度")
-            upper_polylines, upper_bbox = self._hlr_project_to_polylines(
-                upper_main, upper_xdir)
+            # 找到 curved section 的軌道資料
+            curved_sec = None
+            for sec in sections:
+                if sec['section_type'] == 'curved':
+                    curved_sec = sec
+                    break
+            c_upper = curved_sec.get('upper_tracks', []) if curved_sec else []
+            c_lower = curved_sec.get('lower_tracks', []) if curved_sec else []
 
-            # 上圖可用空間（A3 上半部）
+            # 上圖繪圖區域（A3 上半部）
             upper_area_x = MARGIN + 15
             upper_area_y = PH * 0.52
             upper_area_w = PW * 0.45
             upper_area_h = PH - MARGIN - upper_area_y - 10
 
-            ub_w = max(upper_bbox[2] - upper_bbox[0], 1)
-            ub_h = max(upper_bbox[3] - upper_bbox[1], 1)
-            upper_scale = min(upper_area_w / ub_w, upper_area_h / ub_h) * 0.85
+            R_arc = arc_radius
+            pipe_r = pipe_diameter / 2
+
+            # ---- 從 pipe_data 3D 座標計算弧心（投影到 XY 平面）----
+            arc_cx_m, arc_cy_m = 0.0, 0.0
+            plan_sa_deg = 90 - arc_angle_deg / 2   # 預設置中
+            plan_span_deg = arc_angle_deg
+            plan_p1 = (0.0, 0.0)
+            plan_p2 = (0.0, 0.0)
+            plan_valid = False
+            u_sp_3d = (0, 0, 0)
+            u_ep_3d = (0, 0, 0)
+            l_sp_3d = (0, 0, 0)
+            l_ep_3d = (0, 0, 0)
+
+            if c_upper:
+                u_pd = c_upper[0].get('pipe_data', {})
+                u_sp_3d = u_pd.get('start_point', (0, 0, 0))
+                u_ep_3d = u_pd.get('end_point', (0, 0, 0))
+                p1x, p1y = u_sp_3d[0], u_sp_3d[1]
+                p2x, p2y = u_ep_3d[0], u_ep_3d[1]
+                plan_p1, plan_p2 = (p1x, p1y), (p2x, p2y)
+
+                dx_ch = p2x - p1x
+                dy_ch = p2y - p1y
+                chord_xy = math.sqrt(dx_ch**2 + dy_ch**2)
+
+                if chord_xy > 1e-6:
+                    mid_x = (p1x + p2x) / 2
+                    mid_y = (p1y + p2y) / 2
+                    half_c = chord_xy / 2
+                    h_perp = math.sqrt(max(R_arc**2 - half_c**2, 0)) if R_arc >= half_c else 0
+
+                    # 弦法線方向
+                    nx_ch = -dy_ch / chord_xy
+                    ny_ch = dx_ch / chord_xy
+
+                    # 根據彎曲方向選擇弧心側
+                    if bend_direction == 'left':
+                        arc_cx_m = mid_x + h_perp * nx_ch
+                        arc_cy_m = mid_y + h_perp * ny_ch
+                    else:
+                        arc_cx_m = mid_x - h_perp * nx_ch
+                        arc_cy_m = mid_y - h_perp * ny_ch
+
+                    # 起止角度
+                    plan_sa_deg = math.degrees(math.atan2(p1y - arc_cy_m, p1x - arc_cx_m))
+                    ea_deg = math.degrees(math.atan2(p2y - arc_cy_m, p2x - arc_cx_m))
+
+                    # 計算 CCW 跨度，確保與 arc_angle_deg 一致
+                    ccw_span = (ea_deg - plan_sa_deg) % 360
+                    if ccw_span < 1:
+                        ccw_span = 360
+                    if abs(ccw_span - arc_angle_deg) > 30:
+                        plan_sa_deg = ea_deg
+                        ccw_span = (360 - ccw_span) if ccw_span > 180 else (360 - ccw_span)
+                        ccw_span = (plan_sa_deg - ea_deg) % 360
+                        if ccw_span < 1:
+                            ccw_span = arc_angle_deg
+                    plan_span_deg = ccw_span
+                    plan_valid = True
+                    log_print(f"  弧心=({arc_cx_m:.1f},{arc_cy_m:.1f}), "
+                              f"sa={plan_sa_deg:.1f}, span={plan_span_deg:.1f}")
+
+            if c_lower:
+                l_pd_tmp = c_lower[0].get('pipe_data', {})
+                l_sp_3d = l_pd_tmp.get('start_point', (0, 0, 0))
+                l_ep_3d = l_pd_tmp.get('end_point', (0, 0, 0))
+
+            # ---- 俯視圖 bounding box ----
+            bb_pts = []
+            for i in range(101):
+                t = i / 100
+                a = math.radians(plan_sa_deg + t * plan_span_deg)
+                bb_pts.append((arc_cx_m + (R_arc + pipe_r + 10) * math.cos(a),
+                               arc_cy_m + (R_arc + pipe_r + 10) * math.sin(a)))
+            bb_x0 = min(p[0] for p in bb_pts) - pipe_diameter * 2
+            bb_x1 = max(p[0] for p in bb_pts) + pipe_diameter * 2
+            bb_y0 = min(p[1] for p in bb_pts) - pipe_diameter * 2
+            bb_y1 = max(p[1] for p in bb_pts) + pipe_diameter * 2
+
+            model_w_u = max(bb_x1 - bb_x0, 1)
+            model_h_u = max(bb_y1 - bb_y0, 1)
+
+            # 縮放與偏移
+            upper_scale = min(upper_area_w / model_w_u,
+                              upper_area_h / model_h_u) * 0.80
+            pipe_hw_u = min(max(pipe_diameter * upper_scale * 0.5, 1.0), 3.0)
             upper_off_x = (upper_area_x + upper_area_w / 2
-                           - (upper_bbox[0] + upper_bbox[2]) / 2 * upper_scale)
+                           - (bb_x0 + bb_x1) / 2 * upper_scale)
             upper_off_y = (upper_area_y + upper_area_h / 2
-                           - (upper_bbox[1] + upper_bbox[3]) / 2 * upper_scale)
+                           - (bb_y0 + bb_y1) / 2 * upper_scale)
 
-            for pl in upper_polylines:
-                pts = [(p[0] * upper_scale + upper_off_x,
-                        p[1] * upper_scale + upper_off_y) for p in pl]
+            def _m2u(mx, my):
+                """模型座標 → 上圖紙張座標"""
+                return (mx * upper_scale + upper_off_x,
+                        my * upper_scale + upper_off_y)
+
+            def _draw_arc_poly(msp, cx, cy, r, sa, span, n=60, **dxf):
+                """繪製弧形 polyline（模型座標自動縮放到紙張）"""
+                pts = []
+                for i in range(n + 1):
+                    t = i / n
+                    a = math.radians(sa + t * span)
+                    pts.append(_m2u(cx + r * math.cos(a),
+                                    cy + r * math.sin(a)))
                 if len(pts) >= 2:
-                    msp2.add_lwpolyline(pts)
+                    msp.add_lwpolyline(pts, dxfattribs=dxf)
 
-            log_print(f"  上圖邊數: {len(upper_polylines)}")
+            # ---- 繪製上軌弧線（管壁 + 中心線）----
+            _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc + pipe_r,
+                           plan_sa_deg, plan_span_deg)
+            _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc - pipe_r,
+                           plan_sa_deg, plan_span_deg)
+            _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc,
+                           plan_sa_deg, plan_span_deg, color=1)  # 中心線紅色
+
+            # ---- 繪製下軌弧線（俯視圖與上軌幾乎重疊，用綠色+微偏移區分）----
+            if c_lower:
+                rail_vis_off = pipe_diameter * 0.4  # 視覺偏移
+                _draw_arc_poly(msp2, arc_cx_m, arc_cy_m,
+                               R_arc + pipe_r + rail_vis_off,
+                               plan_sa_deg, plan_span_deg, color=3)
+                _draw_arc_poly(msp2, arc_cx_m, arc_cy_m,
+                               R_arc - pipe_r - rail_vis_off,
+                               plan_sa_deg, plan_span_deg, color=3)
+                _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc,
+                               plan_sa_deg, plan_span_deg, color=3)
+
+            # ---- 支撐架標記（沿弧等距的徑向短線）----
+            if bracket_count > 0:
+                for bi in range(bracket_count):
+                    bt = (bi + 0.5) / bracket_count
+                    ba = math.radians(plan_sa_deg + bt * plan_span_deg)
+                    r_in = R_arc - pipe_r - pipe_diameter * 0.8
+                    r_out = R_arc + pipe_r + pipe_diameter * 0.8
+                    bx1, by1 = _m2u(arc_cx_m + r_in * math.cos(ba),
+                                     arc_cy_m + r_in * math.sin(ba))
+                    bx2, by2 = _m2u(arc_cx_m + r_out * math.cos(ba),
+                                     arc_cy_m + r_out * math.sin(ba))
+                    msp2.add_line((bx1, by1), (bx2, by2), dxfattribs={'color': 5})
+
+            log_print(f"  上圖繪製完成（pipe_data 弧形）")
 
             # R 尺寸標註（上圖左上方）
             r_label_x = upper_area_x + 5
@@ -5612,61 +5894,155 @@ Solid 名稱: {solid_name}
                 'height': 4.0}).set_placement((r_label_x, r_label_y))
 
             # 弦長尺寸標註（上圖下方）
-            ub_draw_left = upper_bbox[0] * upper_scale + upper_off_x
-            ub_draw_right = upper_bbox[2] * upper_scale + upper_off_x
-            ub_draw_bottom = upper_bbox[1] * upper_scale + upper_off_y
+            if plan_valid:
+                p1_d = _m2u(*plan_p1)
+                p2_d = _m2u(*plan_p2)
+            else:
+                sa_r = math.radians(plan_sa_deg)
+                ea_r = math.radians(plan_sa_deg + plan_span_deg)
+                p1_d = _m2u(arc_cx_m + R_arc * math.cos(sa_r),
+                            arc_cy_m + R_arc * math.sin(sa_r))
+                p2_d = _m2u(arc_cx_m + R_arc * math.cos(ea_r),
+                            arc_cy_m + R_arc * math.sin(ea_r))
+            chord_dim_y = min(p1_d[1], p2_d[1]) - 5
             self._draw_dimension_line(msp2,
-                                      (ub_draw_left, ub_draw_bottom - 3),
-                                      (ub_draw_right, ub_draw_bottom - 3),
-                                      -8,
-                                      f"{chord_length:.0f}")
+                                      (min(p1_d[0], p2_d[0]), chord_dim_y),
+                                      (max(p1_d[0], p2_d[0]), chord_dim_y),
+                                      -8, f"{chord_length:.0f}")
 
             # ================================================================
-            # 下半部：HLR 前視圖背面
-            # 從背面看（+Y 方向），顯示完整軌道 + 支撐架 + 腳架邊線
+            # 下半部：左前視圖 — 使用 pipe_data 3D→2D 投影
+            # 投影方向：從左前方（view_dir ≈ -30° from Y-axis）
+            # screen_x = y·cos(α) − x·sin(α),  screen_y = z
             # ================================================================
-            # 前視圖背面：視線沿 +Y 方向看，X 軸反轉以維持正確方向
-            back_main = (0, 1, 0)
-            back_xdir = (-1, 0, 0)
+            log_print(f"  下圖：左前視圖（pipe_data）")
 
-            log_print(f"  下圖 HLR 前視圖背面")
-            lower_polylines, lower_bbox = self._hlr_project_to_polylines(
-                back_main, back_xdir)
-
-            # 下圖可用空間（A3 下半部）
             lower_area_x = MARGIN + 15
             lower_area_y = tb_top2 + 5
             lower_area_w = PW * 0.45
             lower_area_h = PH * 0.42 - tb_top2
 
-            lb_w = max(lower_bbox[2] - lower_bbox[0], 1)
-            lb_h = max(lower_bbox[3] - lower_bbox[1], 1)
-            lower_scale = min(lower_area_w / lb_w, lower_area_h / lb_h) * 0.85
+            # 投影角度（左前方 30°）
+            view_alpha = math.radians(30)
+            cos_va = math.cos(view_alpha)
+            sin_va = math.sin(view_alpha)
+
+            def _proj_lf(x, y, z):
+                """3D → 左前視圖 2D 投影"""
+                return (y * cos_va - x * sin_va, z)
+
+            # 取樣 3D 弧線點
+            n_samp = 80
+
+            def _sample_arc_3d(sp3, ep3, cx_m, cy_m, r, sa_d, span_d, n):
+                """沿弧線取樣 3D 點（XY 弧線 + Z 線性插值）"""
+                pts = []
+                z0, z1 = sp3[2], ep3[2]
+                for i in range(n + 1):
+                    t = i / n
+                    a = math.radians(sa_d + t * span_d)
+                    px = cx_m + r * math.cos(a)
+                    py = cy_m + r * math.sin(a)
+                    pz = z0 + t * (z1 - z0)
+                    pts.append((px, py, pz))
+                return pts
+
+            # 上軌 / 下軌 3D 取樣 → 2D 投影
+            u_pts_2d, l_pts_2d = [], []
+            if c_upper:
+                u_pts_3d = _sample_arc_3d(u_sp_3d, u_ep_3d, arc_cx_m, arc_cy_m,
+                                           R_arc, plan_sa_deg, plan_span_deg, n_samp)
+                u_pts_2d = [_proj_lf(*p) for p in u_pts_3d]
+            if c_lower:
+                l_pts_3d = _sample_arc_3d(l_sp_3d, l_ep_3d, arc_cx_m, arc_cy_m,
+                                           R_arc, plan_sa_deg, plan_span_deg, n_samp)
+                l_pts_2d = [_proj_lf(*p) for p in l_pts_3d]
+
+            # Bounding box
+            all_2d = u_pts_2d + l_pts_2d
+            if all_2d:
+                lb_x0 = min(p[0] for p in all_2d) - pipe_diameter
+                lb_x1 = max(p[0] for p in all_2d) + pipe_diameter
+                lb_y0 = min(p[1] for p in all_2d) - pipe_diameter
+                lb_y1 = max(p[1] for p in all_2d) + pipe_diameter
+            else:
+                lb_x0, lb_y0, lb_x1, lb_y1 = -200, -200, 200, 200
+
+            model_w_l = max(lb_x1 - lb_x0, 1)
+            model_h_l = max(lb_y1 - lb_y0, 1)
+
+            lower_scale = min(lower_area_w / model_w_l,
+                              lower_area_h / model_h_l) * 0.80
+            pipe_hw_l = min(max(pipe_diameter * lower_scale * 0.5, 1.0), 3.0)
             lower_off_x = (lower_area_x + lower_area_w / 2
-                           - (lower_bbox[0] + lower_bbox[2]) / 2 * lower_scale)
+                           - (lb_x0 + lb_x1) / 2 * lower_scale)
             lower_off_y = (lower_area_y + lower_area_h / 2
-                           - (lower_bbox[1] + lower_bbox[3]) / 2 * lower_scale)
+                           - (lb_y0 + lb_y1) / 2 * lower_scale)
 
-            for pl in lower_polylines:
-                pts = [(p[0] * lower_scale + lower_off_x,
-                        p[1] * lower_scale + lower_off_y) for p in pl]
-                if len(pts) >= 2:
-                    msp2.add_lwpolyline(pts)
+            def _m2l(sx, sy):
+                """投影 2D 座標 → 下圖紙張座標"""
+                return (sx * lower_scale + lower_off_x,
+                        sy * lower_scale + lower_off_y)
 
-            log_print(f"  下圖邊數（前視圖背面）: {len(lower_polylines)}")
+            def _draw_pipe_curve(msp, pts_2d, hw, center_color=1):
+                """繪製管壁雙線 + 中心線"""
+                if len(pts_2d) < 2:
+                    return
+                # 紙張座標
+                c_pts = [_m2l(*p) for p in pts_2d]
+                # 中心線
+                msp.add_lwpolyline(c_pts, dxfattribs={'color': center_color})
+                # 法線偏移計算管壁
+                wall_u, wall_d = [], []
+                for i in range(len(c_pts)):
+                    if i < len(c_pts) - 1:
+                        dx = c_pts[i + 1][0] - c_pts[i][0]
+                        dy = c_pts[i + 1][1] - c_pts[i][1]
+                    else:
+                        dx = c_pts[i][0] - c_pts[i - 1][0]
+                        dy = c_pts[i][1] - c_pts[i - 1][1]
+                    d = math.sqrt(dx**2 + dy**2)
+                    if d > 1e-9:
+                        nx, ny = -dy / d * hw, dx / d * hw
+                    else:
+                        nx, ny = 0, hw
+                    wall_u.append((c_pts[i][0] + nx, c_pts[i][1] + ny))
+                    wall_d.append((c_pts[i][0] - nx, c_pts[i][1] - ny))
+                if len(wall_u) >= 2:
+                    msp.add_lwpolyline(wall_u)
+                    msp.add_lwpolyline(wall_d)
 
-            # 前視圖背面尺寸標註 — 軌道間距（右側垂直）
-            if rail_spacing > 0:
-                lb_draw_right = lower_bbox[2] * lower_scale + lower_off_x
-                lb_draw_top = lower_bbox[3] * lower_scale + lower_off_y
-                lb_draw_bottom = lower_bbox[1] * lower_scale + lower_off_y
-                rs_draw = rail_spacing * lower_scale
-                lb_mid_y = (lb_draw_top + lb_draw_bottom) / 2
+            # 繪製上軌（紅色中心線 + 黑色管壁）
+            if u_pts_2d:
+                _draw_pipe_curve(msp2, u_pts_2d, pipe_hw_l, center_color=1)
+
+            # 繪製下軌（綠色中心線 + 綠色管壁）
+            if l_pts_2d:
+                _draw_pipe_curve(msp2, l_pts_2d, pipe_hw_l, center_color=3)
+
+            # 支撐架（連接上下軌的短線）
+            if bracket_count > 0 and u_pts_2d and l_pts_2d:
+                n_u = len(u_pts_2d)
+                n_l = len(l_pts_2d)
+                for bi in range(bracket_count):
+                    idx_u = int((bi + 0.5) / bracket_count * (n_u - 1))
+                    idx_l = int((bi + 0.5) / bracket_count * (n_l - 1))
+                    idx_u = max(0, min(idx_u, n_u - 1))
+                    idx_l = max(0, min(idx_l, n_l - 1))
+                    u_pt = _m2l(*u_pts_2d[idx_u])
+                    l_pt = _m2l(*l_pts_2d[idx_l])
+                    msp2.add_line(u_pt, l_pt, dxfattribs={'color': 5})
+
+            log_print(f"  下圖繪製完成（pipe_data 左前視圖）")
+
+            # 軌道間距標註（右側垂直）
+            if rail_spacing > 0 and u_pts_2d and l_pts_2d:
+                u_end = _m2l(*u_pts_2d[-1])
+                l_end = _m2l(*l_pts_2d[-1])
                 self._draw_dimension_line(msp2,
-                                          (lb_draw_right + 5, lb_mid_y - rs_draw / 2),
-                                          (lb_draw_right + 5, lb_mid_y + rs_draw / 2),
-                                          10,
-                                          f"{rail_spacing:.1f}",
+                                          (u_end[0] + 10, u_end[1]),
+                                          (l_end[0] + 10, l_end[1]),
+                                          10, f"{rail_spacing:.1f}",
                                           vertical=True)
 
             # ================================================================
