@@ -1,0 +1,7 @@
+fix: track direction upward, bend angle DXF correction, interactive preview
+
+1. Track drawing direction: dy=-sin -> dy=+sin (tracks now go upward)
+2. Base Y anchor: max(up_ys) -> min(up_ys) (path starts at bottom)
+3. Bend angle DXF: remove 180-angle flip, use direct elevation angle
+4. Preview: remove PNG generation, use interactive matplotlib windows
+5. Add interactive preview to run_sub_assembly.py

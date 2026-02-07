@@ -1,0 +1,81 @@
+# --- Python 系統與編譯檔 ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# --- 虛擬環境 (這是最耗 Token 的元兇，務必忽略) ---
+venv/
+.venv/
+env/
+ENV/
+lib/
+bin/
+include/
+
+# --- 敏感資訊 (資安保護) ---
+.env
+.env.local
+config.py  # 若包含密碼請忽略
+secrets/
+
+# --- 依賴管理與鎖定檔 ---
+# 這些檔案通常行數極多，除非要 Debug 依賴衝突，否則建議忽略
+poetry.lock
+Pipfile.lock
+package-lock.json
+yarn.lock
+
+# --- 構建與發布 ---
+build/
+develop-eggs/
+dist/
+docs/
+downloads/
+google/
+logs/
+output/
+test/logs
+test/output
+eggs/
+.eggs/
+*.egg-info/
+.tox/
+.git/
+.github/
+.githooks/
+.trunk/
+.vscode/
+
+
+
+# --- IDE 與編輯器設定 ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- Log 與 數據庫 ---
+*.log
+*.sqlite
+*.db
+
+# --- 大型數據與二進位檔案 (建議忽略) ---
+# 這些檔案 Claude 無法直接讀取且極佔空間
+*.csv
+*.json    # 若 JSON 為設定檔可保留，若為數據集請忽略
+*.xml
+*.zip
+*.tar.gz
+*.pdf
+#*.png
+*.jpg
+
+# --- CAD/工程檔案 (針對 3D/2D 轉換專案) ---
+*.stp
+*.step
+#*.dxf
+*.dwg
+*.stl

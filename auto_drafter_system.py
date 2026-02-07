@@ -2253,7 +2253,7 @@ class MockCADEngine:
                                   part_classifications, pipe_diameter, rail_spacing,
                                   is_after_curved=False, prev_curved_section=None,
                                   is_before_curved=False, next_curved_section=None,
-                                  bend_direction='left'):
+                                  bend_direction='left', stp_data=None):
         """
         在一個 straight section 內，計算相鄰軌道間的仰角差 → 虛擬 transition bend。
         Per-rail 各自計算 bend angle，因上下軌仰角不同。
@@ -2267,75 +2267,29 @@ class MockCADEngine:
                  upper_r, lower_r, upper_arc, lower_arc, position}
                  position: 'entry' (彎軌出口), 'exit' (彎軌入口), 或 'between' (軌道間)
         """
-        # 建立 elev_map：從 pipe_data 的 start_point/end_point 計算仰角
-        # 原來的 track_elevations 計算不正確（全部是 0），改用直接計算
-        elev_map = {}
+        # 仰角查表（從 stp_data 讀取，不再重複計算）
+        elev_map = stp_data['track_elev_map'] if stp_data else {}
         class_map = {c['feature_id']: c for c in part_classifications}
-        
-        for pc in pipe_centerlines:
-            fid = pc['solid_id']
-            cls = class_map.get(fid, {})
-            if cls.get('class') == 'track':
-                sp = pc.get('start_point', (0, 0, 0))
-                ep = pc.get('end_point', (0, 0, 0))
-                dz = abs(ep[2] - sp[2])
-                dxy = math.sqrt((ep[0] - sp[0])**2 + (ep[1] - sp[1])**2)
-                elev = math.degrees(math.atan2(dz, dxy)) if dxy > 1e-6 else 0
-                elev_map[fid] = elev
+
+        # 建立 pipe_centerlines 查表（from stp_data，用於端點查詢）
+        _pcl_map = {}
+        if stp_data and 'pipe_centerlines' in stp_data:
+            for _pc in stp_data['pipe_centerlines']:
+                _pcl_map[_pc['solid_id']] = _pc
 
         # 建立每條 track 的實際 arc radius 查表
-        # 優先從 features 中的 circle（STEP 檔律中的大圓）提取半徑
         class_map = {c['feature_id']: c for c in part_classifications}
         track_arc_radius_map = {}  # solid_id → radius
         
-        # Step 1: 從 features 中提取大圓半徑（220mm, 270mm等）
-        large_circles = [f for f in self.features if f.type == 'circle' and f.params.get('radius', 0) > 100]
-        if large_circles:
-            # 按半徑分組
-            radius_groups = {}
-            for circ in large_circles:
-                r = round(circ.params.get('radius', 0), -1)  # 四捨五入到最近的10
-                if r not in radius_groups:
-                    radius_groups[r] = []
-                radius_groups[r].append(circ)
-            
-            # 如果有大圓（彎管半徑），使用它們
-            if radius_groups:
-                radii_list = sorted(radius_groups.keys())
-                r_large = radii_list[-1] if len(radii_list) >= 1 else 270
-                r_small = radii_list[0] if len(radii_list) >= 2 else r_large
-                
-                # 根據彎曲方向分配半徑
-                # 左彎（預設）：上軌在外側（用大半徑），下軌在內側（用小半徑）
-                # 右彎：上軌在內側（用小半徑），下軌在外側（用大半徑）
-                if bend_direction == 'right':
-                    upper_default_r = r_small
-                    lower_default_r = r_large
-                else:  # left（預設）
-                    upper_default_r = r_large
-                    lower_default_r = r_small
-            else:
-                if bend_direction == 'right':
-                    upper_default_r = 220
-                    lower_default_r = 270
-                else:
-                    upper_default_r = 270
-                    lower_default_r = 220
+        # Transition bend 半徑和 per-pipe arc 查表（從 stp_data 讀取）
+        if stp_data:
+            upper_default_r = stp_data['upper_bend_r']
+            lower_default_r = stp_data['lower_bend_r']
+            track_arc_radius_map = dict(stp_data.get('track_arc_r_map', {}))
         else:
-            # Step 2: 退回到從 pipe_centerlines 提取（舊方法）
-            for pc in pipe_centerlines:
-                cls = class_map.get(pc['solid_id'], {})
-                if cls.get('class') == 'track':
-                    for seg in pc.get('segments', []):
-                        if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
-                            track_arc_radius_map[pc['solid_id']] = seg['radius']
-                            break
-            if bend_direction == 'right':
-                upper_default_r = 220
-                lower_default_r = 270
-            else:
-                upper_default_r = 270
-                lower_default_r = 220
+            upper_default_r = 270 if bend_direction != 'right' else 220
+            lower_default_r = 220 if bend_direction != 'right' else 270
+            track_arc_radius_map = {}
 
         bends = []
         upper_tracks = section.get('upper_tracks', [])
@@ -2387,11 +2341,14 @@ class MockCADEngine:
                 # 只有當前段仰角，回退到估算
                 entry_bend_deg = round(abs(max(current_elevs) - min(current_elevs)))
                 if entry_bend_deg < 1:
-                    entry_bend_deg = 16.0  # 最終回退
+                    # 從 stp_data 推估：全域仰角作為參考
+                    _global_elev = stp_data['elevation_deg'] if stp_data else 0
+                    entry_bend_deg = _global_elev if _global_elev > 1 else 0
                 log_print(f"  entry_bend_deg fallback (section内差): {entry_bend_deg}°")
             else:
-                entry_bend_deg = 16.0  # 無法計算，使用預設值
-                log_print(f"  entry_bend_deg fallback (default): {entry_bend_deg}°")
+                _global_elev = stp_data['elevation_deg'] if stp_data else 0
+                entry_bend_deg = _global_elev if _global_elev > 1 else 0
+                log_print(f"  entry_bend_deg fallback (stp_data elev): {entry_bend_deg}°")
             
             # 根據參考圖 2-2-3.jpg 的結構（左彎時）：
             # - 上軌：入口過渡段(U1=89.1) → 入口彎角(U2=16°, R220) → 主段(U3=147.3)
@@ -2412,16 +2369,19 @@ class MockCADEngine:
             if n_upper >= 1 and prev_curved_section:
                 curve_upper = prev_curved_section.get('upper_tracks', [])
                 if curve_upper:
-                    upper_pd = upper_tracks[0].get('pipe_data', {})
-                    u_sp = upper_pd.get('start_point', (0, 0, 0))
-                    u_ep = upper_pd.get('end_point', (0, 0, 0))
+                    # 從 stp_data.pipe_centerlines 查詢端點
+                    _u_fid = upper_tracks[0].get('solid_id', '')
+                    _u_pc = _pcl_map.get(_u_fid, upper_tracks[0].get('pipe_data', {}))
+                    u_sp = _u_pc.get('start_point', (0, 0, 0))
+                    u_ep = _u_pc.get('end_point', (0, 0, 0))
                     
                     # 找直軌最近的端點和曲線最近的端點
                     best_curve_pt = None
                     best_track_pt = None
                     min_dist_yz = float('inf')
                     for ct in curve_upper:
-                        cpd = ct.get('pipe_data', {})
+                        _c_fid = ct.get('solid_id', '')
+                        cpd = _pcl_map.get(_c_fid, ct.get('pipe_data', {}))
                         for cpt in [cpd.get('start_point', (0, 0, 0)),
                                     cpd.get('end_point', (0, 0, 0))]:
                             for tpt in [u_sp, u_ep]:
@@ -2445,7 +2405,8 @@ class MockCADEngine:
                             d_track_z = 1
                         
                         # 過渡段方向：彎管前的方向（根據直軌仰角反推）
-                        track_elev = elev_map.get(upper_tracks[0]['solid_id'], 48.0)
+                        _fallback_elev = stp_data['elevation_deg'] if stp_data else 0
+                        track_elev = elev_map.get(upper_tracks[0]['solid_id'], _fallback_elev)
                         trans_elev = track_elev - entry_bend_deg
                         # 過渡段方向與直軌同向（Y 符號相同）
                         sign_y = 1.0 if d_track_y >= 0 else -1.0
@@ -2538,14 +2499,16 @@ class MockCADEngine:
                 exit_bend_deg = round(abs(max(all_elevs) - min(all_elevs)))
                 log_print(f"  計算仰角差: max={max(all_elevs):.1f}° min={min(all_elevs):.1f}° → {exit_bend_deg}°")
             elif len(all_elevs) == 1:
-                # 只有一個仰角，無法計算差
-                exit_bend_deg = 12.0
+                _global_elev = stp_data['elevation_deg'] if stp_data else 0
+                exit_bend_deg = _global_elev if _global_elev > 1 else 0
             else:
-                exit_bend_deg = 12.0
+                _global_elev = stp_data['elevation_deg'] if stp_data else 0
+                exit_bend_deg = _global_elev if _global_elev > 1 else 0
             
             # 確保角度合理
             if exit_bend_deg < 1:
-                exit_bend_deg = 12.0  # 回退到預設值
+                _global_elev = stp_data['elevation_deg'] if stp_data else 0
+                exit_bend_deg = _global_elev if _global_elev > 1 else 0
             
             log_print(f"  彎軌入口 transition bend: {exit_bend_deg:.0f}°")
             bend_rad = math.radians(exit_bend_deg)
@@ -2560,8 +2523,9 @@ class MockCADEngine:
             
             if next_curved_section and n_upper >= 1 and n_lower >= 1:
                 def _find_near_far_yz(track, curve_tracks):
-                    """找出軌道端點中離曲線最近和最遠的端點（使用 YZ 幾何距離）"""
-                    pd_t = track.get('pipe_data', {})
+                    """找出軌道端點中離曲線最近和最遠的端點（從 stp_data.pipe_centerlines 查詢）"""
+                    _t_fid = track.get('solid_id', '')
+                    pd_t = _pcl_map.get(_t_fid, track.get('pipe_data', {}))
                     sp = pd_t.get('start_point', (0, 0, 0))
                     ep = pd_t.get('end_point', (0, 0, 0))
                     min_sp_yz = float('inf')
@@ -2569,7 +2533,8 @@ class MockCADEngine:
                     best_curve_sp = None
                     best_curve_ep = None
                     for ct in curve_tracks:
-                        cpd = ct.get('pipe_data', {})
+                        _c_fid = ct.get('solid_id', '')
+                        cpd = _pcl_map.get(_c_fid, ct.get('pipe_data', {}))
                         for cpt in [cpd.get('start_point', (0, 0, 0)),
                                     cpd.get('end_point', (0, 0, 0))]:
                             d_sp = math.sqrt((sp[1] - cpt[1])**2 + (sp[2] - cpt[2])**2)
@@ -2592,8 +2557,9 @@ class MockCADEngine:
                 l_near, l_far, l_gap_yz, l_curve_pt = _find_near_far_yz(lower_tracks[-1], curve_lo) if curve_lo else ((0,0,0),(0,0,0),0,None)
                 
                 def _compute_outside_transition(track, near_pt, curve_pt, R, all_elevs):
-                    """用彎管幾何計算外側軌道過渡段長度（使用完整 3D 幾何）"""
-                    pd_t = track.get('pipe_data', {})
+                    """用彎管幾何計算外側軌道過渡段長度（從 stp_data.pipe_centerlines 查詢）"""
+                    _t_fid = track.get('solid_id', '')
+                    pd_t = _pcl_map.get(_t_fid, track.get('pipe_data', {}))
                     sp = pd_t.get('start_point', (0, 0, 0))
                     ep = pd_t.get('end_point', (0, 0, 0))
 
@@ -2646,8 +2612,9 @@ class MockCADEngine:
                 if bend_direction == 'left':
                     # 上軌=外側（過渡段朝向曲線），下軌=內側（過渡段在 section 起點）
                     outside_r = upper_default_r
-                    # 過渡後仰角=外側軌道的仰角（內側軌道經過彎管後會達到這個角度）
-                    post_transition_elev = elev_map.get(upper_tracks[-1]['solid_id'], 44.0)
+                    # 過渡後仰角=外側軌道的仰角（從 stp_data 查表）
+                    _fb_elev = stp_data['elevation_deg'] if stp_data else 0
+                    post_transition_elev = elev_map.get(upper_tracks[-1]['solid_id'], _fb_elev)
                     inside_z_gap = abs(u_near[2] - l_near[2])
 
                     exit_straight_upper = round(_compute_outside_transition(
@@ -2659,8 +2626,9 @@ class MockCADEngine:
                 else:  # right bend
                     # 下軌=外側，上軌=內側
                     outside_r = lower_default_r
-                    # 過渡後仰角=外側軌道的仰角（內側軌道經過彎管後會達到這個角度）
-                    post_transition_elev = elev_map.get(lower_tracks[-1]['solid_id'], 44.0)
+                    # 過渡後仰角=外側軌道的仰角（從 stp_data 查表）
+                    _fb_elev = stp_data['elevation_deg'] if stp_data else 0
+                    post_transition_elev = elev_map.get(lower_tracks[-1]['solid_id'], _fb_elev)
                     inside_z_gap = abs(u_near[2] - l_near[2])
 
                     exit_straight_lower = round(_compute_outside_transition(
@@ -2903,50 +2871,52 @@ class MockCADEngine:
         return assignment
 
     def _build_section_cutting_list(self, section, bends, track_items,
-                                    part_classifications, pipe_diameter):
+                                    part_classifications, pipe_diameter,
+                                    stp_data=None):
         """
         對一個 straight section，產出 per-section 取料明細。
         直管 + 彎管交錯排列：U1(直) → U2(12°彎) → U3(直) → ...
         球號從 U1/D1 重新編號。
         
-        新增：支援 'entry' 類型 bend（彎軌出口 transition bend）
+        管段長度從 stp_data['pipe_centerlines'] 查詢（不從 section.pipe_data 讀取）。
         """
+        # 建立 pipe_centerlines 查表（by solid_id）
+        _pcl_map = {}
+        if stp_data and 'pipe_centerlines' in stp_data:
+            for pc in stp_data['pipe_centerlines']:
+                _pcl_map[pc['solid_id']] = pc
+
         # 收集此 section 的 track feature_ids
         upper_fids = set(t['solid_id'] for t in section.get('upper_tracks', []))
         lower_fids = set(t['solid_id'] for t in section.get('lower_tracks', []))
 
-        # 從 track_items 中提取對應項目
-        # track_items 裡的 feature_id 沒有直接記錄，需匹配
-        # 改用 pipe_data segments 的長度
-        # 注意：只提取 straight 段，不提取 arc 段（大彎管已被排除在 straight section 之外）
-        # transition bends（小轉折）由 bends_list 提供
+        # 從 stp_data.pipe_centerlines 查詢管段長度（不從 section.pipe_data 讀取）
         upper_segs = []
         for ut in section.get('upper_tracks', []):
-            pd = ut.get('pipe_data', {})
-            solid_id = ut.get('solid_id', '')  # 球號 (如 F05)
+            solid_id = ut.get('solid_id', '')
+            # 優先從 stp_data.pipe_centerlines 查詢
+            pd = _pcl_map.get(solid_id, ut.get('pipe_data', {}))
             for seg in pd.get('segments', []):
                 if seg.get('type') == 'straight':
                     upper_segs.append({
                         'type': 'straight',
                         'length': seg['length'],
                         'diameter': pd.get('pipe_diameter', pipe_diameter),
-                        'solid_id': solid_id,  # 添加球號
+                        'solid_id': solid_id,
                     })
-                # 不再從 pipe_data 提取 arc - 大彎管應該已被排除，小彎管由 bends_list 提供
 
         lower_segs = []
         for lt in section.get('lower_tracks', []):
-            pd = lt.get('pipe_data', {})
-            solid_id = lt.get('solid_id', '')  # 球號 (如 F02)
+            solid_id = lt.get('solid_id', '')
+            pd = _pcl_map.get(solid_id, lt.get('pipe_data', {}))
             for seg in pd.get('segments', []):
                 if seg.get('type') == 'straight':
                     lower_segs.append({
                         'type': 'straight',
                         'length': seg['length'],
                         'diameter': pd.get('pipe_diameter', pipe_diameter),
-                        'solid_id': solid_id,  # 添加球號
+                        'solid_id': solid_id,
                     })
-                # 不再從 pipe_data 提取 arc - 大彎管應該已被排除，小彎管由 bends_list 提供
 
         # 分離不同類型的 bends
         entry_bends = [b for b in bends if b.get('position') == 'entry']
@@ -5031,7 +5001,7 @@ Solid 名稱: {solid_name}
         """
         th = 3.0
         row_h = 7
-        col_widths = [25, 130]  # 球號, 取料尺寸
+        col_widths = [25, 155]  # 球號, 取料尺寸（加寬確保長文字完整顯示）
         table_w = sum(col_widths)
 
         # 標題
@@ -5316,7 +5286,8 @@ Solid 名稱: {solid_name}
                                      section_cutting_list, section_legs,
                                      leg_angles_map, pipe_diameter,
                                      rail_spacing, base_name, drawing_number,
-                                     project, today, tb_override=None):
+                                     project, today, tb_override=None,
+                                     stp_data=None):
         """
         繪製一張直線段施工圖（匹配 2-2-1.jpg 參考圖佈局）。
         包含：頁面框+標題欄+圖號、側視圖（上下軌+腳架+底座）、
@@ -5389,28 +5360,12 @@ Solid 名稱: {solid_name}
         upper_tracks = section.get('upper_tracks', [])
         lower_tracks = section.get('lower_tracks', [])
 
-        # 建立 track_elevation 查表（從 pipe_data 端點計算）
-        elev_map = {}
-        for ut in upper_tracks:
-            pd = ut.get('pipe_data', {})
-            sp = pd.get('start_point', (0, 0, 0))
-            ep = pd.get('end_point', (0, 0, 0))
-            dy_t = ep[1] - sp[1]
-            dz_t = ep[2] - sp[2]
-            horiz_t = math.sqrt((ep[0] - sp[0])**2 + dy_t**2)
-            elev_map[ut['solid_id']] = math.degrees(math.atan2(abs(dz_t), horiz_t)) if horiz_t > 1e-6 else 0
-        for lt in lower_tracks:
-            pd = lt.get('pipe_data', {})
-            sp = pd.get('start_point', (0, 0, 0))
-            ep = pd.get('end_point', (0, 0, 0))
-            dy_t = ep[1] - sp[1]
-            dz_t = ep[2] - sp[2]
-            horiz_t = math.sqrt((ep[0] - sp[0])**2 + dy_t**2)
-            elev_map[lt['solid_id']] = math.degrees(math.atan2(abs(dz_t), horiz_t)) if horiz_t > 1e-6 else 0
+        # 軌道仰角查表（從 stp_data.track_elev_map 讀取，不再重複計算）
+        elev_map = getattr(self, '_stp_track_elev_map', {})
 
-        # 取得上下軌的基礎仰角
-        upper_base_elev = 32.0
-        lower_base_elev = 32.0
+        # 取得上下軌的基礎仰角（從 stp_data 查表）
+        upper_base_elev = 0
+        lower_base_elev = 0
         for ut in upper_tracks:
             e = elev_map.get(ut['solid_id'], 0)
             if e > 0:
@@ -5421,6 +5376,11 @@ Solid 名稱: {solid_name}
             if e > 0:
                 lower_base_elev = e
                 break
+        # 若查表無值，使用 stp_data 的全域仰角
+        if upper_base_elev == 0:
+            upper_base_elev = getattr(self, '_stp_elevation_deg', 0)
+        if lower_base_elev == 0:
+            lower_base_elev = getattr(self, '_stp_elevation_deg', 0)
 
         # 從 cutting list 分離上軌和下軌的 items
         upper_cl = [it for it in section_cutting_list if str(it.get('item', '')).startswith('U')]
@@ -5469,7 +5429,7 @@ Solid 名稱: {solid_name}
         # 各腳架垂直高度（下軌以下的長度）
         leg_below_heights = []
         for li, leg in enumerate(section_legs):
-            ll = leg.get('line_length', 450)
+            ll = leg.get('line_length', 0)  # from stp_data (cutting_list)
             through = rail_spacing
             remain = max(0, ll - through)
             above = min(remain * 0.08, 40)
@@ -5757,9 +5717,17 @@ Solid 名稱: {solid_name}
         # ========== 腳架（垂直向下到地面）— 沿軌道方向投影定位 ==========
         # 腳架在前視圖的水平位置 = 沿軌道方向投影的位置（t 參數）
         # 計算軌道 3D 方向向量（用上軌的最長 track）
+        # 建立 pipe_centerlines 查表（from stp_data）
+        _pcl_map_draw = {}
+        if stp_data and 'pipe_centerlines' in stp_data:
+            for _pc in stp_data['pipe_centerlines']:
+                _pcl_map_draw[_pc['solid_id']] = _pc
+
         track_dir_3d = (0, 1, 0)  # default
         for ut in upper_tracks:
-            pd = ut.get('pipe_data', {})
+            # 從 stp_data.pipe_centerlines 查詢端點
+            _fid = ut.get('solid_id', '')
+            pd = _pcl_map_draw.get(_fid, ut.get('pipe_data', {}))
             sp3 = pd.get('start_point', (0, 0, 0))
             ep3 = pd.get('end_point', (0, 0, 0))
             d3 = (ep3[0] - sp3[0], ep3[1] - sp3[1], ep3[2] - sp3[2])
@@ -5775,7 +5743,8 @@ Solid 名稱: {solid_name}
         # 計算軌道沿方向投影範圍（所有上軌端點）
         all_track_proj = []
         for ut in upper_tracks:
-            pd = ut.get('pipe_data', {})
+            _fid = ut.get('solid_id', '')
+            pd = _pcl_map_draw.get(_fid, ut.get('pipe_data', {}))
             sp3 = pd.get('start_point', (0, 0, 0))
             ep3 = pd.get('end_point', (0, 0, 0))
             all_track_proj.extend([_proj_along(sp3), _proj_along(ep3)])
@@ -5845,7 +5814,7 @@ Solid 名稱: {solid_name}
 
         n_legs = len(section_legs)
         for li, leg in enumerate(section_legs):
-            ll = leg.get('line_length', 450)
+            ll = leg.get('line_length', 0)  # from stp_data (cutting_list)
 
             # 取得腳架重心並投影到軌道方向
             lc = leg.get('centroid', (0, 0, 0))
@@ -6005,7 +5974,7 @@ Solid 名稱: {solid_name}
         log_print("開始生成子系統施工圖 (3 sheets)...")
         log_print("=" * 60)
 
-        # ===== 收集共用資料 =====
+        # ===== 從 info 收集共用資料 → 建立 stp_data 結構 =====
         cutting_list = info.get('cutting_list', {})
         track_items = cutting_list.get('track_items', [])
         leg_items = cutting_list.get('leg_items', [])
@@ -6014,64 +5983,167 @@ Solid 名稱: {solid_name}
         part_classifications = info.get('part_classifications', [])
         angles = info.get('angles', [])
 
-        # 管路統計
+        # ---- 建立 stp_data：所有繪圖數值的唯一來源 ----
+        class_map_all = {c['feature_id']: c for c in part_classifications}
         track_pipes = [pc for pc in pipe_centerlines
-                       if any(c['feature_id'] == pc['solid_id'] and c['class'] == 'track'
-                              for c in part_classifications)]
-        pipe_diameter = 0
-        for pc in track_pipes:
-            pipe_diameter = max(pipe_diameter, pc.get('pipe_diameter', 0))
+                       if class_map_all.get(pc['solid_id'], {}).get('class') == 'track']
 
-        # 分離上軌/下軌
-        upper_items = [t for t in track_items if str(t.get('item', '')).startswith('U')]
-        lower_items = [t for t in track_items if str(t.get('item', '')).startswith('D')]
-        
-        # 偵測彎曲方向（用於調整繪圖和半徑分配）
-        bend_direction = self._detect_bend_direction(pipe_centerlines, part_classifications)
-        log_print(f"軌道彎曲方向: {bend_direction}")
+        # 管徑（from info.pipe_centerlines）
+        _pipe_diameters = [pc.get('pipe_diameter', 0) for pc in track_pipes]
+        _pipe_diameter = max(_pipe_diameters) if _pipe_diameters else 0
 
-        # 角度資料
+        # 角度資料（from info.angles）
         leg_angles = [a for a in angles if a.get('type') == 'leg_to_ground']
         track_bends = [a for a in angles if a.get('type') == 'track_bend']
         track_elevations = [a for a in angles if a.get('type') == 'track_elevation']
 
-        # 軌道間距（配對上下軌 centroid 的垂直距離平均值）
+        # 軌道仰角查表（from info.angles → track_elevation）
+        _track_elev_map = {}
+        for te in track_elevations:
+            _track_elev_map[te.get('part_a', '')] = te.get('angle_deg', 0)
+
+        # 彎管資料（from info.cutting_list.track_items → type=='arc'）
+        _arc_items = [t for t in track_items if t.get('type') == 'arc']
+        _arc_radius = _arc_items[0].get('radius', 0) if _arc_items else 0
+        _arc_angle_deg = _arc_items[0].get('angle_deg', 0) if _arc_items else 0
+        _arc_height_gain = _arc_items[0].get('height_gain', 0) if _arc_items else 0
+        _arc_outer_length = _arc_items[0].get('outer_arc_length', 0) if _arc_items else 0
+
+        # 弧線中心線長度（from info.pipe_centerlines → arc pipe total_length）
+        _arc_cl_length = 0
+        for pc in track_pipes:
+            for seg in pc.get('segments', []):
+                if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                    _arc_cl_length = max(_arc_cl_length, pc.get('total_length', 0))
+
+        # 仰角（from info.angles → 取第一個非零 track_elevation）
+        _elevation_deg = 0
+        for te in track_elevations:
+            ed = te.get('angle_deg', 0)
+            if ed > 0.5:
+                _elevation_deg = ed
+                break
+
+        # 弦長（幾何計算，基於 stp_data 的 arc_radius 和 arc_angle_deg）
+        _chord_length = (2 * _arc_radius * math.sin(math.radians(_arc_angle_deg / 2))
+                         if _arc_radius > 0 and _arc_angle_deg > 0 else 0)
+
+        # 腳架長度（from info.cutting_list.leg_items）
+        _leg_lengths = [lg.get('line_length', 0) for lg in leg_items]
+
+        # 支撐架數量（from info.cutting_list.bracket_items）
+        _bracket_count = sum(b.get('quantity', 1) for b in bracket_items)
+
+        # 軌道間距（from info.part_classifications centroid 配對計算）
         gn = self._ground_normal
         y_up_rs = (gn == (0, 1, 0))
-        class_map_rs = {c['feature_id']: c for c in part_classifications}
-        track_pipes_for_spacing = [pc for pc in pipe_centerlines
-                                   if class_map_rs.get(pc['solid_id'], {}).get('class') == 'track']
-        vert_dists = []
+        _rail_spacing = 0
+        _vert_dists = []
         _paired_rs = set()
-        for i, tp_i in enumerate(track_pipes_for_spacing):
+        for i, tp_i in enumerate(track_pipes):
             if i in _paired_rs:
                 continue
-            ci = class_map_rs.get(tp_i['solid_id'], {}).get('centroid', (0, 0, 0))
+            ci = class_map_all.get(tp_i['solid_id'], {}).get('centroid', (0, 0, 0))
             best_j, best_hd = None, float('inf')
-            for j, tp_j in enumerate(track_pipes_for_spacing):
+            for j, tp_j in enumerate(track_pipes):
                 if j <= i or j in _paired_rs:
                     continue
-                cj = class_map_rs.get(tp_j['solid_id'], {}).get('centroid', (0, 0, 0))
-                if y_up_rs:
-                    vert_d = abs(ci[1] - cj[1])
-                    horiz_d = math.sqrt((ci[0] - cj[0])**2 + (ci[2] - cj[2])**2)
-                else:
-                    vert_d = abs(ci[2] - cj[2])
-                    horiz_d = math.sqrt((ci[0] - cj[0])**2 + (ci[1] - cj[1])**2)
+                cj = class_map_all.get(tp_j['solid_id'], {}).get('centroid', (0, 0, 0))
+                vert_d = abs(ci[1] - cj[1]) if y_up_rs else abs(ci[2] - cj[2])
+                horiz_d = (math.sqrt((ci[0] - cj[0])**2 + (ci[2] - cj[2])**2) if y_up_rs
+                           else math.sqrt((ci[0] - cj[0])**2 + (ci[1] - cj[1])**2))
                 if vert_d > 50 and horiz_d < vert_d and horiz_d < best_hd:
                     best_hd = horiz_d
                     best_j = j
             if best_j is not None:
                 _paired_rs.add(i)
                 _paired_rs.add(best_j)
-                cj = class_map_rs.get(track_pipes_for_spacing[best_j]['solid_id'], {}).get('centroid', (0, 0, 0))
-                if y_up_rs:
-                    vert_dists.append(abs(ci[1] - cj[1]))
-                else:
-                    vert_dists.append(abs(ci[2] - cj[2]))
-        rail_spacing = sum(vert_dists) / len(vert_dists) if vert_dists else 0
-        if rail_spacing < 10:
-            rail_spacing = 251.1  # 預設值
+                cj = class_map_all.get(track_pipes[best_j]['solid_id'], {}).get('centroid', (0, 0, 0))
+                _vert_dists.append(abs(ci[1] - cj[1]) if y_up_rs else abs(ci[2] - cj[2]))
+        _rail_spacing = sum(_vert_dists) / len(_vert_dists) if _vert_dists else 0
+
+        # 偵測彎曲方向
+        bend_direction = self._detect_bend_direction(pipe_centerlines, part_classifications)
+
+        # Transition bend 半徑（from info.features → 大圓特徵）
+        _large_circles = [f for f in self.features if f.type == 'circle' and f.params.get('radius', 0) > 100]
+        _bend_radii = sorted(set(round(c.params.get('radius', 0), -1) for c in _large_circles))
+        if len(_bend_radii) >= 2:
+            _r_large, _r_small = _bend_radii[-1], _bend_radii[0]
+        elif len(_bend_radii) == 1:
+            _r_large = _r_small = _bend_radii[0]
+        else:
+            # 從 pipe_centerlines 弧段提取
+            _arc_radii_from_pipes = []
+            for pc in track_pipes:
+                for seg in pc.get('segments', []):
+                    if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                        _arc_radii_from_pipes.append(seg['radius'])
+            if _arc_radii_from_pipes:
+                _r_large = max(_arc_radii_from_pipes)
+                _r_small = min(_arc_radii_from_pipes)
+            else:
+                _r_large = _r_small = _arc_radius  # 使用主弧半徑
+
+        if bend_direction == 'right':
+            _upper_bend_r, _lower_bend_r = _r_small, _r_large
+        else:
+            _upper_bend_r, _lower_bend_r = _r_large, _r_small
+
+        # Per-pipe arc radius 查表（from info.pipe_centerlines）
+        _track_arc_r_map = {}
+        for pc in track_pipes:
+            for seg in pc.get('segments', []):
+                if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                    _track_arc_r_map[pc['solid_id']] = seg['radius']
+                    break
+
+        # ---- 組裝 stp_data 結構 ----
+        stp_data = {
+            'pipe_diameter':    _pipe_diameter,
+            'rail_spacing':     _rail_spacing,
+            'arc_radius':       _arc_radius,
+            'arc_angle_deg':    _arc_angle_deg,
+            'arc_height_gain':  _arc_height_gain,
+            'arc_outer_length': _arc_outer_length,
+            'arc_cl_length':    _arc_cl_length,
+            'elevation_deg':    _elevation_deg,
+            'chord_length':     _chord_length,
+            'leg_lengths':      _leg_lengths,
+            'bracket_count':    _bracket_count,
+            'bend_direction':   bend_direction,
+            'track_elev_map':   _track_elev_map,
+            'upper_bend_r':     _upper_bend_r,
+            'lower_bend_r':     _lower_bend_r,
+            'track_arc_r_map':  _track_arc_r_map,
+            # 切料明細原始資料（from info.cutting_list）
+            'track_items':      track_items,
+            'leg_items':        leg_items,
+            'bracket_items':    bracket_items,
+            # info 結構原始資料（供下游函數使用）
+            'pipe_centerlines':     pipe_centerlines,
+            'part_classifications': part_classifications,
+            'track_elevations':     track_elevations,
+        }
+
+        # 向後相容：原有變數名仍可使用
+        pipe_diameter = stp_data['pipe_diameter']
+        rail_spacing = stp_data['rail_spacing']
+
+        log_print(f"[stp_data] pipe_d={pipe_diameter:.1f}, rail_sp={rail_spacing:.1f}, "
+                  f"arc_R={_arc_radius:.0f}, arc_angle={_arc_angle_deg:.1f}°, "
+                  f"arc_h_gain={_arc_height_gain:.1f}, elev={_elevation_deg:.1f}°, "
+                  f"chord={_chord_length:.0f}, bracket={_bracket_count}, "
+                  f"bend_dir={bend_direction}, "
+                  f"upper_bend_r={_upper_bend_r:.0f}, lower_bend_r={_lower_bend_r:.0f}")
+        if _rail_spacing < 10:
+            log_print(f"  [Warning] rail_spacing={_rail_spacing:.1f} 偏小，請確認模型", "warning")
+
+        # 分離上軌/下軌
+        upper_items = [t for t in stp_data['track_items'] if str(t.get('item', '')).startswith('U')]
+        lower_items = [t for t in stp_data['track_items'] if str(t.get('item', '')).startswith('D')]
+
+        log_print(f"軌道彎曲方向: {bend_direction}")
 
         # 共用標題欄資訊
         project = info.get('product_name') or base_name
@@ -6089,10 +6161,11 @@ Solid 名稱: {solid_name}
         try:
             log_print("\n--- Drawing 1: 直線段施工圖 (支架) ---")
 
-            # 建立 track centroid → track_elevation 映射
-            track_elev_by_id = {}
-            for te in track_elevations:
-                track_elev_by_id[te.get('part_a', '')] = te.get('angle_deg', 0)
+            # 使用 stp_data 的仰角查表
+            track_elev_by_id = stp_data['track_elev_map']
+            # 設定到 self 供 _draw_straight_section_sheet 使用
+            self._stp_track_elev_map = stp_data['track_elev_map']
+            self._stp_elevation_deg = stp_data['elevation_deg']
 
             # 收集所有 track 的 centroid + elevation
             track_centroids = []
@@ -6106,13 +6179,13 @@ Solid 名稱: {solid_name}
             # 腳架在圖面上繪製為垂直（0°），不需要角度映射
             leg_angles_map = {}
 
-            # 分段分析
-            sections = self._detect_track_sections(pipe_centerlines,
-                                                   part_classifications,
-                                                   track_items)
+            # 分段分析（從 stp_data 讀取 pipe_centerlines / part_classifications）
+            sections = self._detect_track_sections(stp_data['pipe_centerlines'],
+                                                   stp_data['part_classifications'],
+                                                   stp_data['track_items'])
 
             # 腳架分配
-            leg_assignment = self._assign_legs_to_sections(sections, leg_items)
+            leg_assignment = self._assign_legs_to_sections(sections, stp_data['leg_items'])
 
             # 取第一個 straight section
             first_straight_idx = None
@@ -6135,17 +6208,18 @@ Solid 名稱: {solid_name}
                         next_curved_section = next_sec
                         log_print(f"  此區段後面是彎軌，將添加出口 transition bend")
 
-                # transition bends
+                # transition bends（全部從 stp_data 讀取）
                 section_bends = self._compute_transition_bends(
-                    section, track_elevations, pipe_centerlines,
-                    part_classifications, pipe_diameter, rail_spacing,
+                    section, stp_data['track_elevations'], stp_data['pipe_centerlines'],
+                    stp_data['part_classifications'], pipe_diameter, rail_spacing,
                     is_before_curved=is_before_curved, next_curved_section=next_curved_section,
-                    bend_direction=bend_direction)
+                    bend_direction=bend_direction, stp_data=stp_data)
 
-                # per-section cutting list
+                # per-section cutting list（全部從 stp_data 讀取）
                 section_cl = self._build_section_cutting_list(
-                    section, section_bends, track_items,
-                    part_classifications, pipe_diameter)
+                    section, section_bends, stp_data['track_items'],
+                    stp_data['part_classifications'], pipe_diameter,
+                    stp_data=stp_data)
 
                 # 圖號
                 drawing_number = f"{base_name}-1"
@@ -6153,15 +6227,17 @@ Solid 名稱: {solid_name}
                 doc1 = self._draw_straight_section_sheet(
                     section, section_bends, section_cl, section_legs,
                     leg_angles_map, pipe_diameter, rail_spacing,
-                    base_name, drawing_number, project, today)
+                    base_name, drawing_number, project, today,
+                    stp_data=stp_data)
             else:
                 # fallback: 沒有 straight section，仍繪製舊版單腳架圖
                 log_print("  [Warning] 未偵測到直線段，使用 fallback 繪圖")
                 doc1 = self._draw_straight_section_sheet(
                     {'section_type': 'straight', 'upper_tracks': [], 'lower_tracks': []},
-                    [], track_items, leg_items,
+                    [], stp_data['track_items'], stp_data['leg_items'],
                     leg_angles_map, pipe_diameter, rail_spacing,
-                    base_name, f"{base_name}-1", project, today)
+                    base_name, f"{base_name}-1", project, today,
+                    stp_data=stp_data)
 
             # 儲存
             path1 = os.path.join(output_dir, f"{base_name}-1.dxf")
@@ -6190,87 +6266,41 @@ Solid 名稱: {solid_name}
                 (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
                 (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
 
-            # 偵測彎曲方向
-            bend_direction = self._detect_bend_direction(pipe_centerlines, part_classifications)
-            log_print(f"  彎曲方向: {bend_direction}")
+            # ---- 從 stp_data 讀取所有繪圖數值（不再重複計算）----
+            bend_direction = stp_data['bend_direction']
+            arc_radius = stp_data['arc_radius']
+            arc_angle_deg = stp_data['arc_angle_deg']
+            elevation_deg = stp_data['elevation_deg']
+            chord_length = stp_data['chord_length']
+            log_print(f"  [stp_data] R={arc_radius:.0f}, angle={arc_angle_deg:.1f}°, "
+                      f"elev={elevation_deg:.1f}°, chord={chord_length:.0f}")
 
-            # 收集彎管資料
-            arc_items = [t for t in track_items if t.get('type') == 'arc']
-            arc_radius = 0
-            arc_angle_deg = 180  # 預設
-            if arc_items:
-                arc_radius = arc_items[0].get('radius', 260)
-                arc_angle_deg = arc_items[0].get('angle_deg', 180)
-            elif track_bends:
-                arc_angle_deg = track_bends[0].get('angle_deg', 180)
-                arc_radius = 260
-
-            if arc_radius == 0:
-                arc_radius = 260
-
-            # 仰角 - 從 pipe_data 端點計算（track_elevations 來自 _calculate_angles 可能全為 0）
-            elevation_deg = 0
-            class_map_d2 = {c['feature_id']: c for c in part_classifications}
-            for pc in pipe_centerlines:
-                fid = pc['solid_id']
-                cls_d2 = class_map_d2.get(fid, {})
-                if cls_d2.get('class') == 'track':
-                    sp = pc.get('start_point', (0, 0, 0))
-                    ep = pc.get('end_point', (0, 0, 0))
-                    dz = abs(ep[2] - sp[2])
-                    dxy = math.sqrt((ep[0] - sp[0])**2 + (ep[1] - sp[1])**2)
-                    elev = math.degrees(math.atan2(dz, dxy)) if dxy > 1e-6 else 0
-                    if elev > 0.5:  # 排除水平軌道/彎管
-                        elevation_deg = round(elev, 1)
-                        log_print(f"  Drawing 2 仰角: {elevation_deg}° (from pipe {fid})")
-                        break
-
-            # 弦長
-            chord_length = 2 * arc_radius * math.sin(math.radians(arc_angle_deg / 2))
-
-            # 標題欄
+            # 標題欄（公司資訊 — 匹配標準圖 LM-12）
             tb_info2 = {
                 'company': '羅布森股份有限公司',
                 'project': project,
-                'drawing_name': '彎軌取料施工圖',
+                'drawing_name': '彎軌軌道製圖',
                 'drawer': 'Drafter',
                 'date': today,
                 'units': 'mm',
                 'scale': '1:10',
                 'material': 'STK-400',
                 'finish': '裁切及焊接',
-                'drawing_number': f"{base_name}-2",
+                'drawing_number': 'LM-12',
                 'version': '01',
                 'quantity': '1',
             }
             tb_top2 = self._draw_title_block(msp2, PW, PH, tb_info2)
 
-            # 圖號
+            # 圖號（右上角大字）
             self._draw_drawing_number(msp2, PW, PH, f"{base_name}-2")
 
-            # 計算弧長與高低差 — 使用中心線弧長（非外弧長）
-            arc_total_length = 0
-            arc_height_gain = 0
-            for ai in arc_items:
-                # 使用中心線弧長公式: sqrt((R*θ)² + h²)
-                r_cl = ai.get('radius', 0)
-                theta_rad = math.radians(ai.get('angle_deg', 0))
-                h_g = ai.get('height_gain', 0)
-                if r_cl > 0 and theta_rad > 0:
-                    if h_g > 1:
-                        single_len = math.sqrt((r_cl * theta_rad) ** 2 + h_g ** 2)
-                    else:
-                        single_len = r_cl * theta_rad
-                else:
-                    single_len = ai.get('outer_arc_length', ai.get('arc_length', 0))
-                arc_total_length = max(arc_total_length, single_len)
-                arc_height_gain = max(arc_height_gain, h_g)
-            if arc_total_length == 0:
-                arc_total_length = 2 * math.pi * arc_radius * (arc_angle_deg / 360)
-            if arc_height_gain < 1 and elevation_deg > 0:
-                arc_height_gain = arc_total_length * math.sin(math.radians(elevation_deg))
-
-            bracket_count = sum(b.get('quantity', 1) for b in bracket_items)
+            # 弧長、高低差、支撐架 — 全部從 stp_data 讀取
+            arc_total_length = stp_data['arc_cl_length']
+            arc_height_gain = stp_data['arc_height_gain']
+            bracket_count = stp_data['bracket_count']
+            log_print(f"  [stp_data] arc_cl_len={arc_total_length:.1f}, "
+                      f"h_gain={arc_height_gain:.1f}, brackets={bracket_count}")
 
             # 映射(背面)顯示：x_dir=-1 將視圖左右鏡像
             x_dir = -1  # 1=正面, -1=背面
@@ -6290,11 +6320,11 @@ Solid 名稱: {solid_name}
             c_upper = curved_sec.get('upper_tracks', []) if curved_sec else []
             c_lower = curved_sec.get('lower_tracks', []) if curved_sec else []
 
-            # 上圖繪圖區域（A3 上半部）
-            upper_area_x = MARGIN + 15
-            upper_area_y = PH * 0.52
-            upper_area_w = PW * 0.45
-            upper_area_h = PH - MARGIN - upper_area_y - 10
+            # 上圖繪圖區域（A3 左上方：俯視圖佔上 35%）
+            upper_area_x = MARGIN + 5
+            upper_area_y = PH * 0.60
+            upper_area_w = PW * 0.52
+            upper_area_h = PH - MARGIN - upper_area_y - 5
 
             R_arc = arc_radius
             pipe_r = pipe_diameter / 2
@@ -6312,9 +6342,12 @@ Solid 名稱: {solid_name}
             l_ep_3d = (0, 0, 0)
 
             if c_upper:
-                u_pd = c_upper[0].get('pipe_data', {})
-                u_sp_3d = u_pd.get('start_point', (0, 0, 0))
-                u_ep_3d = u_pd.get('end_point', (0, 0, 0))
+                # 從 stp_data.pipe_centerlines 查詢上弧管端點（不直接用 section pipe_data）
+                _u_fid = c_upper[0].get('solid_id', '')
+                _u_pc = next((pc for pc in stp_data['pipe_centerlines']
+                              if pc['solid_id'] == _u_fid), {})
+                u_sp_3d = _u_pc.get('start_point', (0, 0, 0))
+                u_ep_3d = _u_pc.get('end_point', (0, 0, 0))
                 p1x, p1y = u_sp_3d[0], u_sp_3d[1]
                 p2x, p2y = u_ep_3d[0], u_ep_3d[1]
                 plan_p1, plan_p2 = (p1x, p1y), (p2x, p2y)
@@ -6361,9 +6394,12 @@ Solid 名稱: {solid_name}
                               f"sa={plan_sa_deg:.1f}, span={plan_span_deg:.1f}")
 
             if c_lower:
-                l_pd_tmp = c_lower[0].get('pipe_data', {})
-                l_sp_3d = l_pd_tmp.get('start_point', (0, 0, 0))
-                l_ep_3d = l_pd_tmp.get('end_point', (0, 0, 0))
+                # 從 stp_data.pipe_centerlines 查詢下弧管端點
+                _l_fid = c_lower[0].get('solid_id', '')
+                _l_pc = next((pc for pc in stp_data['pipe_centerlines']
+                              if pc['solid_id'] == _l_fid), {})
+                l_sp_3d = _l_pc.get('start_point', (0, 0, 0))
+                l_ep_3d = _l_pc.get('end_point', (0, 0, 0))
 
             # ---- 俯視圖 bounding box ----
             bb_pts = []
@@ -6372,17 +6408,17 @@ Solid 名稱: {solid_name}
                 a = math.radians(plan_sa_deg + t * plan_span_deg)
                 bb_pts.append((arc_cx_m + (R_arc + pipe_r + 10) * math.cos(a),
                                arc_cy_m + (R_arc + pipe_r + 10) * math.sin(a)))
-            bb_x0 = min(p[0] for p in bb_pts) - pipe_diameter * 2
-            bb_x1 = max(p[0] for p in bb_pts) + pipe_diameter * 2
-            bb_y0 = min(p[1] for p in bb_pts) - pipe_diameter * 2
-            bb_y1 = max(p[1] for p in bb_pts) + pipe_diameter * 2
+            bb_x0 = min(p[0] for p in bb_pts) - pipe_diameter
+            bb_x1 = max(p[0] for p in bb_pts) + pipe_diameter
+            bb_y0 = min(p[1] for p in bb_pts) - pipe_diameter
+            bb_y1 = max(p[1] for p in bb_pts) + pipe_diameter
 
             model_w_u = max(bb_x1 - bb_x0, 1)
             model_h_u = max(bb_y1 - bb_y0, 1)
 
             # 縮放與偏移
             upper_scale = min(upper_area_w / model_w_u,
-                              upper_area_h / model_h_u) * 0.80
+                              upper_area_h / model_h_u) * 0.85
             pipe_hw_u = min(max(pipe_diameter * upper_scale * 0.5, 1.0), 3.0)
             # 映射時反轉 X 軸的偏移計算
             upper_off_x = (upper_area_x + upper_area_w / 2
@@ -6406,46 +6442,57 @@ Solid 名稱: {solid_name}
                 if len(pts) >= 2:
                     msp.add_lwpolyline(pts, dxfattribs=dxf)
 
-            # ---- 繪製上軌弧線（管壁 + 中心線）----
+            # ---- 繪製俯視圖：中心線弧 + 管壁雙線（匹配標準圖 2-2-2） ----
+            # 管壁外弧
             _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc + pipe_r,
                            plan_sa_deg, plan_span_deg)
+            # 管壁內弧
             _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc - pipe_r,
                            plan_sa_deg, plan_span_deg)
+            # 中心線（紅色）
             _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc,
-                           plan_sa_deg, plan_span_deg, color=1)  # 中心線紅色
+                           plan_sa_deg, plan_span_deg, color=1)
 
-            # ---- 繪製下軌弧線（俯視圖與上軌幾乎重疊，用綠色+微偏移區分）----
-            if c_lower:
-                rail_vis_off = pipe_diameter * 0.4  # 視覺偏移
-                _draw_arc_poly(msp2, arc_cx_m, arc_cy_m,
-                               R_arc + pipe_r + rail_vis_off,
-                               plan_sa_deg, plan_span_deg, color=3)
-                _draw_arc_poly(msp2, arc_cx_m, arc_cy_m,
-                               R_arc - pipe_r - rail_vis_off,
-                               plan_sa_deg, plan_span_deg, color=3)
-                _draw_arc_poly(msp2, arc_cx_m, arc_cy_m, R_arc,
-                               plan_sa_deg, plan_span_deg, color=3)
+            # 端點封口線（連接內外壁弧的短線）
+            for ea_deg_i in [plan_sa_deg, plan_sa_deg + plan_span_deg]:
+                ea_rad = math.radians(ea_deg_i)
+                p_out = _m2u(arc_cx_m + (R_arc + pipe_r) * math.cos(ea_rad),
+                             arc_cy_m + (R_arc + pipe_r) * math.sin(ea_rad))
+                p_in = _m2u(arc_cx_m + (R_arc - pipe_r) * math.cos(ea_rad),
+                            arc_cy_m + (R_arc - pipe_r) * math.sin(ea_rad))
+                msp2.add_line(p_out, p_in)
 
-            # ---- 支撐架標記（沿弧等距的徑向短線）----
+            # ---- 支撐架標記（X 標記 + 小圓圈，沿弧等距）----
             if bracket_count > 0:
+                x_sz = 3  # X 標記大小
+                circle_r = 2.5  # 小圓圈半徑
                 for bi in range(bracket_count):
                     bt = (bi + 0.5) / bracket_count
                     ba = math.radians(plan_sa_deg + bt * plan_span_deg)
-                    r_in = R_arc - pipe_r - pipe_diameter * 0.8
-                    r_out = R_arc + pipe_r + pipe_diameter * 0.8
-                    bx1, by1 = _m2u(arc_cx_m + r_in * math.cos(ba),
-                                     arc_cy_m + r_in * math.sin(ba))
-                    bx2, by2 = _m2u(arc_cx_m + r_out * math.cos(ba),
-                                     arc_cy_m + r_out * math.sin(ba))
-                    msp2.add_line((bx1, by1), (bx2, by2), dxfattribs={'color': 5})
+                    bx_m = arc_cx_m + R_arc * math.cos(ba)
+                    by_m = arc_cy_m + R_arc * math.sin(ba)
+                    bx, by = _m2u(bx_m, by_m)
+                    # X 標記
+                    msp2.add_line((bx - x_sz, by - x_sz), (bx + x_sz, by + x_sz))
+                    msp2.add_line((bx - x_sz, by + x_sz), (bx + x_sz, by - x_sz))
+                    # 小圓圈
+                    msp2.add_circle((bx, by), circle_r)
 
             log_print(f"  上圖繪製完成（pipe_data 弧形）")
 
-            # R 尺寸標註（上圖左上方）
-            r_label_x = upper_area_x + 5
-            r_label_y = upper_area_y + upper_area_h - 10
+            # R 尺寸標註（弧線偏上方，帶徑向引線）
+            r_label_angle = math.radians(plan_sa_deg + plan_span_deg * 0.7)
+            r_arc_pt = _m2u(arc_cx_m + R_arc * math.cos(r_label_angle),
+                            arc_cy_m + R_arc * math.sin(r_label_angle))
+            # 徑向外延長（從弧心向外）
+            r_dir_x = math.cos(r_label_angle) * x_dir  # x_dir 控制映射方向
+            r_dir_y = math.sin(r_label_angle)
+            r_ext = 15  # 引線延伸長度（drawing units）
+            r_tip = (r_arc_pt[0] + r_dir_x * r_ext,
+                     r_arc_pt[1] + r_dir_y * r_ext)
+            msp2.add_line(r_arc_pt, r_tip)
             msp2.add_text(f"R{arc_radius:.0f}", dxfattribs={
-                'height': 4.0}).set_placement((r_label_x, r_label_y))
+                'height': 4.0}).set_placement((r_tip[0] + 2, r_tip[1]))
 
             # 弦長尺寸標註（上圖下方）
             if plan_valid:
@@ -6471,10 +6518,11 @@ Solid 名稱: {solid_name}
             # ================================================================
             log_print(f"  下圖：左前視圖（pipe_data）")
 
-            lower_area_x = MARGIN + 15
+            # 下圖繪圖區域（A3 左下方：佔頁面左半 55% 寬、下 50% 高）
+            lower_area_x = MARGIN + 5
             lower_area_y = tb_top2 + 5
-            lower_area_w = PW * 0.45
-            lower_area_h = PH * 0.42 - tb_top2
+            lower_area_w = PW * 0.52
+            lower_area_h = upper_area_y - lower_area_y - 10
 
             # 投影角度（左前方 30°）
             view_alpha = math.radians(30)
@@ -6515,10 +6563,10 @@ Solid 名稱: {solid_name}
             # Bounding box
             all_2d = u_pts_2d + l_pts_2d
             if all_2d:
-                lb_x0 = min(p[0] for p in all_2d) - pipe_diameter
-                lb_x1 = max(p[0] for p in all_2d) + pipe_diameter
-                lb_y0 = min(p[1] for p in all_2d) - pipe_diameter
-                lb_y1 = max(p[1] for p in all_2d) + pipe_diameter
+                lb_x0 = min(p[0] for p in all_2d) - pipe_r
+                lb_x1 = max(p[0] for p in all_2d) + pipe_r
+                lb_y0 = min(p[1] for p in all_2d) - pipe_r
+                lb_y1 = max(p[1] for p in all_2d) + pipe_r
             else:
                 lb_x0, lb_y0, lb_x1, lb_y1 = -200, -200, 200, 200
 
@@ -6526,7 +6574,7 @@ Solid 名稱: {solid_name}
             model_h_l = max(lb_y1 - lb_y0, 1)
 
             lower_scale = min(lower_area_w / model_w_l,
-                              lower_area_h / model_h_l) * 0.80
+                              lower_area_h / model_h_l) * 0.75
             pipe_hw_l = min(max(pipe_diameter * lower_scale * 0.5, 1.0), 3.0)
             lower_off_x = (lower_area_x + lower_area_w / 2
                            - (lb_x0 + lb_x1) / 2 * lower_scale)
@@ -6574,10 +6622,12 @@ Solid 名稱: {solid_name}
             if l_pts_2d:
                 _draw_pipe_curve(msp2, l_pts_2d, pipe_hw_l, center_color=3)
 
-            # 支撐架（連接上下軌的短線）
+            # 支撐架（連接上下軌的管線 + X 標記 + 小圓圈）
             if bracket_count > 0 and u_pts_2d and l_pts_2d:
                 n_u = len(u_pts_2d)
                 n_l = len(l_pts_2d)
+                leg_hw = min(pipe_hw_l * 0.6, 1.5)  # 腳架管壁半寬
+                x_sz = min(3.0, pipe_hw_l * 1.2)     # X 標記大小
                 for bi in range(bracket_count):
                     idx_u = int((bi + 0.5) / bracket_count * (n_u - 1))
                     idx_l = int((bi + 0.5) / bracket_count * (n_l - 1))
@@ -6585,18 +6635,49 @@ Solid 名稱: {solid_name}
                     idx_l = max(0, min(idx_l, n_l - 1))
                     u_pt = _m2l(*u_pts_2d[idx_u])
                     l_pt = _m2l(*l_pts_2d[idx_l])
-                    msp2.add_line(u_pt, l_pt, dxfattribs={'color': 5})
+                    # 腳架管壁雙線
+                    msp2.add_line((u_pt[0] - leg_hw, u_pt[1]),
+                                 (l_pt[0] - leg_hw, l_pt[1]))
+                    msp2.add_line((u_pt[0] + leg_hw, u_pt[1]),
+                                 (l_pt[0] + leg_hw, l_pt[1]))
+                    # X 標記（上軌穿越處）
+                    msp2.add_line((u_pt[0] - x_sz, u_pt[1] - x_sz),
+                                 (u_pt[0] + x_sz, u_pt[1] + x_sz))
+                    msp2.add_line((u_pt[0] - x_sz, u_pt[1] + x_sz),
+                                 (u_pt[0] + x_sz, u_pt[1] - x_sz))
+                    # X 標記（下軌穿越處）
+                    msp2.add_line((l_pt[0] - x_sz, l_pt[1] - x_sz),
+                                 (l_pt[0] + x_sz, l_pt[1] + x_sz))
+                    msp2.add_line((l_pt[0] - x_sz, l_pt[1] + x_sz),
+                                 (l_pt[0] + x_sz, l_pt[1] - x_sz))
+                    # 小圓圈（支撐架位置）
+                    msp2.add_circle(u_pt, x_sz * 0.8)
+                    msp2.add_circle(l_pt, x_sz * 0.8)
 
             log_print(f"  下圖繪製完成（pipe_data 左前視圖）")
 
-            # 軌道間距標註（右側垂直）
-            if rail_spacing > 0 and u_pts_2d and l_pts_2d:
-                u_end = _m2l(*u_pts_2d[-1])
-                l_end = _m2l(*l_pts_2d[-1])
+            # ---- 高低差標註（右側垂直：上軌起點→上軌終點的 Z 差）----
+            if arc_height_gain > 1 and u_pts_2d:
+                u_start_d = _m2l(*u_pts_2d[0])
+                u_end_d = _m2l(*u_pts_2d[-1])
+                # 高低差 = 上軌兩端的 Z 差 → 在投影圖中為 Y 差
+                dim_x_right = max(u_start_d[0], u_end_d[0]) + 15
                 self._draw_dimension_line(msp2,
-                                          (u_end[0] + 10, u_end[1]),
-                                          (l_end[0] + 10, l_end[1]),
-                                          10, f"{rail_spacing:.1f}",
+                                          (dim_x_right, u_start_d[1]),
+                                          (dim_x_right, u_end_d[1]),
+                                          10, f"{arc_height_gain:.1f}",
+                                          vertical=True)
+
+            # ---- 上下軌距離標註（底部：弧起點處上下軌 Z 差，匹配標準圖）----
+            if rail_spacing > 0 and u_pts_2d and l_pts_2d:
+                # 取弧起點（較低 Z = 圖面下方）
+                u_start_d = _m2l(*u_pts_2d[0])
+                l_start_d = _m2l(*l_pts_2d[0])
+                dim_x_sp = min(u_start_d[0], l_start_d[0]) - 15
+                self._draw_dimension_line(msp2,
+                                          (dim_x_sp, u_start_d[1]),
+                                          (dim_x_sp, l_start_d[1]),
+                                          -10, f"{rail_spacing:.1f}",
                                           vertical=True)
 
             # ================================================================
@@ -6606,7 +6687,7 @@ Solid 名稱: {solid_name}
             # 螺旋方向：左彎→右螺旋（右手定則），右彎→左螺旋
             spiral_dir = '右螺旋' if bend_direction == 'left' else '左螺旋'
             
-            cl_arc_items = [t for t in track_items if t.get('type') == 'arc']
+            cl_arc_items = [t for t in stp_data['track_items'] if t.get('type') == 'arc']
             cl_items_for_d2 = []
             item_idx = 1
             for ai in cl_arc_items:
@@ -6636,7 +6717,7 @@ Solid 名稱: {solid_name}
                 })
                 item_idx += 1
 
-            cl_table_x = PW - MARGIN - 160
+            cl_table_x = PW - MARGIN - 180  # 加寬避免文字超出右邊界
             cl_table_y = PH - MARGIN - 30
             cl_bottom_y = cl_table_y
             if cl_items_for_d2:
@@ -6658,8 +6739,8 @@ Solid 名稱: {solid_name}
 
             # ---- BOM 表（長度/仰角標註下方） ----
             bom2_items = []
-            if bracket_items:
-                total_brackets = sum(b.get('quantity', 1) for b in bracket_items)
+            if stp_data['bracket_items']:
+                total_brackets = sum(b.get('quantity', 1) for b in stp_data['bracket_items'])
                 # 支撐架型號：PSA + 仰角度數（如 PSA32 = 仰角32度用的支撐架）
                 psa_spec = f"PSA{elevation_deg:.0f}" if elevation_deg > 0 else 'PSA20'
                 bom2_items.append({
@@ -6729,14 +6810,15 @@ Solid 名稱: {solid_name}
 
             # 計算 section3 的 transition bends 和取料明細
             section3_bends = self._compute_transition_bends(
-                section3, track_elevations, pipe_centerlines,
-                part_classifications, pipe_diameter, rail_spacing,
+                section3, stp_data['track_elevations'], stp_data['pipe_centerlines'],
+                stp_data['part_classifications'], pipe_diameter, rail_spacing,
                 is_after_curved=is_after_curved, prev_curved_section=prev_curved_section,
-                bend_direction=bend_direction)
+                bend_direction=bend_direction, stp_data=stp_data)
 
             section3_cl = self._build_section_cutting_list(
-                section3, section3_bends, track_items,
-                part_classifications, pipe_diameter)
+                section3, section3_bends, stp_data['track_items'],
+                stp_data['part_classifications'], pipe_diameter,
+                stp_data=stp_data)
 
             # 使用 Drawing 1 的繪圖函數，傳入 section3 的資料
             doc3 = self._draw_straight_section_sheet(
@@ -6747,7 +6829,8 @@ Solid 名稱: {solid_name}
                     'company': '羅布森股份有限公司',
                     'drawing_name': '彎軌軌道製圖',
                     'drawing_number': 'LM-13',
-                })
+                },
+                stp_data=stp_data)
 
             # 儲存
             path3 = os.path.join(output_dir, f"{base_name}_3.dxf")
@@ -6762,9 +6845,31 @@ Solid 名稱: {solid_name}
             import traceback
             log_print(traceback.format_exc(), "error")
 
-        # ===== 完成 =====
+        # ===== stp_data 來源驗證報告 =====
         log_print(f"\n{'=' * 60}")
-        log_print(f"子系統施工圖完成！共 {len(output_paths)} 張")
+        log_print(f"[stp_data 驗證] 所有繪圖數值來源追蹤:")
+        log_print(f"  管徑:       {stp_data['pipe_diameter']:.1f} ← stp_data.pipe_diameter")
+        log_print(f"  軌距:       {stp_data['rail_spacing']:.1f} ← stp_data.rail_spacing")
+        log_print(f"  弧半徑:     {stp_data['arc_radius']:.0f} ← stp_data.arc_radius")
+        log_print(f"  弧角度:     {stp_data['arc_angle_deg']:.1f}° ← stp_data.arc_angle_deg")
+        log_print(f"  高低差:     {stp_data['arc_height_gain']:.1f} ← stp_data.arc_height_gain")
+        log_print(f"  仰角:       {stp_data['elevation_deg']:.1f}° ← stp_data.elevation_deg")
+        log_print(f"  弦長:       {stp_data['chord_length']:.0f} ← stp_data.chord_length")
+        log_print(f"  弧長(CL):   {stp_data['arc_cl_length']:.1f} ← stp_data.arc_cl_length")
+        log_print(f"  彎向:       {stp_data['bend_direction']} ← stp_data.bend_direction")
+        log_print(f"  上軌彎R:    {stp_data['upper_bend_r']:.0f} ← stp_data.upper_bend_r")
+        log_print(f"  下軌彎R:    {stp_data['lower_bend_r']:.0f} ← stp_data.lower_bend_r")
+        log_print(f"  支撐架數:   {stp_data['bracket_count']} ← stp_data.bracket_count")
+        log_print(f"  軌道數:     {len(stp_data['track_items'])} ← stp_data.track_items")
+        log_print(f"  腳架數:     {len(stp_data['leg_items'])} ← stp_data.leg_items")
+        for li, lg in enumerate(stp_data['leg_items']):
+            log_print(f"    腳架{li+1}: L={lg.get('line_length',0):.1f} ← stp_data.leg_items[{li}].line_length")
+        log_print(f"  pipe_centerlines: {len(stp_data['pipe_centerlines'])} 條 ← stp_data.pipe_centerlines")
+        log_print(f"  track_elev_map: {stp_data['track_elev_map']} ← stp_data.track_elev_map")
+        log_print("=" * 60)
+
+        # ===== 完成 =====
+        log_print(f"\n子系統施工圖完成！共 {len(output_paths)} 張")
         for p in output_paths:
             log_print(f"  {p}")
         log_print("=" * 60 + "\n")
