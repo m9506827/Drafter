@@ -825,6 +825,36 @@ class MockCADEngine:
 
         centerline = sample_path(largest_face, n_samples)
 
+        # === 端點校正：用圓周取樣平均法取得管端中心 ===
+        # BSpline 取樣在 sv_mid（圓周中點）的端點是管壁上的點，不是管中心
+        # 透過在管端沿 V 方向取樣多個點再平均，可得到精確的管軸心端點
+        # 注意：只校正回傳的 start_point/end_point，不改動 centerline（避免破壞 straightness 判定）
+        corrected_start = None
+        corrected_end = None
+        try:
+            surf_adapter = BRepAdaptor_Surface(largest_face)
+            _su1 = surf_adapter.FirstUParameter()
+            _su2 = surf_adapter.LastUParameter()
+            _sv1 = surf_adapter.FirstVParameter()
+            _sv2 = surf_adapter.LastVParameter()
+            n_v = 36  # 沿圓周取 36 個點
+
+            def _circ_center(u_val):
+                pts_c = []
+                for j in range(n_v):
+                    sv = _sv1 + j / n_v * (_sv2 - _sv1)
+                    pt = surf_adapter.Value(u_val, sv)
+                    pts_c.append((pt.X(), pt.Y(), pt.Z()))
+                cx_ = sum(p[0] for p in pts_c) / len(pts_c)
+                cy_ = sum(p[1] for p in pts_c) / len(pts_c)
+                cz_ = sum(p[2] for p in pts_c) / len(pts_c)
+                return (cx_, cy_, cz_)
+
+            corrected_start = _circ_center(_su1)
+            corrected_end = _circ_center(_su2)
+        except Exception:
+            pass
+
         # 計算中心線總長
         total_length = 0
         for i in range(len(centerline) - 1):
@@ -930,14 +960,18 @@ class MockCADEngine:
                     'direction': d,
                 })
 
+        # 使用校正後的管軸心端點（如果可用），否則回退到取樣端點
+        final_start = corrected_start if corrected_start is not None else centerline[0]
+        final_end = corrected_end if corrected_end is not None else centerline[-1]
+
         return {
             'solid_id': feature_id,
             'pipe_radius': round(pipe_diameter / 2, 2),
             'pipe_diameter': round(pipe_diameter, 1),
             'total_length': round(total_length, 1),
             'segments': segments,
-            'start_point': centerline[0],
-            'end_point': centerline[-1],
+            'start_point': final_start,
+            'end_point': final_end,
             'cylinder_faces': [],
             'method': 'bspline',
         }
@@ -963,6 +997,8 @@ class MockCADEngine:
             from OCP.GeomAbs import GeomAbs_Cylinder
             from OCP.GProp import GProp_GProps
             from OCP.BRepGProp import BRepGProp
+            from OCP.Bnd import Bnd_Box
+            from OCP.BRepBndLib import BRepBndLib
             ocp_available = True
         except ImportError:
             pass
@@ -1001,6 +1037,7 @@ class MockCADEngine:
                                     'axis_direction': (direction.X(), direction.Y(), direction.Z()),
                                     'area': area,
                                     'est_length': est_length,
+                                    '_face_obj': face,  # 保存面物件供 BBox 計算
                                 })
                         except Exception:
                             pass
@@ -1124,22 +1161,74 @@ class MockCADEngine:
                     dir_groups.append([cf])
 
             for dg in dir_groups:
-                group_length = sum(cf['est_length'] for cf in dg)
                 direction = dg[0]['axis_direction']
+                sum_est_length = sum(cf['est_length'] for cf in dg)
 
-                if len(dir_groups) > 1:
-                    # 多個方向 → 可能有彎曲段
-                    segments.append({
-                        'type': 'straight',
-                        'length': group_length,
-                        'direction': direction,
-                    })
+                # === 面 BBox 延展範圍法：計算管方向實際延展長度 ===
+                # 管件實體可能包含額外結構（法蘭、底板），其圓柱面會使
+                # est_length 加總偏大。改用各面的 bounding box 在管方向
+                # 上的最小-最大範圍來求實際管長，消除重疊面的影響。
+                extent_length = None
+                try:
+                    proj_min = float('inf')
+                    proj_max = float('-inf')
+                    for cf in dg:
+                        face_obj = cf.get('_face_obj')
+                        if face_obj is not None:
+                            bnd = Bnd_Box()
+                            BRepBndLib.Add_s(face_obj, bnd)
+                            xmin, ymin, zmin, xmax, ymax, zmax = bnd.Get()
+                            # 將 bbox 8 頂點投影到管方向，取最小最大值
+                            for x in [xmin, xmax]:
+                                for y in [ymin, ymax]:
+                                    for z in [zmin, zmax]:
+                                        proj = x*direction[0] + y*direction[1] + z*direction[2]
+                                        proj_min = min(proj_min, proj)
+                                        proj_max = max(proj_max, proj)
+                    if proj_max > proj_min:
+                        extent_length = round(proj_max - proj_min, 1)
+                except Exception:
+                    pass
+
+                # 選擇較小值（面積加總可能偏大，延展範圍更準確）
+                if extent_length is not None and extent_length < sum_est_length:
+                    group_length = extent_length
+                    log_print(f"    [OCP extent] 使用面延展範圍: {extent_length:.1f}mm "
+                              f"(面積加總={sum_est_length:.1f}mm)")
                 else:
-                    segments.append({
-                        'type': 'straight',
-                        'length': group_length,
-                        'direction': direction,
-                    })
+                    group_length = sum_est_length
+
+                # 軸心過濾：排除非主管身的圓柱面（對支撐架等小管件有效）
+                if len(dg) > 1 and extent_length is None:
+                    total_area = sum(cf['area'] for cf in dg)
+                    if total_area > 0:
+                        avg_ox = sum(cf['axis_origin'][0] * cf['area'] for cf in dg) / total_area
+                        avg_oy = sum(cf['axis_origin'][1] * cf['area'] for cf in dg) / total_area
+                        avg_oz = sum(cf['axis_origin'][2] * cf['area'] for cf in dg) / total_area
+                        pipe_d = dominant_radius * 2
+                        filtered_dg = []
+                        for cf in dg:
+                            ox, oy, oz = cf['axis_origin']
+                            diff = (ox - avg_ox, oy - avg_oy, oz - avg_oz)
+                            proj_along = (diff[0]*direction[0] + diff[1]*direction[1] + diff[2]*direction[2])
+                            perp_x = diff[0] - proj_along * direction[0]
+                            perp_y = diff[1] - proj_along * direction[1]
+                            perp_z = diff[2] - proj_along * direction[2]
+                            perp_dist = math.sqrt(perp_x**2 + perp_y**2 + perp_z**2)
+                            if perp_dist < pipe_d:
+                                filtered_dg.append(cf)
+                            else:
+                                log_print(f"    [OCP filter] 排除偏離軸心圓柱面: "
+                                          f"perp_dist={perp_dist:.1f}mm > pipe_d={pipe_d:.1f}mm, "
+                                          f"est_L={cf['est_length']:.1f}")
+                        if filtered_dg:
+                            group_length = sum(cf['est_length'] for cf in filtered_dg)
+
+                segments.append({
+                    'type': 'straight',
+                    'length': group_length,
+                    'direction': direction,
+                })
                 total_length += group_length
 
             # 如果有多個方向群組，嘗試偵測彎弧
@@ -1184,11 +1273,36 @@ class MockCADEngine:
             bbox_w = params.get('bbox_w', 0)
             bbox_h = params.get('bbox_h', 0)
 
+            # === 計算面延展範圍（所有主要半徑圓柱面沿管方向的 min/max） ===
+            # 用於腳架線長計算：face_extent - pipe_diameter ≈ 製造切管長度
+            face_extent = None
+            try:
+                all_proj_min = float('inf')
+                all_proj_max = float('-inf')
+                main_dir = dir_groups[0][0]['axis_direction'] if dir_groups else (0, 0, 1)
+                for cf in dominant_faces:
+                    fo = cf.get('_face_obj')
+                    if fo is not None:
+                        fb = Bnd_Box()
+                        BRepBndLib.Add_s(fo, fb)
+                        fxmin, fymin, fzmin, fxmax, fymax, fzmax = fb.Get()
+                        for fx in [fxmin, fxmax]:
+                            for fy in [fymin, fymax]:
+                                for fz in [fzmin, fzmax]:
+                                    proj = fx*main_dir[0] + fy*main_dir[1] + fz*main_dir[2]
+                                    all_proj_min = min(all_proj_min, proj)
+                                    all_proj_max = max(all_proj_max, proj)
+                if all_proj_max > all_proj_min:
+                    face_extent = round(all_proj_max - all_proj_min, 1)
+            except Exception:
+                pass
+
             results.append({
                 'solid_id': fid,
                 'pipe_radius': round(dominant_radius, 2),
                 'pipe_diameter': round(dominant_radius * 2, 2),
                 'total_length': round(total_length, 1),
+                'face_extent': face_extent,  # 面延展範圍（含間隙的實際管方向跨距）
                 'segments': segments,
                 'start_point': (cx - bbox_l/2, cy - bbox_w/2, cz - bbox_h/2),
                 'end_point': (cx + bbox_l/2, cy + bbox_w/2, cz + bbox_h/2),
@@ -1801,8 +1915,17 @@ class MockCADEngine:
             feat = next((f for f in self.features if f.id == fid), None)
 
             if pipe_data and pipe_data.get('total_length', 0) > 0:
-                # 使用管路中心線總長
-                line_length = pipe_data.get('total_length', 0)
+                # 腳架線長計算：
+                # OCP 方法的 total_length 來自圓柱面面積加總，包含底座插入部分
+                # face_extent 是主要圓柱面沿管方向的 min/max 跨距（含間隙）
+                # face_extent - pipe_diameter ≈ 製造切管長度（扣除端面效應）
+                fe = pipe_data.get('face_extent')
+                pd = pipe_data.get('pipe_diameter', 0)
+                if fe is not None and pd > 0 and pipe_data.get('method') == 'ocp':
+                    line_length = round(fe - pd, 1)
+                    log_print(f"  [LineLength] {fid}: face_extent={fe:.1f} - pipe_d={pd:.1f} = {line_length:.1f}")
+                else:
+                    line_length = pipe_data.get('total_length', 0)
             elif feat:
                 bl = feat.params.get('bbox_l', 0)
                 bw = feat.params.get('bbox_w', 0)
