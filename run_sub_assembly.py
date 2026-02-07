@@ -8,6 +8,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 from auto_drafter_system import MockCADEngine, log_print
+from simple_viewer import EngineeringViewer
 
 
 def main():
@@ -43,6 +44,15 @@ def main():
         print(f"\n[Done] 共 {len(result)} 張施工圖:")
         for i, dxf_path in enumerate(result, 1):
             print(f"  [{i}] DXF: {dxf_path}")
+
+        # 使用程式互動視窗預覽每張施工圖
+        for dxf_path in result:
+            if os.path.exists(dxf_path):
+                try:
+                    print(f"  [Preview] 開啟預覽: {dxf_path}")
+                    EngineeringViewer.view_2d_dxf(dxf_path, fast_mode=True)
+                except Exception as pve:
+                    print(f"  [Preview] 預覽失敗: {pve}")
         return 0
     else:
         print("[Error] 生成失敗")

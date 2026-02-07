@@ -5530,7 +5530,7 @@ Solid 名稱: {solid_name}
         model_center_x = (max(all_xs) + min(all_xs)) / 2
         draw_center_x = draw_area_x + draw_area_w / 2
         base_x = draw_center_x - x_dir * model_center_x * scale  # 居中顯示
-        base_y_upper = y_offset + max(up_ys) * scale  # 上軌最高 Y 對齊
+        base_y_upper = y_offset + min(up_ys) * scale  # 上軌起點 Y（路徑向上延伸）
 
         # ========== 繪製完整 cutting list 路徑 ==========
         def _draw_cl_path(msp, path_info, start_x, start_y, scale, pipe_hw, dim_side):
@@ -5549,7 +5549,7 @@ Solid 名稱: {solid_name}
                     rad = math.radians(angle_deg)
                     draw_len = seg_len * scale
                     dx = x_dir * draw_len * math.cos(rad)
-                    dy = -draw_len * math.sin(rad)  # Y 負方向 = 向下
+                    dy = draw_len * math.sin(rad)  # Y 正方向 = 向上（仰角正 = 上坡）
 
                     sx, sy = cx, cy
                     ex, ey = cx + dx, cy + dy
@@ -5605,12 +5605,9 @@ Solid 名稱: {solid_name}
                         # 角度弧線標記
                         arc_r = min(15, 25 * scale)
                         # 前段方向角和後段方向角（DXF 角度系統）
-                        if x_dir < 0:
-                            pre_dxf = prev_angle
-                            post_dxf = prev_angle + bend_deg
-                        else:
-                            pre_dxf = 180 - prev_angle
-                            post_dxf = 180 - (prev_angle + bend_deg)
+                        # x_dir=1 且 dy=+sin: 段方向角 = 仰角本身
+                        pre_dxf = prev_angle
+                        post_dxf = prev_angle + bend_deg
                         sa = min(pre_dxf, post_dxf)
                         ea = max(pre_dxf, post_dxf)
                         if ea - sa > 0.5:
@@ -6172,13 +6169,7 @@ Solid 名稱: {solid_name}
             output_paths.append(path1)
             log_print(f"  [OK] {path1}")
 
-            # 產生 PNG 預覽圖（使用 EngineeringViewer，非阻塞）
-            try:
-                preview_png = os.path.join(output_dir, f"{base_name}-1_preview.png")
-                EngineeringViewer.view_2d_dxf(path1, fast_mode=True, save_path=preview_png)
-                log_print(f"  [Preview] PNG 預覽: {preview_png}")
-            except Exception as pve:
-                log_print(f"  [Preview] 預覽生成失敗: {pve}", "warning")
+            # PNG 預覽已移除，改在 __main__ 以互動視窗顯示
 
         except Exception as e:
             log_print(f"[Error] Drawing 1 失敗: {e}", "error")
@@ -6688,13 +6679,7 @@ Solid 名稱: {solid_name}
             output_paths.append(path2)
             log_print(f"  [OK] {path2}")
 
-            # 產生 PNG 預覽圖
-            try:
-                preview2 = os.path.join(output_dir, f"{base_name}_2_preview.png")
-                EngineeringViewer.view_2d_dxf(path2, fast_mode=True, save_path=preview2)
-                log_print(f"  [Preview] PNG 預覽: {preview2}")
-            except Exception as pve:
-                log_print(f"  [Preview] 預覽生成失敗: {pve}", "warning")
+            # PNG 預覽已移除，改在 __main__ 以互動視窗顯示
 
         except Exception as e:
             log_print(f"[Error] Drawing 2 失敗: {e}", "error")
@@ -6770,13 +6755,7 @@ Solid 名稱: {solid_name}
             output_paths.append(path3)
             log_print(f"  [OK] {path3}")
 
-            # 產生 PNG 預覽圖
-            try:
-                preview3 = os.path.join(output_dir, f"{base_name}_3_preview.png")
-                EngineeringViewer.view_2d_dxf(path3, fast_mode=True, save_path=preview3)
-                log_print(f"  [Preview] PNG 預覽: {preview3}")
-            except Exception as pve:
-                log_print(f"  [Preview] 預覽生成失敗: {pve}", "warning")
+            # PNG 預覽已移除，改在 __main__ 以互動視窗顯示
 
         except Exception as e:
             log_print(f"[Error] Drawing 3 失敗: {e}", "error")
@@ -8122,7 +8101,15 @@ if __name__ == "__main__":
             log_print(f"[System] 共 {len(sub_drawings)} 張施工圖已生成")
             for i, dxf_path in enumerate(sub_drawings, 1):
                 log_print(f"  [{i}] {dxf_path}")
-            # PNG 預覽已在繪圖過程中生成，不再重複開啟互動視窗
+
+            # 使用程式互動視窗預覽每張施工圖
+            for dxf_path in sub_drawings:
+                if os.path.exists(dxf_path):
+                    try:
+                        log_print(f"  [Preview] 開啟預覽: {dxf_path}")
+                        EngineeringViewer.view_2d_dxf(dxf_path, fast_mode=True)
+                    except Exception as pve:
+                        log_print(f"  [Preview] 預覽失敗: {pve}", "warning")
         else:
             log_print("[Warning] 未能生成子系統施工圖", "warning")
     else:
