@@ -2261,9 +2261,30 @@ class MockCADEngine:
             log_print(f"  彎軌入口 transition bend: {exit_bend_deg:.0f}°")
             bend_rad = math.radians(exit_bend_deg)
             
-            # 添加彎軌入口的 exit bend
-            # 注意：不分割現有軌道，因為過渡段在模型中沒有獨立建模
-            # 只在直軌末端添加 exit bend（連接到大彎軌）
+            # 添加彎軌入口的 exit bend — 分割最後一個直段
+            # 結構：main_straight → exit_bend → exit_straight_to_curve
+            # 分割比例依彎曲方向：外側軌道過渡段較長，內側較短
+            if bend_direction == 'right':
+                exit_ratio_upper = 0.30  # 右彎時上軌在內側
+                exit_ratio_lower = 0.48  # 右彎時下軌在外側
+            else:  # left
+                exit_ratio_upper = 0.48  # 左彎時上軌在外側
+                exit_ratio_lower = 0.30  # 左彎時下軌在內側
+            
+            # 計算最後一個直段的長度
+            exit_straight_upper = 0
+            exit_straight_lower = 0
+            if n_upper >= 1:
+                pd = upper_tracks[-1].get('pipe_data', {})
+                for seg in pd.get('segments', []):
+                    if seg.get('type') == 'straight':
+                        exit_straight_upper = round(seg.get('length', 0) * exit_ratio_upper, 1)
+            if n_lower >= 1:
+                pd = lower_tracks[-1].get('pipe_data', {})
+                for seg in pd.get('segments', []):
+                    if seg.get('type') == 'straight':
+                        exit_straight_lower = round(seg.get('length', 0) * exit_ratio_lower, 1)
+            
             bends.append({
                 'angle_deg': exit_bend_deg,
                 'upper_bend_deg': exit_bend_deg,
@@ -2274,8 +2295,8 @@ class MockCADEngine:
                 'upper_arc': round((upper_default_r + pipe_diameter / 2) * bend_rad, 0),
                 'lower_arc': round((lower_default_r + pipe_diameter / 2) * bend_rad, 0),
                 'position': 'exit',
-                'exit_straight_upper': 0,  # 不添加額外過渡段
-                'exit_straight_lower': 0,  # 不添加額外過渡段
+                'exit_straight_upper': exit_straight_upper,
+                'exit_straight_lower': exit_straight_lower,
             })
 
         # ========== 原有邏輯：軌道間 transition bends ==========
@@ -2614,6 +2635,8 @@ class MockCADEngine:
                         idx += 1
             
             # 處理 exit bend（在所有直段之後）
+            # 如果有 exit_straight > 0，分割最後一個直段：
+            #   main_part → exit_bend → exit_transition_part
             if exit_bend:
                 r = exit_bend['upper_r'] if is_upper else exit_bend['lower_r']
                 arc_len = exit_bend['upper_arc'] if is_upper else exit_bend['lower_arc']
@@ -2621,27 +2644,68 @@ class MockCADEngine:
                 exit_straight = exit_bend.get('exit_straight_upper' if is_upper else 'exit_straight_lower', 0)
                 
                 if bend_deg >= 0.5 and arc_len >= 1:
-                    # 添加 exit bend
-                    items.append({
-                        'item': f'{prefix}{idx}',
-                        'type': 'arc',
-                        'diameter': pipe_diameter,
-                        'angle_deg': bend_deg,
-                        'radius': r,
-                        'outer_arc_length': arc_len,
-                        'height_gain': 0,
-                        'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
-                    })
-                    idx += 1
-                    
-                    # 如果有 exit 過渡段，添加它
-                    if exit_straight > 0:
+                    # 如果有 exit 過渡段且最後一個項目是直管，分割它
+                    if exit_straight > 0 and items and items[-1].get('type') == 'straight':
+                        last_item = items[-1]
+                        total_len = last_item['length']
+                        
+                        if exit_straight < total_len:
+                            # 縮短最後一個直管為主段
+                            main_len = round(total_len - exit_straight, 1)
+                            items[-1] = {
+                                'item': last_item['item'],
+                                'type': 'straight',
+                                'diameter': last_item.get('diameter', pipe_diameter),
+                                'length': main_len,
+                                'spec': f"直徑{last_item.get('diameter', pipe_diameter):.1f} 長度{main_len:.1f}",
+                            }
+                            
+                            # 添加 exit bend
+                            items.append({
+                                'item': f'{prefix}{idx}',
+                                'type': 'arc',
+                                'diameter': pipe_diameter,
+                                'angle_deg': bend_deg,
+                                'radius': r,
+                                'outer_arc_length': arc_len,
+                                'height_gain': 0,
+                                'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
+                            })
+                            idx += 1
+                            
+                            # 添加 exit 過渡直段
+                            items.append({
+                                'item': f'{prefix}{idx}',
+                                'type': 'straight',
+                                'diameter': pipe_diameter,
+                                'length': exit_straight,
+                                'spec': f"直徑{pipe_diameter:.1f} 長度{exit_straight:.1f}",
+                            })
+                            idx += 1
+                        else:
+                            # exit_straight >= total_len，不分割，只加 bend
+                            items.append({
+                                'item': f'{prefix}{idx}',
+                                'type': 'arc',
+                                'diameter': pipe_diameter,
+                                'angle_deg': bend_deg,
+                                'radius': r,
+                                'outer_arc_length': arc_len,
+                                'height_gain': 0,
+                                'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
+                            })
+                            idx += 1
+                    else:
+                        # 無法分割，直接添加 exit bend
                         items.append({
                             'item': f'{prefix}{idx}',
-                            'type': 'straight',
+                            'type': 'arc',
                             'diameter': pipe_diameter,
-                            'length': exit_straight,
-                            'spec': f"直徑{pipe_diameter:.1f} 長度{exit_straight:.1f}",
+                            'angle_deg': bend_deg,
+                            'radius': r,
+                            'outer_arc_length': arc_len,
+                            'height_gain': 0,
+                            'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
                         })
                         idx += 1
             
@@ -3858,12 +3922,12 @@ Solid 名稱: {solid_name}
              gp_Dir(0, -1, 0), gp_Dir(1, 0, 0), False),       # => (x, z)
             ('YZ', '',     '側視圖 (Right) - 直接投影',
              gp_Dir(-1, 0, 0), gp_Dir(0, -1, 0), False),      # => (-y, z)
-            ('XY', '_rot', '俯視圖 (Top) - 反向',
-             gp_Dir(0, 0, -1), gp_Dir(1, 0, 0), True),        # => (x, -y)
-            ('XZ', '_rot', '前視圖 (Front) - 反向',
-             gp_Dir(0, -1, 0), gp_Dir(1, 0, 0), False),       # => (x, z)
-            ('YZ', '_rot', '側視圖 (Right) - 反向',
-             gp_Dir(0, 1, 0),  gp_Dir(-1, 0, 0), False),      # => (-x, z)
+            # ('XY', '_rot', '俯視圖 (Top) - 反向',
+            #  gp_Dir(0, 0, -1), gp_Dir(1, 0, 0), True),        # => (x, -y)
+            # ('XZ', '_rot', '前視圖 (Front) - 反向',
+            #  gp_Dir(0, -1, 0), gp_Dir(1, 0, 0), False),       # => (x, z)
+            # ('YZ', '_rot', '側視圖 (Right) - 反向',
+            #  gp_Dir(0, 1, 0),  gp_Dir(-1, 0, 0), False),      # => (-x, z)
         ]
 
         output_files = []
@@ -4540,23 +4604,30 @@ Solid 名稱: {solid_name}
             ry = header_y - (ri + 1) * row_h
             msp.add_line((x, ry), (x + table_w, ry))
             item_id = str(item.get('item', ''))
-            # 格式化規格
-            diameter = item.get('diameter', 0)
-            if item.get('type') == 'straight':
-                spec = f"直徑{diameter:.1f} 長度{item.get('length', 0):.1f}"
-            elif item.get('type') == 'arc':
-                angle = item.get('angle_deg', 0)
-                radius = item.get('radius', 0)
-                outer_arc = item.get('outer_arc_length', 0)
-                h_gain = item.get('height_gain', 0)
-                spec = f"直徑{diameter:.1f} {angle:.0f}度(R{radius:.0f})弧長{outer_arc:.0f}"
-                if h_gain > 1:
-                    spec += f" 高低差{h_gain:.1f}"
+            # 格式化規格 — 優先使用預建 spec 欄位
+            if item.get('spec'):
+                spec = str(item['spec'])
             else:
-                spec = str(item.get('spec', ''))
+                diameter = item.get('diameter', 0)
+                if item.get('type') == 'straight':
+                    spec = f"直徑{diameter:.1f} 長度{item.get('length', 0):.1f}"
+                elif item.get('type') == 'arc':
+                    angle = item.get('angle_deg', 0)
+                    radius = item.get('radius', 0)
+                    outer_arc = item.get('outer_arc_length', 0)
+                    h_gain = item.get('height_gain', 0)
+                    spiral_dir = item.get('spiral_direction', '')
+                    if angle >= 90 and spiral_dir:
+                        # 螺旋弧格式 (Drawing 2)
+                        spec = f"直徑{diameter:.1f} R={radius:.0f}({angle:.0f}度){spiral_dir}高低差{h_gain:.1f}"
+                    else:
+                        # 轉接彎管格式 (Drawing 1 & 3)
+                        spec = f"直徑{diameter:.1f} 角度{angle:.0f}度(半徑{radius:.0f})外弧長{outer_arc:.0f}"
+                else:
+                    spec = ''
             msp.add_text(item_id, dxfattribs={'height': th - 0.5}).set_placement(
                 (x + 3, ry + 1.5))
-            msp.add_text(spec[:50], dxfattribs={'height': th - 0.5}).set_placement(
+            msp.add_text(spec[:60], dxfattribs={'height': th - 0.5}).set_placement(
                 (x + col_widths[0] + 3, ry + 1.5))
 
         bottom_y = header_y - len(items) * row_h
@@ -5551,16 +5622,16 @@ Solid 名稱: {solid_name}
                                       f"{chord_length:.0f}")
 
             # ================================================================
-            # 下半部：HLR 等角投影
-            # 顯示完整軌道 + 支撐架 + 腳架邊線（follow Drawing 1 & 3）
+            # 下半部：HLR 前視圖背面
+            # 從背面看（+Y 方向），顯示完整軌道 + 支撐架 + 腳架邊線
             # ================================================================
-            # 等角投影方向：從前上方偏右觀看
-            iso_main = (0.4, -0.6, 0.7)
-            iso_xdir = (-0.8, 0, 0.5)
+            # 前視圖背面：視線沿 +Y 方向看，X 軸反轉以維持正確方向
+            back_main = (0, 1, 0)
+            back_xdir = (-1, 0, 0)
 
-            log_print(f"  下圖 HLR 等角投影")
+            log_print(f"  下圖 HLR 前視圖背面")
             lower_polylines, lower_bbox = self._hlr_project_to_polylines(
-                iso_main, iso_xdir)
+                back_main, back_xdir)
 
             # 下圖可用空間（A3 下半部）
             lower_area_x = MARGIN + 15
@@ -5582,9 +5653,9 @@ Solid 名稱: {solid_name}
                 if len(pts) >= 2:
                     msp2.add_lwpolyline(pts)
 
-            log_print(f"  下圖邊數: {len(lower_polylines)}")
+            log_print(f"  下圖邊數（前視圖背面）: {len(lower_polylines)}")
 
-            # 等角視圖尺寸標註 — 軌道間距（右側垂直）
+            # 前視圖背面尺寸標註 — 軌道間距（右側垂直）
             if rail_spacing > 0:
                 lb_draw_right = lower_bbox[2] * lower_scale + lower_off_x
                 lb_draw_top = lower_bbox[3] * lower_scale + lower_off_y
@@ -5600,13 +5671,40 @@ Solid 名稱: {solid_name}
 
             # ================================================================
             # 軌道取料明細表（右上）— 先繪製以取得 bottom_y
+            # 格式：直徑XX R=XX(XX度)右/左螺旋高低差XX
             # ================================================================
+            # 螺旋方向：左彎→右螺旋（右手定則），右彎→左螺旋
+            spiral_dir = '右螺旋' if bend_direction == 'left' else '左螺旋'
+            
             cl_arc_items = [t for t in track_items if t.get('type') == 'arc']
-            cl_items_for_d2 = cl_arc_items if cl_arc_items else []
-            if not cl_items_for_d2:
-                for ti in track_items:
-                    if ti.get('type') == 'arc':
-                        cl_items_for_d2.append(ti)
+            cl_items_for_d2 = []
+            item_idx = 1
+            for ai in cl_arc_items:
+                diameter = ai.get('diameter', ai.get('pipe_diameter', pipe_diameter))
+                radius = ai.get('radius', arc_radius)
+                angle = ai.get('angle_deg', arc_angle_deg)
+                h_gain = ai.get('height_gain', arc_height_gain)
+                prefix = 'U' if item_idx <= len(cl_arc_items) // 2 or item_idx == 1 else 'D'
+                if item_idx == 1:
+                    prefix = 'U'
+                elif item_idx == 2:
+                    prefix = 'D'
+                else:
+                    prefix = f'U' if item_idx % 2 == 1 else 'D'
+                
+                spec_str = f"直徑{diameter:.1f} R={radius:.0f}({angle:.0f}度){spiral_dir}高低差{h_gain:.1f}"
+                cl_items_for_d2.append({
+                    'item': f'{prefix}{(item_idx + 1) // 2}',
+                    'type': 'arc',
+                    'diameter': diameter,
+                    'angle_deg': angle,
+                    'radius': radius,
+                    'outer_arc_length': ai.get('outer_arc_length', 0),
+                    'height_gain': h_gain,
+                    'spiral_direction': spiral_dir,
+                    'spec': spec_str,
+                })
+                item_idx += 1
 
             cl_table_x = PW - MARGIN - 160
             cl_table_y = PH - MARGIN - 30
@@ -5632,11 +5730,12 @@ Solid 名稱: {solid_name}
             bom2_items = []
             if bracket_items:
                 total_brackets = sum(b.get('quantity', 1) for b in bracket_items)
-                spec = bracket_items[0].get('spec', 'PSA20')
+                # 支撐架型號：PSA + 仰角度數（如 PSA32 = 仰角32度用的支撐架）
+                psa_spec = f"PSA{elevation_deg:.0f}" if elevation_deg > 0 else 'PSA20'
                 bom2_items.append({
                     'id': 1, 'name': '支撐架',
                     'quantity': total_brackets,
-                    'remark': spec
+                    'remark': psa_spec
                 })
 
             if bom2_items:
@@ -6027,10 +6126,10 @@ Solid 名稱: {solid_name}
             bom_id = 1
             # 腳架（只顯示該區段的腳架）
             for li, leg in enumerate(section3_legs):
-                spec = leg.get('spec', '')
+                ll = leg.get('line_length', 0)
                 bom3_items.append({
                     'id': bom_id, 'name': '腳架', 'quantity': 1,
-                    'remark': f"線長{spec}"
+                    'remark': f"線長L={ll:.0f}"
                 })
                 bom_id += 1
 
