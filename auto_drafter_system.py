@@ -6658,6 +6658,7 @@ Solid 名稱: {solid_name}
                             'end': (end_x, end_y),
                             'length': seg_len,
                             'item_id': it.get('item', f'S{seg_num}'),
+                            'solid_id': it.get('solid_id', ''),
                         })
 
                         # 尺寸標註
@@ -6667,6 +6668,20 @@ Solid 名稱: {solid_name}
                                                       (end_x, end_y),
                                                       dim_offset,
                                                       f"{seg_len:.1f}")
+
+                        # 球號標示（在段的中心，軌道旁邊）
+                        solid_id = it.get('solid_id', '')
+                        if solid_id and draw_len > 10:
+                            mid_x = (cursor_x + end_x) / 2
+                            mid_y = (cursor_y + end_y) / 2
+                            # 偏移到軌道旁（與尺寸標註相反方向）
+                            ball_offset = -dim_offset * 0.8
+                            ball_x = mid_x - math.sin(current_angle) * ball_offset
+                            ball_y = mid_y + math.cos(current_angle) * ball_offset
+                            msp.add_text(f"[{solid_id}]", dxfattribs={
+                                'height': 5.0,
+                                'color': 1  # 紅色
+                            }).set_placement((ball_x, ball_y))
 
                         cursor_x = end_x
                         cursor_y = end_y
