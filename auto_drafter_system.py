@@ -5328,8 +5328,9 @@ Solid 名稱: {solid_name}
         PW, PH = 420, 297
         MARGIN = 10
 
-        # 前視圖：x_dir=-1 保持軌道向右上傾斜方向
-        x_dir = -1  # -1=前視圖（軌道向右上傾斜）
+        # 前視圖：x_dir=1 軌道從左向右延伸
+        x_dir = 1  # 1=前視圖（軌道從左向右延伸）
+
 
         doc = ezdxf.new(dxfversion='R2010')
         msp = doc.modelspace()
@@ -5448,7 +5449,7 @@ Solid 名稱: {solid_name}
                         'radius': bend_r, 'arc_length': arc_len,
                         'label': label, 'prev_angle': current_angle
                     })
-                    current_angle -= bend_deg  # exit bend: 仰角遞減（朝向水平曲線）
+                    current_angle += bend_deg  # exit bend: 仰角遞增（軌道往下彎，角度變陡）
             return path
 
         # 上軌：起始角 = upper_base_elev（主管段的自然仰角）
@@ -5457,7 +5458,7 @@ Solid 名稱: {solid_name}
         # 因為下軌 D1(過渡段) 在彎角之前，D3(主管) 在彎角之後
         # D3 必須為 lower_base_elev，所以 D1 = lower_base_elev + total_bend
         lower_bend_total = sum(it.get('angle_deg', 0) for it in lower_cl if it.get('type') == 'arc')
-        lower_start_elev = lower_base_elev + lower_bend_total
+        lower_start_elev = lower_base_elev - lower_bend_total
         lower_path = _build_path_info(lower_cl, lower_start_elev)
 
         # 各腳架垂直高度（下軌以下的長度）
@@ -5523,7 +5524,7 @@ Solid 名稱: {solid_name}
         # 將圖形水平居中於繪圖區域
         model_center_x = (max(all_xs) + min(all_xs)) / 2
         draw_center_x = draw_area_x + draw_area_w / 2
-        base_x = draw_center_x + model_center_x * scale  # 居中顯示
+        base_x = draw_center_x - x_dir * model_center_x * scale  # 居中顯示
         base_y_upper = y_offset + max(up_ys) * scale  # 上軌最高 Y 對齊
 
         # ========== 繪製完整 cutting list 路徑 ==========
@@ -5578,7 +5579,7 @@ Solid 名稱: {solid_name}
                     # 球號標示（在段的中心，軌道旁邊）
                     solid_id = item.get('solid_id', '')
                     log_print(f"    [DrawBall] label={label}, solid_id='{solid_id}', draw_len={draw_len:.1f}")
-                    if solid_id and draw_len > 10:
+                    if label and draw_len > 10:
                         # 標示位置：段中點，偏移到軌道旁
                         mid_x = (sx + ex) / 2
                         mid_y = (sy + ey) / 2
@@ -5586,7 +5587,7 @@ Solid 名稱: {solid_name}
                         offset_dist = pipe_hw + 12
                         ball_x = mid_x - ny * offset_dist * dim_side
                         ball_y = mid_y + nx * offset_dist * dim_side
-                        msp.add_text(f"[{solid_id}]", dxfattribs={
+                        msp.add_text(f"[{label}]", dxfattribs={
                             'height': 5.0,  # 加大文字高度
                             'color': 1  # 紅色
                         }).set_placement((ball_x, ball_y))
@@ -5612,20 +5613,43 @@ Solid 名稱: {solid_name}
                         # 角度弧線標記
                         arc_r = min(15, 25 * scale)
                         # 前段方向角和後段方向角（DXF 角度系統）
-                        pre_dxf = -prev_angle * x_dir if x_dir < 0 else -prev_angle
-                        post_dxf = -(prev_angle + bend_deg) * x_dir if x_dir < 0 else -(prev_angle + bend_deg)
+                        # x_dir=1: 弧線畫在彎曲內側（加180°）
+                        if x_dir < 0:
+                            pre_dxf = prev_angle
+                            post_dxf = prev_angle + bend_deg
+                        else:
+                            pre_dxf = 180 - prev_angle
+                            post_dxf = 180 - (prev_angle + bend_deg)
                         sa = min(pre_dxf, post_dxf)
                         ea = max(pre_dxf, post_dxf)
                         if ea - sa > 0.5:
                             msp.add_arc((cx, cy), arc_r, sa, ea)
-                        # 角度文字
-                        mid_a = math.radians((prev_angle + bend_deg / 2))
+                        # 角度文字（放在弧線中點方向）
+                        mid_arc_deg = (sa + ea) / 2
+                        mid_arc_rad = math.radians(mid_arc_deg)
                         txt_r = arc_r + 5
-                        txt_x = cx + x_dir * txt_r * math.cos(mid_a)
-                        txt_y = cy - txt_r * math.sin(mid_a)
+                        txt_x = cx + txt_r * math.cos(mid_arc_rad)
+                        txt_y = cy + txt_r * math.sin(mid_arc_rad)
                         msp.add_text(f"{bend_deg:.0f}°", dxfattribs={
                             'height': 2.5
                         }).set_placement((txt_x, txt_y))
+
+                    # 彎曲段球號標示（U2/D2 等）
+                    label = item.get('label', '')
+                    if label:
+                        if x_dir < 0:
+                            mid_arc_deg_b = prev_angle + bend_deg / 2
+                        else:
+                            mid_arc_deg_b = 180 - prev_angle - bend_deg / 2
+                        # 球號放在彎曲外側（與角度弧線相反方向）
+                        out_rad = math.radians(mid_arc_deg_b + 180)
+                        ball_r = pipe_hw + 12
+                        ball_x = cx + ball_r * math.cos(out_rad)
+                        ball_y = cy + ball_r * math.sin(out_rad)
+                        msp.add_text(f"[{label}]", dxfattribs={
+                            'height': 5.0,
+                            'color': 1
+                        }).set_placement((ball_x, ball_y))
 
             # 端蓋
             if seg_positions:
@@ -5773,6 +5797,9 @@ Solid 名稱: {solid_name}
             if leg_x_span < 50 and n_legs > 1:
                 # 均勻分佈：第一個腳架在 0.2，最後一個在 0.8
                 t = 0.2 + (0.6 * li / (n_legs - 1))
+                # x_dir=1 時反轉位置，使 index 0 (①) 在右側
+                if x_dir > 0:
+                    t = 1.0 - t
             else:
                 t = max(0.05, min(0.95, (leg_x - track_x_min) / track_x_span))
             leg_upper_pt = (
