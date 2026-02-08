@@ -5191,13 +5191,13 @@ Solid 名稱: {solid_name}
                 (cx + r_outer + 3, cy - 1))
 
     # ====================================================================
-    # 共用俯視圖繪製 (Drawing 0 右半 / Drawing 2 上半)
+    # Drawing 2 上半：俯視圖繪製
     # ====================================================================
 
     def _draw_top_plan_view(self, msp, area_x, area_y, area_w, area_h,
                             stp_data, x_dir=1, draw_brackets=True):
         """
-        繪製軌道俯視圖（弧形軌道 XY 平面投影） — Drawing 0 / Drawing 2 共用。
+        繪製軌道俯視圖（弧形軌道 XY 平面投影） — Drawing 2 上半部使用。
 
         Args:
             msp: DXF modelspace
@@ -5343,8 +5343,8 @@ Solid 名稱: {solid_name}
 
         # 支撐架標記
         if bracket_count > 0:
-            x_sz = 3
-            circle_r = 2.5
+            x_sz = 1.5
+            circle_r = 1.2
             for bi in range(bracket_count):
                 bt = (bi + 0.5) / bracket_count
                 ba = math.radians(plan_sa_deg + bt * plan_span_deg)
@@ -5573,14 +5573,16 @@ Solid 名稱: {solid_name}
         )
 
         def project_iso(pt):
-            """3D 點 → 等角投影 2D"""
+            """3D 點 → 等角投影 2D（flip_v 一致）"""
             return (
                 sum(pt[i] * iso_x_n[i] for i in range(3)),
-                sum(pt[i] * iso_y_n[i] for i in range(3)),
+                -sum(pt[i] * iso_y_n[i] for i in range(3)),
             )
 
         # ==== 左半：等角 HLR 視圖 ====
-        iso_polylines, iso_bbox = self._hlr_project_to_polylines(iso_main, iso_x)
+        # flip_v=True 讓 Z 軸向上在頁面上也朝上
+        iso_polylines, iso_bbox = self._hlr_project_to_polylines(
+            iso_main, iso_x, flip_v=True)
 
         # 繪圖區域（左半頁面）
         left_area_x = MARGIN + 5
@@ -5611,23 +5613,112 @@ Solid 名稱: {solid_name}
             dim_text = f"{track_endpoint_length:.1f}"
             self._draw_dimension_line_along(msp, dim_a, dim_b, -8, dim_text)
 
-        # ==== 右半：俯視圖（共用 Drawing 2 上圖 function） ====
+        # ==== 右半：俯視 HLR 視圖（獨立於 Drawing 2） ====
+        top_main = (0, 0, -1)  # 從上往下看
+        top_x = (1, 0, 0)     # X 向右
+        top_polylines, top_bbox = self._hlr_project_to_polylines(top_main, top_x)
+
         right_area_x = PW * 0.50 + 5
         right_area_y = MARGIN + 40
         right_area_w = PW * 0.45
         right_area_h = PH - MARGIN - 40 - right_area_y
 
-        plan_result = self._draw_top_plan_view(
-            msp, right_area_x, right_area_y, right_area_w, right_area_h,
-            stp_data, x_dir=-1, draw_brackets=True)
+        if top_polylines:
+            bx0, by0, bx1, by1 = top_bbox
+            model_w = max(bx1 - bx0, 1)
+            model_h = max(by1 - by0, 1)
+            top_scale = min(right_area_w / model_w, right_area_h / model_h) * 0.80
+            top_off_x = right_area_x + right_area_w / 2 - (bx0 + bx1) / 2 * top_scale
+            top_off_y = right_area_y + right_area_h / 2 - (by0 + by1) / 2 * top_scale
 
-        if plan_result:
-            # 軌道端點跨距尺寸（垂直）
-            m2d = plan_result['m2d']
-            p1_d = m2d(*plan_result['plan_p1'])
-            p2_d = m2d(*plan_result['plan_p2'])
+            for pl in top_polylines:
+                dxf_pts = [(p[0] * top_scale + top_off_x,
+                            p[1] * top_scale + top_off_y) for p in pl]
+                if len(dxf_pts) >= 2:
+                    msp.add_lwpolyline(dxf_pts)
+
+            # 投影 3D→2D：top-down view (main=(0,0,-1), x=(1,0,0))
+            # HLR Y 方向 = cross(main, x) = (0,-1,0) → projected_y = -model_y
+            def _project_top(pt3d):
+                return (pt3d[0], -pt3d[1])
+
+            # 軌道端點跨距尺寸（自動偵測方向）
+            top_a = _project_top(pt_a)
+            top_b = _project_top(pt_b)
+            dim_top_a = (top_a[0] * top_scale + top_off_x,
+                         top_a[1] * top_scale + top_off_y)
+            dim_top_b = (top_b[0] * top_scale + top_off_x,
+                         top_b[1] * top_scale + top_off_y)
             dim_text_v = f"{track_span_xy:.1f}"
-            self._draw_dimension_line(msp, p1_d, p2_d, -12, dim_text_v, vertical=True)
+            dx_dim = abs(dim_top_a[0] - dim_top_b[0])
+            dy_dim = abs(dim_top_a[1] - dim_top_b[1])
+            if dy_dim > dx_dim:
+                # 端點主要垂直分佈 → 垂直尺寸
+                self._draw_dimension_line(msp, dim_top_a, dim_top_b,
+                                          -12, dim_text_v, vertical=True)
+            else:
+                # 端點主要水平分佈 → 水平尺寸
+                self._draw_dimension_line(msp, dim_top_a, dim_top_b,
+                                          -8, dim_text_v, vertical=False)
+
+            # R 弧半徑標註（引線）
+            # 計算弧心（與 _draw_top_plan_view 相同幾何邏輯）
+            arc_pipe = None
+            for tp in track_pipes:
+                for seg in tp.get('segments', []):
+                    if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                        arc_pipe = tp
+                        break
+                if arc_pipe:
+                    break
+
+            if arc_pipe and arc_radius > 1:
+                sp_3d = arc_pipe.get('start_point', (0, 0, 0))
+                ep_3d = arc_pipe.get('end_point', (0, 0, 0))
+                p1x, p1y = sp_3d[0], sp_3d[1]
+                p2x, p2y = ep_3d[0], ep_3d[1]
+                dx_ch = p2x - p1x
+                dy_ch = p2y - p1y
+                chord_xy = math.sqrt(dx_ch**2 + dy_ch**2)
+                if chord_xy > 1e-6:
+                    mid_x = (p1x + p2x) / 2
+                    mid_y = (p1y + p2y) / 2
+                    half_c = chord_xy / 2
+                    h_perp = math.sqrt(max(arc_radius**2 - half_c**2, 0)) \
+                        if arc_radius >= half_c else 0
+                    nx_ch = -dy_ch / chord_xy
+                    ny_ch = dx_ch / chord_xy
+                    if bend_direction == 'left':
+                        acx = mid_x + h_perp * nx_ch
+                        acy = mid_y + h_perp * ny_ch
+                    else:
+                        acx = mid_x - h_perp * nx_ch
+                        acy = mid_y - h_perp * ny_ch
+
+                    # 選取弧線 70% 位置的角度作為標註點
+                    sa = math.degrees(math.atan2(p1y - acy, p1x - acx))
+                    ea = math.degrees(math.atan2(p2y - acy, p2x - acx))
+                    ccw = (ea - sa) % 360
+                    if ccw < 1:
+                        ccw = 360
+                    r_angle = math.radians(sa + ccw * 0.7)
+
+                    # 弧上取標註點 → 投影到 top-down → 紙面座標
+                    r_model = (acx + arc_radius * math.cos(r_angle),
+                               acy + arc_radius * math.sin(r_angle))
+                    r_proj = _project_top((r_model[0], r_model[1], 0))
+                    r_paper = (r_proj[0] * top_scale + top_off_x,
+                               r_proj[1] * top_scale + top_off_y)
+
+                    # 引線方向（從弧面徑向外推）
+                    r_dir_x = math.cos(r_angle)
+                    r_dir_y = -math.sin(r_angle)  # 對應 flip: -model_y
+                    r_ext = 15
+                    r_tip = (r_paper[0] + r_dir_x * r_ext,
+                             r_paper[1] + r_dir_y * r_ext)
+                    msp.add_line(r_paper, r_tip)
+                    msp.add_text(f"R{arc_radius:.0f}", dxfattribs={
+                        'height': 4.0}).set_placement((r_tip[0] + 2, r_tip[1]))
 
         # 儲存
         path0 = os.path.join(output_dir, f"{base_name}-0.dxf")
