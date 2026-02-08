@@ -4148,7 +4148,7 @@ Solid 名稱: {solid_name}
         dim_x = ext_left - 40  # 尺寸線位置（圖左邊外側）
 
         # --- R260 標註：引線 + 文字 ---
-        text_height = 15
+        text_height = 30
         angle = math.radians(30)
         # 引線起點：弧面上 30° 位置（用外徑）
         arc_pt = (arc_cx + (r_center + 12) * math.cos(angle),
@@ -4186,7 +4186,7 @@ Solid 名稱: {solid_name}
         # 文字（旋轉 90 度）
         text_y = (bar_y + arc_bottom_y) / 2
         msp.add_text(f"{height:.1f}", dxfattribs={
-            'height': 12,
+            'height': 24,
             'insert': (dim_x - 18, text_y),
             'rotation': 90,
         })
@@ -4241,7 +4241,7 @@ Solid 名稱: {solid_name}
             if p1[1] < p2[1]:
                 p1, p2 = p2, p1
 
-        text_height = 15
+        text_height = 30
 
         # --- 斜向尺寸線 ---
         dx = p2[0] - p1[0]
@@ -4529,7 +4529,7 @@ Solid 名稱: {solid_name}
             today = datetime.now().strftime("%Y-%m-%d")
 
             # 添加文字 (使用 add_text)
-            text_height = 4
+            text_height = 8
             msp.add_text(f"圖名: {product_name}", dxfattribs={'height': text_height * 1.5}).set_placement(
                 (title_x + 10, title_y + 45))
             msp.add_text(f"檔案: {file_name}", dxfattribs={'height': text_height}).set_placement(
@@ -4827,7 +4827,7 @@ Solid 名稱: {solid_name}
                         version, quantity
         """
         margin = 10
-        scale_factor = 0.5  # 縮小至 50%
+        scale_factor = 1.0  # 標準大小
         th = 3.0 * scale_factor  # 基準文字高度縮小
 
         # 標題欄區域：移除原第一欄(85)後寬度 = 275
@@ -4946,9 +4946,9 @@ Solid 名稱: {solid_name}
         x, y: 表格左上角座標
         Returns: 表格底部 y 座標
         """
-        th = 3.0
-        row_h = 8
-        col_widths = [25, 35, 25, 60]  # 球號, 品名, 數量, 備註
+        th = 6.0
+        row_h = 14
+        col_widths = [30, 45, 30, 80]  # 球號, 品名, 數量, 備註
         table_w = sum(col_widths)
 
         # 表頭
@@ -4999,9 +4999,9 @@ Solid 名稱: {solid_name}
         x, y: 表格左上角座標
         Returns: 表格底部 y 座標
         """
-        th = 3.0
-        row_h = 7
-        col_widths = [25, 135]  # 球號, 取料尺寸
+        th = 6.0
+        row_h = 12
+        col_widths = [35, 185]  # 球號, 取料尺寸
         table_w = sum(col_widths)
 
         # 標題
@@ -5059,7 +5059,7 @@ Solid 名稱: {solid_name}
         """在右上角繪製大字圖號"""
         margin = 10
         msp.add_text(number, dxfattribs={
-            'height': 18,
+            'height': 36,
         }).set_placement((pw - margin - 100, ph - margin - 30))
 
     def _draw_dimension_line(self, msp, p1, p2, offset, text, vertical=False):
@@ -5070,7 +5070,7 @@ Solid 名稱: {solid_name}
         text: 尺寸文字
         vertical: True 表示垂直尺寸
         """
-        th = 3.0
+        th = 6.0
         if vertical:
             # 垂直尺寸
             dim_x = p1[0] + offset
@@ -5082,7 +5082,7 @@ Solid 名稱: {solid_name}
             # 尺寸線
             msp.add_line((dim_x, y1), (dim_x, y2))
             # 箭頭
-            arrow_l = min(2.5, (y2 - y1) * 0.08)
+            arrow_l = min(5.0, (y2 - y1) * 0.08)
             msp.add_line((dim_x, y1), (dim_x - 1, y1 + arrow_l))
             msp.add_line((dim_x, y1), (dim_x + 1, y1 + arrow_l))
             msp.add_line((dim_x, y2), (dim_x - 1, y2 - arrow_l))
@@ -5102,7 +5102,7 @@ Solid 名稱: {solid_name}
             # 尺寸線
             msp.add_line((x1, dim_y), (x2, dim_y))
             # 箭頭
-            arrow_l = min(2.5, (x2 - x1) * 0.08)
+            arrow_l = min(5.0, (x2 - x1) * 0.08)
             msp.add_line((x1, dim_y), (x1 + arrow_l, dim_y + 1))
             msp.add_line((x1, dim_y), (x1 + arrow_l, dim_y - 1))
             msp.add_line((x2, dim_y), (x2 - arrow_l, dim_y + 1))
@@ -5113,7 +5113,7 @@ Solid 名稱: {solid_name}
 
     def _draw_angle_arc(self, msp, center, r, start_deg, end_deg, text):
         """繪製角度標註弧線 + 文字"""
-        th = 3.0
+        th = 6.0
         # 繪製弧線
         msp.add_arc(center, r, start_deg, end_deg)
         # 文字放在弧線中間
@@ -5130,7 +5130,7 @@ Solid 名稱: {solid_name}
         offset: 尺寸線距離主線的法向偏移量（正=左側 when looking from p1 to p2）
         text: 尺寸文字
         """
-        th = 3.0
+        th = 6.0
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         seg_len = math.sqrt(dx**2 + dy**2)
@@ -5153,7 +5153,7 @@ Solid 名稱: {solid_name}
         msp.add_line(d1, d2)
 
         # 箭頭
-        arrow_l = min(2.5, seg_len * 0.08)
+        arrow_l = min(5.0, seg_len * 0.08)
         # 沿方向的箭頭偏移
         aw = 1.0  # 箭頭半寬（沿法線方向）
         msp.add_line(d1, (d1[0] + ux * arrow_l + nx * aw, d1[1] + uy * arrow_l + ny * aw))
@@ -5176,7 +5176,7 @@ Solid 名稱: {solid_name}
 
     def _draw_pipe_cross_section(self, msp, cx, cy, r_outer, label=None):
         """繪製管截面（雙圓 + 中心線）"""
-        th = 3.0
+        th = 6.0
         r_inner = r_outer * 0.75
         msp.add_circle((cx, cy), r_outer)
         msp.add_circle((cx, cy), r_inner)
@@ -5341,23 +5341,35 @@ Solid 名稱: {solid_name}
                         arc_cy + (R_arc - pipe_r) * math.sin(ea_rad))
             msp.add_line(p_out, p_in)
 
-        # 支撐架標記（徑向線 + 兩端小圓圈）
+        # 支撐架標記（X-marks at track intersections + connecting line + circles）
         if bracket_count > 0:
             circle_r = 1.2
-            extension = pipe_r * 0.5
+            x_sz = 1.5  # X-mark half size
             for bi in range(bracket_count):
                 bt = (bi + 0.5) / bracket_count
                 ba = math.radians(plan_sa_deg + bt * plan_span_deg)
                 cos_ba, sin_ba = math.cos(ba), math.sin(ba)
-                # 徑向線從外到內穿越管壁
-                r_out = R_arc + pipe_r + extension
-                r_in = R_arc - pipe_r - extension
-                p_out = _m2d(arc_cx + r_out * cos_ba, arc_cy + r_out * sin_ba)
-                p_in = _m2d(arc_cx + r_in * cos_ba, arc_cy + r_in * sin_ba)
-                msp.add_line(p_out, p_in)
-                # 兩端小圓圈（代表支撐架管截面）
-                msp.add_circle(p_out, circle_r)
-                msp.add_circle(p_in, circle_r)
+                # Upper track intersection point (outer pipe wall)
+                u_pt = _m2d(arc_cx + (R_arc + pipe_r) * cos_ba,
+                            arc_cy + (R_arc + pipe_r) * sin_ba)
+                # Lower track intersection point (inner pipe wall)
+                l_pt = _m2d(arc_cx + (R_arc - pipe_r) * cos_ba,
+                            arc_cy + (R_arc - pipe_r) * sin_ba)
+                # Connecting line (bracket body)
+                msp.add_line(u_pt, l_pt)
+                # X marks at upper intersection
+                msp.add_line((u_pt[0] - x_sz, u_pt[1] - x_sz),
+                             (u_pt[0] + x_sz, u_pt[1] + x_sz))
+                msp.add_line((u_pt[0] - x_sz, u_pt[1] + x_sz),
+                             (u_pt[0] + x_sz, u_pt[1] - x_sz))
+                # X marks at lower intersection
+                msp.add_line((l_pt[0] - x_sz, l_pt[1] - x_sz),
+                             (l_pt[0] + x_sz, l_pt[1] + x_sz))
+                msp.add_line((l_pt[0] - x_sz, l_pt[1] + x_sz),
+                             (l_pt[0] + x_sz, l_pt[1] - x_sz))
+                # Circles at ends
+                msp.add_circle(u_pt, circle_r)
+                msp.add_circle(l_pt, circle_r)
 
         # R 尺寸標註（帶徑向引線）
         r_label_angle = math.radians(plan_sa_deg + plan_span_deg * 0.7)
@@ -5370,7 +5382,7 @@ Solid 名稱: {solid_name}
                  r_arc_pt[1] + r_dir_y * r_ext)
         msp.add_line(r_arc_pt, r_tip)
         msp.add_text(f"R{arc_radius:.0f}", dxfattribs={
-            'height': 4.0}).set_placement((r_tip[0] + 2, r_tip[1]))
+            'height': 8.0}).set_placement((r_tip[0] + 2, r_tip[1]))
 
         return {
             'scale': view_scale,
@@ -5723,7 +5735,7 @@ Solid 名稱: {solid_name}
                              r_paper[1] + r_dir_y * r_ext)
                     msp.add_line(r_paper, r_tip)
                     msp.add_text(f"R{arc_radius:.0f}", dxfattribs={
-                        'height': 4.0}).set_placement((r_tip[0] + 2, r_tip[1]))
+                        'height': 8.0}).set_placement((r_tip[0] + 2, r_tip[1]))
 
         # 儲存
         path0 = os.path.join(output_dir, f"{base_name}-0.dxf")
@@ -5757,8 +5769,8 @@ Solid 名稱: {solid_name}
         PW, PH = 420, 297
         MARGIN = 10
 
-        # 前視圖：x_dir=1 軌道從左向右延伸
-        x_dir = 1  # 1=前視圖（軌道從左向右延伸）
+        # 側視圖：x_dir=-1 軌道從右向左延伸（匹配標準圖方向）
+        x_dir = -1  # -1=鏡像（軌道從右向左延伸）
 
 
         doc = ezdxf.new(dxfversion='R2010')
@@ -5794,7 +5806,7 @@ Solid 名稱: {solid_name}
 
         # ---- 取料明細表（右上）----
         if section_cutting_list:
-            self._draw_cutting_list_table(msp, PW - MARGIN - 160,
+            self._draw_cutting_list_table(msp, PW - MARGIN - 220,
                                           PH - MARGIN - 30, section_cutting_list)
 
         # ---- BOM 表 ----
@@ -5806,10 +5818,10 @@ Solid 名稱: {solid_name}
                 'remark': f"線長L={ll:.0f}"
             })
         if bom_items:
-            bom_x = PW - MARGIN - 155
+            bom_x = PW - MARGIN - 190
             # BOM below cutting list
             cl_rows = len(section_cutting_list) if section_cutting_list else 0
-            bom_y = PH - MARGIN - 30 - cl_rows * 7 - 30
+            bom_y = PH - MARGIN - 30 - cl_rows * 12 - 30
             self._draw_bom_table(msp, bom_x, bom_y, bom_items)
 
         # ---- 側視圖（基於 cutting list 完整路徑繪製）----
@@ -5998,7 +6010,21 @@ Solid 名稱: {solid_name}
                             dim_side * x_dir * (pipe_hw + 8),
                             f"{seg_len:.1f}")
 
-                    # 球號已在取料明細表中呈現，不在軌道段上重複標示
+                    # 球號標註（段中點，垂直偏移）
+                    if label and draw_len > 5:
+                        mid_sx = (sx + ex) / 2
+                        mid_sy = (sy + ey) / 2
+                        label_offset = dim_side * x_dir * (pipe_hw + 18)
+                        seg_d_lbl = math.sqrt(dx**2 + dy**2)
+                        if seg_d_lbl > 1e-6:
+                            lbl_nx = -dy / seg_d_lbl
+                            lbl_ny = dx / seg_d_lbl
+                        else:
+                            lbl_nx, lbl_ny = 0, 1
+                        msp.add_text(str(label), dxfattribs={
+                            'height': 5.0
+                        }).set_placement((mid_sx + lbl_nx * label_offset,
+                                          mid_sy + lbl_ny * label_offset))
 
                     # 垂直分量：只在段末端畫輔助線（不加文字標註，避免重疊）
                     vert_comp = abs(seg_len * math.sin(rad))
@@ -6036,7 +6062,7 @@ Solid 名稱: {solid_name}
                         txt_x = cx + txt_r * math.cos(mid_arc_rad)
                         txt_y = cy + txt_r * math.sin(mid_arc_rad)
                         msp.add_text(f"{bend_deg:.0f}°", dxfattribs={
-                            'height': 2.5
+                            'height': 5.0
                         }).set_placement((txt_x, txt_y))
 
                         # === 高低角度標註：從垂直線量測的仰角（只在上軌繪製） ===
@@ -6057,7 +6083,7 @@ Solid 名稱: {solid_name}
                                 e_rad = math.radians(e_mid)
                                 e_txt_r = elev_arc_r + 5
                                 msp.add_text(f"{abs(pre_complement):.0f}°", dxfattribs={
-                                    'height': 2.5
+                                    'height': 5.0
                                 }).set_placement((cx + e_txt_r * math.cos(e_rad),
                                                   cy + e_txt_r * math.sin(e_rad)))
 
@@ -6073,7 +6099,7 @@ Solid 名稱: {solid_name}
                                 e_rad2 = math.radians(e_mid2)
                                 e_txt_r2 = elev_arc_r + 5
                                 msp.add_text(f"{abs(post_complement):.0f}°", dxfattribs={
-                                    'height': 2.5
+                                    'height': 5.0
                                 }).set_placement((cx + e_txt_r2 * math.cos(e_rad2),
                                                   cy + e_txt_r2 * math.sin(e_rad2)))
 
@@ -6082,7 +6108,13 @@ Solid 名稱: {solid_name}
                             msp.add_line((cx, cy), (cx, cy + ref_len),
                                          dxfattribs={'color': 8})
 
-                    # 彎曲段球號已在取料明細表中呈現，不在軌道上重複標示
+                    # 彎曲段球號標註（在轉折點旁）
+                    arc_label = item.get('label', '')
+                    if arc_label:
+                        arc_lbl_offset = dim_side * x_dir * (pipe_hw + 25)
+                        msp.add_text(str(arc_label), dxfattribs={
+                            'height': 5.0
+                        }).set_placement((cx + arc_lbl_offset * 0.5, cy + abs(arc_lbl_offset) * 0.8))
 
             # 端蓋
             if seg_positions:
@@ -6124,7 +6156,7 @@ Solid 名稱: {solid_name}
                          dxfattribs={'color': 8})
             # 標註仰角（從垂直線量測的角度）
             msp.add_text(f"{abs(complement0):.0f}°", dxfattribs={
-                'height': 2.5
+                'height': 5.0
             }).set_placement((ref_x + x_dir * 3, sp0[1] + 8))
 
         # ========== 管徑標註 ==========
@@ -6133,7 +6165,7 @@ Solid 名稱: {solid_name}
             mid_x = (sp0[0] + sp0[2]) / 2
             mid_y = (sp0[1] + sp0[3]) / 2
             msp.add_text(f"\u00D8{pipe_diameter:.1f}", dxfattribs={
-                'height': 2.5
+                'height': 5.0
             }).set_placement((mid_x + x_dir * 5, mid_y + pipe_hw + 5))
 
         # ========== 軌道間距（起始端垂直標註）==========
@@ -6358,7 +6390,7 @@ Solid 名稱: {solid_name}
             balloon_r = 5
             msp.add_circle((balloon_x, balloon_y), balloon_r)
             msp.add_text(f"{li + 1}", dxfattribs={
-                'height': 4.0
+                'height': 8.0
             }).set_placement((balloon_x - 2, balloon_y - 2))
             msp.add_line((balloon_x - balloon_r, balloon_y),
                          (leg_foot[0] + 2, leg_foot[1]))
@@ -6367,7 +6399,7 @@ Solid 名稱: {solid_name}
         if pipe_diameter > 0 and upper_seg_positions:
             ep = upper_seg_positions[-1]
             msp.add_text(f"\u00D8{pipe_diameter:.1f}", dxfattribs={
-                'height': 2.5
+                'height': 5.0
             }).set_placement((ep[2] + 5, ep[3] + pipe_hw + 2))
 
         # ===== 整體尺寸：上軌總展開長 =====
@@ -7066,7 +7098,7 @@ Solid 名稱: {solid_name}
                 })
                 item_idx += 1
 
-            cl_table_x = PW - MARGIN - 160
+            cl_table_x = PW - MARGIN - 220
             cl_table_y = PH - MARGIN - 30
             cl_bottom_y = cl_table_y
             if cl_items_for_d2:
@@ -7076,7 +7108,7 @@ Solid 名稱: {solid_name}
             # ================================================================
             # 長度 + 仰角標註 — 軌道取料明細表下方
             # ================================================================
-            big_text_h = 8
+            big_text_h = 16
             big_text_x = cl_table_x
             big_text_y = cl_bottom_y - 15
             msp2.add_text(f"長度{arc_total_length:.0f}", dxfattribs={
@@ -7099,8 +7131,8 @@ Solid 名稱: {solid_name}
                 })
 
             if bom2_items:
-                bom2_x = PW - MARGIN - 155
-                bom2_y = big_text_y - 12
+                bom2_x = PW - MARGIN - 190
+                bom2_y = big_text_y - 24
                 self._draw_bom_table(msp2, bom2_x, bom2_y, bom2_items)
 
             # 儲存
