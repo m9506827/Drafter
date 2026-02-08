@@ -6958,10 +6958,10 @@ Solid 名稱: {solid_name}
             lower_area_w = PW * 0.52
             lower_area_h = upper_area_y - lower_area_y - 10
 
-            # YZ 平面正視圖（沿 X 軸方向觀看）
+            # XZ 平面投影（沿 Y 軸方向觀看，水平=X, 垂直=Z）
             def _proj_lf(x, y, z):
-                """3D → YZ 平面正視圖投影（水平=Y, 垂直=Z）"""
-                return (y, z)
+                """3D → XZ 平面正視圖投影（水平=X, 垂直=Z）"""
+                return (x, z)
 
             # 取樣 3D 弧線點
             n_samp = 80
