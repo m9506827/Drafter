@@ -5737,8 +5737,8 @@ Solid 名稱: {solid_name}
 
     def _draw_straight_section_sheet(self, section, section_bends,
                                      section_cutting_list, section_legs,
-                                     leg_angles_map, pipe_diameter,
-                                     rail_spacing, base_name, drawing_number,
+                                     leg_angles_map,
+                                     base_name, drawing_number,
                                      project, today, tb_override=None,
                                      stp_data=None):
         """
@@ -5749,6 +5749,10 @@ Solid 名稱: {solid_name}
         Returns: ezdxf Document
         """
         import re as _re
+
+        # 從 stp_data 讀取管徑與軌距
+        pipe_diameter = stp_data['pipe_diameter'] if stp_data else 0
+        rail_spacing = stp_data['rail_spacing'] if stp_data else 0
 
         PW, PH = 420, 297
         MARGIN = 10
@@ -5813,8 +5817,8 @@ Solid 名稱: {solid_name}
         upper_tracks = section.get('upper_tracks', [])
         lower_tracks = section.get('lower_tracks', [])
 
-        # 軌道仰角查表（從 stp_data.track_elev_map 讀取，不再重複計算）
-        elev_map = getattr(self, '_stp_track_elev_map', {})
+        # 軌道仰角查表（從 stp_data.track_elev_map 讀取）
+        elev_map = stp_data['track_elev_map'] if stp_data else {}
 
         # 取得上下軌的基礎仰角（從 stp_data 查表）
         upper_base_elev = 0
@@ -5831,9 +5835,9 @@ Solid 名稱: {solid_name}
                 break
         # 若查表無值，使用 stp_data 的全域仰角
         if upper_base_elev == 0:
-            upper_base_elev = getattr(self, '_stp_elevation_deg', 0)
+            upper_base_elev = stp_data['elevation_deg'] if stp_data else 0
         if lower_base_elev == 0:
-            lower_base_elev = getattr(self, '_stp_elevation_deg', 0)
+            lower_base_elev = stp_data['elevation_deg'] if stp_data else 0
 
         # 從 cutting list 分離上軌和下軌的 items
         upper_cl = [it for it in section_cutting_list if str(it.get('item', '')).startswith('U')]
@@ -6586,14 +6590,14 @@ Solid 名稱: {solid_name}
         pipe_diameter = stp_data['pipe_diameter']
         rail_spacing = stp_data['rail_spacing']
 
-        log_print(f"[stp_data] pipe_d={pipe_diameter:.1f}, rail_sp={rail_spacing:.1f}, "
-                  f"arc_R={_arc_radius:.0f}, arc_angle={_arc_angle_deg:.1f}°, "
-                  f"arc_h_gain={_arc_height_gain:.1f}, elev={_elevation_deg:.1f}°, "
-                  f"chord={_chord_length:.0f}, bracket={_bracket_count}, "
-                  f"bend_dir={bend_direction}, "
-                  f"upper_bend_r={_upper_bend_r:.0f}, lower_bend_r={_lower_bend_r:.0f}")
-        if _rail_spacing < 10:
-            log_print(f"  [Warning] rail_spacing={_rail_spacing:.1f} 偏小，請確認模型", "warning")
+        log_print(f"[stp_data] pipe_d={stp_data['pipe_diameter']:.1f}, rail_sp={stp_data['rail_spacing']:.1f}, "
+                  f"arc_R={stp_data['arc_radius']:.0f}, arc_angle={stp_data['arc_angle_deg']:.1f}°, "
+                  f"arc_h_gain={stp_data['arc_height_gain']:.1f}, elev={stp_data['elevation_deg']:.1f}°, "
+                  f"chord={stp_data['chord_length']:.0f}, bracket={stp_data['bracket_count']}, "
+                  f"bend_dir={stp_data['bend_direction']}, "
+                  f"upper_bend_r={stp_data['upper_bend_r']:.0f}, lower_bend_r={stp_data['lower_bend_r']:.0f}")
+        if stp_data['rail_spacing'] < 10:
+            log_print(f"  [Warning] rail_spacing={stp_data['rail_spacing']:.1f} 偏小，請確認模型", "warning")
 
         # 分離上軌/下軌
         upper_items = [t for t in stp_data['track_items'] if str(t.get('item', '')).startswith('U')]
@@ -6632,9 +6636,6 @@ Solid 名稱: {solid_name}
 
             # 使用 stp_data 的仰角查表
             track_elev_by_id = stp_data['track_elev_map']
-            # 設定到 self 供 _draw_straight_section_sheet 使用
-            self._stp_track_elev_map = stp_data['track_elev_map']
-            self._stp_elevation_deg = stp_data['elevation_deg']
 
             # 收集所有 track 的 centroid + elevation
             track_centroids = []
@@ -6695,7 +6696,7 @@ Solid 名稱: {solid_name}
 
                 doc1 = self._draw_straight_section_sheet(
                     section, section_bends, section_cl, section_legs,
-                    leg_angles_map, pipe_diameter, rail_spacing,
+                    leg_angles_map,
                     base_name, drawing_number, project, today,
                     stp_data=stp_data)
             else:
@@ -6704,7 +6705,7 @@ Solid 名稱: {solid_name}
                 doc1 = self._draw_straight_section_sheet(
                     {'section_type': 'straight', 'upper_tracks': [], 'lower_tracks': []},
                     [], stp_data['track_items'], stp_data['leg_items'],
-                    leg_angles_map, pipe_diameter, rail_spacing,
+                    leg_angles_map,
                     base_name, f"{base_name}-1", project, today,
                     stp_data=stp_data)
 
@@ -7171,7 +7172,7 @@ Solid 名稱: {solid_name}
             # 使用 Drawing 1 的繪圖函數，傳入 section3 的資料
             doc3 = self._draw_straight_section_sheet(
                 section3, section3_bends, section3_cl, section3_legs,
-                leg_angles_map, pipe_diameter, rail_spacing,
+                leg_angles_map,
                 base_name, f"{base_name}-3", project, today,
                 tb_override={
                     'company': 'iDrafter股份有限公司',
