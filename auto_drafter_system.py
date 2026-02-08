@@ -5279,6 +5279,283 @@ Solid 名稱: {solid_name}
         return polylines, bbox
 
     # ====================================================================
+    # Drawing 0: 總施工圖 (Overview Assembly Drawing)
+    # ====================================================================
+
+    def generate_overview_drawing(self, output_dir, base_name, stp_data, project, today):
+        """
+        生成總施工圖 (Drawing 0) — 等角視圖 + 俯視圖
+        左半：等角投影 HLR 視圖 + 軌道端點間距尺寸
+        右半：俯視投影 HLR 視圖 + 垂直跨距尺寸 + R 弧半徑標註
+
+        Args:
+            output_dir: 輸出目錄
+            base_name: 檔案基本名稱（如 "2-2"）
+            stp_data: 所有繪圖數值的結構
+            project: 專案名稱
+            today: 日期字串
+
+        Returns:
+            輸出 DXF 檔案路徑，失敗返回 None
+        """
+        PW, PH = 420, 297
+        MARGIN = 10
+
+        doc = ezdxf.new(dxfversion='R2010')
+        msp = doc.modelspace()
+
+        # 圖框
+        msp.add_lwpolyline([(0, 0), (PW, 0), (PW, PH), (0, PH), (0, 0)])
+        msp.add_lwpolyline([
+            (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
+            (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
+
+        # 標題欄
+        tb_info = {
+            'company': '羅布森股份有限公司',
+            'project': project,
+            'drawing_name': '彎軌軌道總圖',
+            'drawer': 'Drafter',
+            'date': today,
+            'units': 'mm',
+            'scale': '1:10',
+            'material': 'STK-400',
+            'finish': '裁切及焊接',
+            'drawing_number': base_name,
+            'version': '01',
+            'quantity': '1',
+        }
+        self._draw_title_block(msp, PW, PH, tb_info)
+
+        # 圖號（右上角大字 — 只顯示 base_name，如 "2-2"）
+        self._draw_drawing_number(msp, PW, PH, base_name)
+
+        # ==== 從 stp_data 計算軌道端點數據 ====
+        pipe_centerlines = stp_data['pipe_centerlines']
+        part_classifications = stp_data['part_classifications']
+        arc_radius = stp_data['arc_radius']
+        bend_direction = stp_data['bend_direction']
+
+        class_map = {c['feature_id']: c for c in part_classifications}
+        track_pipes = [pc for pc in pipe_centerlines
+                       if class_map.get(pc['solid_id'], {}).get('class') == 'track']
+
+        # 收集所有 track pipe 端點
+        all_endpoints = []
+        for tp in track_pipes:
+            sp = tp.get('start_point', (0, 0, 0))
+            ep = tp.get('end_point', (0, 0, 0))
+            all_endpoints.append(sp)
+            all_endpoints.append(ep)
+
+        if len(all_endpoints) < 2:
+            log_print("  [Warning] 端點不足，無法生成 Drawing 0", "warning")
+            return None
+
+        # 找兩個最遠 3D 端點
+        max_dist = 0
+        pt_a, pt_b = all_endpoints[0], all_endpoints[1]
+        for i in range(len(all_endpoints)):
+            for j in range(i + 1, len(all_endpoints)):
+                pi, pj = all_endpoints[i], all_endpoints[j]
+                d = math.sqrt((pi[0] - pj[0])**2 + (pi[1] - pj[1])**2 + (pi[2] - pj[2])**2)
+                if d > max_dist:
+                    max_dist = d
+                    pt_a, pt_b = pi, pj
+
+        track_endpoint_length = max_dist  # 3D 距離（如 1092.4）
+        track_span_xy = math.sqrt((pt_a[0] - pt_b[0])**2 + (pt_a[1] - pt_b[1])**2)  # XY 投影距離（如 548.1）
+
+        log_print(f"  [Drawing 0] track_endpoint_length={track_endpoint_length:.1f}, "
+                  f"track_span_xy={track_span_xy:.1f}, arc_R={arc_radius:.0f}")
+
+        # ==== 3D → 2D 投影輔助函數 ====
+        # 等角投影方向（從右前上方觀看）
+        iso_main = (1, 1, 1)  # 視線方向
+        iso_x = (1, 0, -1)    # 水平軸
+        # 正規化
+        iso_main_len = math.sqrt(sum(c**2 for c in iso_main))
+        iso_main_n = tuple(c / iso_main_len for c in iso_main)
+        iso_x_len = math.sqrt(sum(c**2 for c in iso_x))
+        iso_x_n = tuple(c / iso_x_len for c in iso_x)
+        # y_dir = cross(main, x)
+        iso_y_n = (
+            iso_main_n[1] * iso_x_n[2] - iso_main_n[2] * iso_x_n[1],
+            iso_main_n[2] * iso_x_n[0] - iso_main_n[0] * iso_x_n[2],
+            iso_main_n[0] * iso_x_n[1] - iso_main_n[1] * iso_x_n[0],
+        )
+
+        def project_iso(pt):
+            """3D 點 → 等角投影 2D"""
+            return (
+                sum(pt[i] * iso_x_n[i] for i in range(3)),
+                sum(pt[i] * iso_y_n[i] for i in range(3)),
+            )
+
+        # 俯視投影方向（從上往下看）
+        top_main = (0, -1, 0)  # Y-down 視線（Y-up 模型，從上往下看）
+        top_x = (1, 0, 0)      # 水平軸 = X
+        # y_dir for top = cross(main, x) = (0,-1,0) x (1,0,0) = (0,0,1)
+
+        def project_top(pt):
+            """3D 點 → 俯視投影 2D"""
+            return (pt[0], pt[2])
+
+        # ==== 左半：等角 HLR 視圖 ====
+        iso_polylines, iso_bbox = self._hlr_project_to_polylines(iso_main, iso_x)
+
+        # 繪圖區域（左半頁面）
+        left_area_x = MARGIN + 5
+        left_area_y = MARGIN + 40   # 留空給標題欄
+        left_area_w = PW * 0.45
+        left_area_h = PH - MARGIN - 40 - left_area_y
+
+        if iso_polylines:
+            bx0, by0, bx1, by1 = iso_bbox
+            model_w = max(bx1 - bx0, 1)
+            model_h = max(by1 - by0, 1)
+            iso_scale = min(left_area_w / model_w, left_area_h / model_h) * 0.80
+            iso_off_x = left_area_x + left_area_w / 2 - (bx0 + bx1) / 2 * iso_scale
+            iso_off_y = left_area_y + left_area_h / 2 - (by0 + by1) / 2 * iso_scale
+
+            for pl in iso_polylines:
+                dxf_pts = [(p[0] * iso_scale + iso_off_x, p[1] * iso_scale + iso_off_y) for p in pl]
+                if len(dxf_pts) >= 2:
+                    msp.add_lwpolyline(dxf_pts)
+
+            # 投影兩個極端端點到等角視圖
+            iso_a = project_iso(pt_a)
+            iso_b = project_iso(pt_b)
+            dim_a = (iso_a[0] * iso_scale + iso_off_x, iso_a[1] * iso_scale + iso_off_y)
+            dim_b = (iso_b[0] * iso_scale + iso_off_x, iso_b[1] * iso_scale + iso_off_y)
+
+            # 繪製斜向尺寸線
+            dim_text = f"{track_endpoint_length:.1f}"
+            self._draw_dimension_line_along(msp, dim_a, dim_b, -8, dim_text)
+
+        # ==== 右半：俯視 HLR 視圖 ====
+        top_polylines, top_bbox = self._hlr_project_to_polylines(top_main, top_x)
+
+        right_area_x = PW * 0.50 + 5
+        right_area_y = MARGIN + 40
+        right_area_w = PW * 0.45
+        right_area_h = PH - MARGIN - 40 - right_area_y
+
+        if top_polylines:
+            bx0, by0, bx1, by1 = top_bbox
+            model_w = max(bx1 - bx0, 1)
+            model_h = max(by1 - by0, 1)
+            top_scale = min(right_area_w / model_w, right_area_h / model_h) * 0.80
+            top_off_x = right_area_x + right_area_w / 2 - (bx0 + bx1) / 2 * top_scale
+            top_off_y = right_area_y + right_area_h / 2 - (by0 + by1) / 2 * top_scale
+
+            for pl in top_polylines:
+                dxf_pts = [(p[0] * top_scale + top_off_x, p[1] * top_scale + top_off_y) for p in pl]
+                if len(dxf_pts) >= 2:
+                    msp.add_lwpolyline(dxf_pts)
+
+            # 投影兩個極端端點到俯視圖
+            top_a = project_top(pt_a)
+            top_b = project_top(pt_b)
+            dim_top_a = (top_a[0] * top_scale + top_off_x, top_a[1] * top_scale + top_off_y)
+            dim_top_b = (top_b[0] * top_scale + top_off_x, top_b[1] * top_scale + top_off_y)
+
+            # 垂直跨距尺寸線（左側）
+            dim_text_v = f"{track_span_xy:.1f}"
+            self._draw_dimension_line(msp, dim_top_a, dim_top_b, -12, dim_text_v, vertical=True)
+
+            # ==== R 弧半徑標註（leader line） ====
+            if arc_radius > 0:
+                # 計算弧心（與 Drawing 2 相同的幾何邏輯）
+                # 從 track pipe 端點找弧管
+                arc_pipe = None
+                for tp in track_pipes:
+                    for seg in tp.get('segments', []):
+                        if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                            arc_pipe = tp
+                            break
+                    if arc_pipe:
+                        break
+
+                if arc_pipe:
+                    sp_3d = arc_pipe.get('start_point', (0, 0, 0))
+                    ep_3d = arc_pipe.get('end_point', (0, 0, 0))
+
+                    # XY 平面弦
+                    p1x, p1y = sp_3d[0], sp_3d[1]
+                    p2x, p2y = ep_3d[0], ep_3d[1]
+                    dx_ch = p2x - p1x
+                    dy_ch = p2y - p1y
+                    chord_xy = math.sqrt(dx_ch**2 + dy_ch**2)
+
+                    if chord_xy > 1e-6:
+                        mid_x = (p1x + p2x) / 2
+                        mid_y = (p1y + p2y) / 2
+                        half_c = chord_xy / 2
+                        R_arc = arc_radius
+                        h_perp = math.sqrt(max(R_arc**2 - half_c**2, 0)) if R_arc >= half_c else 0
+
+                        # 弦法線方向
+                        nx_ch = -dy_ch / chord_xy
+                        ny_ch = dx_ch / chord_xy
+
+                        # 根據彎曲方向選擇弧心側
+                        if bend_direction == 'left':
+                            arc_cx = mid_x + h_perp * nx_ch
+                            arc_cy = mid_y + h_perp * ny_ch
+                        else:
+                            arc_cx = mid_x - h_perp * nx_ch
+                            arc_cy = mid_y - h_perp * ny_ch
+
+                        # 弧心 → 俯視投影 → DXF 座標
+                        arc_center_top = project_top((arc_cx, arc_cy, 0))
+                        arc_center_dxf = (
+                            arc_center_top[0] * top_scale + top_off_x,
+                            arc_center_top[1] * top_scale + top_off_y,
+                        )
+
+                        # 弧上某點（弦中點處的弧面上）→ 投影
+                        arc_mid_x = mid_x + (R_arc - h_perp) * (-nx_ch if bend_direction == 'left' else nx_ch)
+                        arc_mid_y = mid_y + (R_arc - h_perp) * (-ny_ch if bend_direction == 'left' else ny_ch)
+                        arc_on_top = project_top((arc_mid_x, arc_mid_y, 0))
+                        arc_on_dxf = (
+                            arc_on_top[0] * top_scale + top_off_x,
+                            arc_on_top[1] * top_scale + top_off_y,
+                        )
+
+                        # R 標註 leader line：從弧面上點指向外側
+                        leader_dx = arc_on_dxf[0] - arc_center_dxf[0]
+                        leader_dy = arc_on_dxf[1] - arc_center_dxf[1]
+                        leader_len = math.sqrt(leader_dx**2 + leader_dy**2)
+                        if leader_len > 1e-6:
+                            ldx = leader_dx / leader_len
+                            ldy = leader_dy / leader_len
+                        else:
+                            ldx, ldy = 1, 0
+                        leader_end = (arc_on_dxf[0] + ldx * 30, arc_on_dxf[1] + ldy * 30)
+
+                        # leader line
+                        msp.add_line(arc_on_dxf, leader_end)
+                        # 箭頭
+                        arrow_l = 2.5
+                        msp.add_line(arc_on_dxf,
+                                     (arc_on_dxf[0] + ldx * arrow_l - ldy * 1,
+                                      arc_on_dxf[1] + ldy * arrow_l + ldx * 1))
+                        msp.add_line(arc_on_dxf,
+                                     (arc_on_dxf[0] + ldx * arrow_l + ldy * 1,
+                                      arc_on_dxf[1] + ldy * arrow_l - ldx * 1))
+                        # R 文字
+                        r_text = f"R{arc_radius:.0f}"
+                        msp.add_text(r_text, dxfattribs={'height': 4.0}).set_placement(
+                            (leader_end[0] + 2, leader_end[1] + 1))
+
+        # 儲存
+        path0 = os.path.join(output_dir, f"{base_name}-0.dxf")
+        doc.saveas(path0)
+        log_print(f"  [OK] {path0}")
+        return path0
+
+    # ====================================================================
     # 直線段施工圖 (per-section sheet for *-1.dxf)
     # ====================================================================
 
@@ -5942,7 +6219,8 @@ Solid 名稱: {solid_name}
 
     def generate_sub_assembly_drawing(self, output_dir: str = "output") -> List[str]:
         """
-        生成子系統施工圖 — 3 張獨立 DXF + PNG
+        生成子系統施工圖 — 4 張獨立 DXF + PNG
+        Drawing 0: 總施工圖 (Overview Assembly)
         Drawing 1: 腳架施工圖 (Leg Detail)
         Drawing 2: 彎軌施工圖 (Curved Track)
         Drawing 3: 直段+彎段施工圖 (Section Assembly)
@@ -5971,7 +6249,7 @@ Solid 名稱: {solid_name}
             base_name = "sub_assembly"
 
         log_print("\n" + "=" * 60)
-        log_print("開始生成子系統施工圖 (3 sheets)...")
+        log_print("開始生成子系統施工圖 (4 sheets)...")
         log_print("=" * 60)
 
         # ===== 從 info 收集共用資料 → 建立 stp_data 結構 =====
@@ -6154,6 +6432,19 @@ Solid 名稱: {solid_name}
         MARGIN = 10
 
         output_paths = []
+
+        # ================================================================
+        # Drawing 0: 總施工圖 (Overview Assembly Drawing)
+        # ================================================================
+        try:
+            log_print("\n--- Drawing 0: 總施工圖 ---")
+            path0 = self.generate_overview_drawing(output_dir, base_name, stp_data, project, today)
+            if path0:
+                output_paths.append(path0)
+        except Exception as e:
+            log_print(f"[Error] Drawing 0 失敗: {e}", "error")
+            import traceback
+            log_print(traceback.format_exc(), "error")
 
         # ================================================================
         # Drawing 1: 直線段施工圖 (Straight Section — 支架)
