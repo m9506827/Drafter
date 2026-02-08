@@ -5341,18 +5341,23 @@ Solid 名稱: {solid_name}
                         arc_cy + (R_arc - pipe_r) * math.sin(ea_rad))
             msp.add_line(p_out, p_in)
 
-        # 支撐架標記
+        # 支撐架標記（徑向線 + 兩端小圓圈）
         if bracket_count > 0:
-            x_sz = 1.5
             circle_r = 1.2
+            extension = pipe_r * 0.5
             for bi in range(bracket_count):
                 bt = (bi + 0.5) / bracket_count
                 ba = math.radians(plan_sa_deg + bt * plan_span_deg)
-                bx, by = _m2d(arc_cx + R_arc * math.cos(ba),
-                              arc_cy + R_arc * math.sin(ba))
-                msp.add_line((bx - x_sz, by - x_sz), (bx + x_sz, by + x_sz))
-                msp.add_line((bx - x_sz, by + x_sz), (bx + x_sz, by - x_sz))
-                msp.add_circle((bx, by), circle_r)
+                cos_ba, sin_ba = math.cos(ba), math.sin(ba)
+                # 徑向線從外到內穿越管壁
+                r_out = R_arc + pipe_r + extension
+                r_in = R_arc - pipe_r - extension
+                p_out = _m2d(arc_cx + r_out * cos_ba, arc_cy + r_out * sin_ba)
+                p_in = _m2d(arc_cx + r_in * cos_ba, arc_cy + r_in * sin_ba)
+                msp.add_line(p_out, p_in)
+                # 兩端小圓圈（代表支撐架管截面）
+                msp.add_circle(p_out, circle_r)
+                msp.add_circle(p_in, circle_r)
 
         # R 尺寸標註（帶徑向引線）
         r_label_angle = math.radians(plan_sa_deg + plan_span_deg * 0.7)
@@ -6458,12 +6463,14 @@ Solid 名稱: {solid_name}
         _arc_height_gain = _arc_items[0].get('height_gain', 0) if _arc_items else 0
         _arc_outer_length = _arc_items[0].get('outer_arc_length', 0) if _arc_items else 0
 
-        # 弧線中心線長度（from info.pipe_centerlines → arc pipe total_length）
-        _arc_cl_length = 0
-        for pc in track_pipes:
-            for seg in pc.get('segments', []):
-                if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
-                    _arc_cl_length = max(_arc_cl_length, pc.get('total_length', 0))
+        # 弧線中心線長度（優先使用 cutting_list arc item 的 arc_length）
+        _arc_cl_length = _arc_items[0].get('arc_length', 0) if _arc_items else 0
+        if _arc_cl_length <= 0:
+            # fallback: pipe_centerlines total_length
+            for pc in track_pipes:
+                for seg in pc.get('segments', []):
+                    if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                        _arc_cl_length = max(_arc_cl_length, pc.get('total_length', 0))
 
         # 仰角（from info.angles → 取第一個非零 track_elevation）
         _elevation_deg = 0
@@ -6960,12 +6967,13 @@ Solid 名稱: {solid_name}
             if l_pts_2d:
                 _draw_pipe_curve(msp2, l_pts_2d, pipe_hw_l, center_color=3)
 
-            # 支撐架（連接上下軌的管線 + X 標記 + 小圓圈）
+            # 支撐架（連接上下軌的管線 + X 標記 + 管壁邊緣小圓圈）
             if bracket_count > 0 and u_pts_2d and l_pts_2d:
                 n_u = len(u_pts_2d)
                 n_l = len(l_pts_2d)
                 leg_hw = min(pipe_hw_l * 0.6, 1.5)  # 腳架管壁半寬
-                x_sz = min(3.0, pipe_hw_l * 1.2)     # X 標記大小
+                x_sz = min(1.5, pipe_hw_l * 0.6)     # X 標記大小（縮小）
+                circle_r = x_sz * 0.5
                 for bi in range(bracket_count):
                     idx_u = int((bi + 0.5) / bracket_count * (n_u - 1))
                     idx_l = int((bi + 0.5) / bracket_count * (n_l - 1))
@@ -6988,9 +6996,11 @@ Solid 名稱: {solid_name}
                                  (l_pt[0] + x_sz, l_pt[1] + x_sz))
                     msp2.add_line((l_pt[0] - x_sz, l_pt[1] + x_sz),
                                  (l_pt[0] + x_sz, l_pt[1] - x_sz))
-                    # 小圓圈（支撐架位置）
-                    msp2.add_circle(u_pt, x_sz * 0.8)
-                    msp2.add_circle(l_pt, x_sz * 0.8)
+                    # 小圓圈在管壁邊緣（每支撐架 4 個）
+                    msp2.add_circle((u_pt[0] - leg_hw, u_pt[1]), circle_r)
+                    msp2.add_circle((u_pt[0] + leg_hw, u_pt[1]), circle_r)
+                    msp2.add_circle((l_pt[0] - leg_hw, l_pt[1]), circle_r)
+                    msp2.add_circle((l_pt[0] + leg_hw, l_pt[1]), circle_r)
 
             log_print(f"  下圖繪製完成（pipe_data 左前視圖）")
 
