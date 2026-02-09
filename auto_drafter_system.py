@@ -825,34 +825,98 @@ class MockCADEngine:
 
         centerline = sample_path(largest_face, n_samples)
 
-        # === 端點校正：用圓周取樣平均法取得管端中心 ===
-        # BSpline 取樣在 sv_mid（圓周中點）的端點是管壁上的點，不是管中心
-        # 透過在管端沿 V 方向取樣多個點再平均，可得到精確的管軸心端點
-        # 注意：只校正回傳的 start_point/end_point，不改動 centerline（避免破壞 straightness 判定）
+        # === 端點校正：3D 圓擬合取得管軸心 ===
+        # BSpline 取樣在 sv_mid 的端點是管壁上的點，不是管中心
+        # V 參數僅涵蓋半圓周，簡單平均會有偏差
+        # 改用 3D 圓擬合（在截面平面上擬合圓）取得精確管軸心
         corrected_start = None
         corrected_end = None
+        _arc_length_from_u = 0
         try:
             surf_adapter = BRepAdaptor_Surface(largest_face)
             _su1 = surf_adapter.FirstUParameter()
             _su2 = surf_adapter.LastUParameter()
             _sv1 = surf_adapter.FirstVParameter()
             _sv2 = surf_adapter.LastVParameter()
-            n_v = 36  # 沿圓周取 36 個點
+            _arc_length_from_u = _su2 - _su1  # U 參數範圍 = 弧長（精確）
+            n_v = 36  # 沿 V 方向取 36 個點
 
-            def _circ_center(u_val):
+            def _fit_pipe_center(u_val):
+                """在 u_val 處取 V 截面點，擬合 3D 圓取得管軸心"""
                 pts_c = []
                 for j in range(n_v):
                     sv = _sv1 + j / n_v * (_sv2 - _sv1)
                     pt = surf_adapter.Value(u_val, sv)
                     pts_c.append((pt.X(), pt.Y(), pt.Z()))
-                cx_ = sum(p[0] for p in pts_c) / len(pts_c)
-                cy_ = sum(p[1] for p in pts_c) / len(pts_c)
-                cz_ = sum(p[2] for p in pts_c) / len(pts_c)
-                return (cx_, cy_, cz_)
+                nc = len(pts_c)
+                # 質心
+                mx = sum(p[0] for p in pts_c) / nc
+                my = sum(p[1] for p in pts_c) / nc
+                mz = sum(p[2] for p in pts_c) / nc
+                # 中心化
+                cen = [(p[0]-mx, p[1]-my, p[2]-mz) for p in pts_c]
+                # 截面平面法向量（用跨度向量叉積）
+                v1 = cen[nc // 3]
+                v2 = cen[2 * nc // 3]
+                nx_ = v1[1]*v2[2] - v1[2]*v2[1]
+                ny_ = v1[2]*v2[0] - v1[0]*v2[2]
+                nz_ = v1[0]*v2[1] - v1[1]*v2[0]
+                nl = math.sqrt(nx_**2 + ny_**2 + nz_**2)
+                if nl < 1e-10:
+                    return (mx, my, mz)
+                nx_, ny_, nz_ = nx_/nl, ny_/nl, nz_/nl
+                # 局部 2D 座標系
+                p0 = cen[0]
+                dn = p0[0]*nx_ + p0[1]*ny_ + p0[2]*nz_
+                e1x = p0[0] - dn*nx_
+                e1y = p0[1] - dn*ny_
+                e1z = p0[2] - dn*nz_
+                e1l = math.sqrt(e1x**2 + e1y**2 + e1z**2)
+                if e1l < 1e-10:
+                    return (mx, my, mz)
+                e1x, e1y, e1z = e1x/e1l, e1y/e1l, e1z/e1l
+                e2x = ny_*e1z - nz_*e1y
+                e2y = nz_*e1x - nx_*e1z
+                e2z = nx_*e1y - ny_*e1x
+                # 投影到 2D
+                pts2 = [(c[0]*e1x+c[1]*e1y+c[2]*e1z,
+                         c[0]*e2x+c[1]*e2y+c[2]*e2z) for c in cen]
+                # Kasa 最小平方圓擬合
+                np2 = len(pts2)
+                sx_ = sum(q[0] for q in pts2)
+                sy_ = sum(q[1] for q in pts2)
+                sx2_ = sum(q[0]**2 for q in pts2)
+                sy2_ = sum(q[1]**2 for q in pts2)
+                sxy_ = sum(q[0]*q[1] for q in pts2)
+                sf_ = [q[0]**2+q[1]**2 for q in pts2]
+                sfx_ = sum(sf_[k]*pts2[k][0] for k in range(np2))
+                sfy_ = sum(sf_[k]*pts2[k][1] for k in range(np2))
+                sfs_ = sum(sf_)
+                A11_, A12_, A13_ = sx2_, sxy_, sx_
+                A21_, A22_, A23_ = sxy_, sy2_, sy_
+                A31_, A32_, A33_ = sx_, sy_, float(np2)
+                det_ = (A11_*(A22_*A33_-A23_*A32_)
+                        - A12_*(A21_*A33_-A23_*A31_)
+                        + A13_*(A21_*A32_-A22_*A31_))
+                if abs(det_) < 1e-10:
+                    return (mx, my, mz)
+                av_ = ((sfx_*(A22_*A33_-A23_*A32_)
+                        - A12_*(sfy_*A33_-A23_*sfs_)
+                        + A13_*(sfy_*A32_-A22_*sfs_)) / det_)
+                bv_ = ((A11_*(sfy_*A33_-A23_*sfs_)
+                        - sfx_*(A21_*A33_-A23_*A31_)
+                        + A13_*(A21_*sfs_-sfy_*A31_)) / det_)
+                cu_ = av_ / 2
+                cv_ = bv_ / 2
+                # 轉回 3D
+                return (mx + cu_*e1x + cv_*e2x,
+                        my + cu_*e1y + cv_*e2y,
+                        mz + cu_*e1z + cv_*e2z)
 
-            corrected_start = _circ_center(_su1)
-            corrected_end = _circ_center(_su2)
+            corrected_start = _fit_pipe_center(_su1)
+            corrected_end = _fit_pipe_center(_su2)
         except Exception:
+            _arc_length_from_u = 0
             pass
 
         # 計算中心線總長
@@ -880,59 +944,107 @@ class MockCADEngine:
                 'direction': d,
             })
         else:
-            # 彎管 — 找出曲率所在的軸（起點≈終點的軸），投影到含該軸的平面
-            start_p = centerline[0]
-            end_p = centerline[-1]
-            deltas = [
-                (abs(end_p[0] - start_p[0]), 0),
-                (abs(end_p[1] - start_p[1]), 1),
-                (abs(end_p[2] - start_p[2]), 2),
-            ]
-            deltas.sort(key=lambda x: x[0])
-            # 曲率軸：起終點值最接近的軸（圓弧往返的方向）
-            curve_axis = deltas[0][1]
-            # 投影平面：包含曲率軸和第二大變化軸
-            other_axis = deltas[1][1]
-            # 高度方向：起終點變化最大的軸
-            height_axis = deltas[2][1]
-            arc_axes = [curve_axis, other_axis]
+            # 彎管 — 使用 3D 圓擬合取得精確管軸心中心線
+            # 在每個 U 取樣點，擬合截面圓找管心（比 sv_mid 壁面取樣更精確）
+            true_centerline = None
+            try:
+                if corrected_start is not None:
+                    # _fit_pipe_center 已定義，用它取樣 TRUE 中心線
+                    true_centerline = []
+                    for i in range(n_samples + 1):
+                        u_val = _su1 + i / n_samples * (_su2 - _su1)
+                        true_centerline.append(_fit_pipe_center(u_val))
+            except Exception:
+                true_centerline = None
 
-            def proj(p):
-                return (p[arc_axes[0]], p[arc_axes[1]])
+            # 用於擬合的中心線（優先 true_centerline）
+            fit_cl = true_centerline if true_centerline else centerline
 
-            p0 = proj(centerline[0])
-            p_mid = proj(centerline[n_samples // 2])
-            p_end = proj(centerline[-1])
+            # 嘗試 3 個投影平面（XY, XZ, YZ），選殘差最小的
+            best_arc = None
+            best_residual = float('inf')
+            axis_combos = [(0, 1, 2), (0, 2, 1), (1, 2, 0)]  # (ax0, ax1, h_ax)
 
-            # 三點擬合圓
-            ax_, ay_ = p0
-            bx_, by_ = p_mid
-            cx_, cy_ = p_end
-            D = 2 * (ax_ * (by_ - cy_) + bx_ * (cy_ - ay_) + cx_ * (ay_ - by_))
+            for ax0, ax1, h_ax in axis_combos:
+                pts_2d = [(p[ax0], p[ax1]) for p in fit_cl]
+                n_pts = len(pts_2d)
 
-            if abs(D) > 1e-6:
-                ux = ((ax_ ** 2 + ay_ ** 2) * (by_ - cy_) +
-                      (bx_ ** 2 + by_ ** 2) * (cy_ - ay_) +
-                      (cx_ ** 2 + cy_ ** 2) * (ay_ - by_)) / D
-                uy = ((ax_ ** 2 + ay_ ** 2) * (cx_ - bx_) +
-                      (bx_ ** 2 + by_ ** 2) * (ax_ - cx_) +
-                      (cx_ ** 2 + cy_ ** 2) * (bx_ - ax_)) / D
+                # Kasa 最小平方圓擬合
+                sx  = sum(p[0] for p in pts_2d)
+                sy  = sum(p[1] for p in pts_2d)
+                sx2 = sum(p[0]**2 for p in pts_2d)
+                sy2 = sum(p[1]**2 for p in pts_2d)
+                sxy = sum(p[0]*p[1] for p in pts_2d)
+                sf  = [p[0]**2 + p[1]**2 for p in pts_2d]
+                sfx = sum(sf[i] * pts_2d[i][0] for i in range(n_pts))
+                sfy = sum(sf[i] * pts_2d[i][1] for i in range(n_pts))
+                sf_sum = sum(sf)
 
-                r0 = math.sqrt((ax_ - ux) ** 2 + (ay_ - uy) ** 2)
-                r1 = math.sqrt((bx_ - ux) ** 2 + (by_ - uy) ** 2)
-                r2 = math.sqrt((cx_ - ux) ** 2 + (cy_ - uy) ** 2)
-                arc_radius = (r0 + r1 + r2) / 3
+                A11, A12, A13 = sx2, sxy, sx
+                A21, A22, A23 = sxy, sy2, sy
+                A31, A32, A33 = sx, sy, float(n_pts)
+                D = (A11*(A22*A33 - A23*A32)
+                     - A12*(A21*A33 - A23*A31)
+                     + A13*(A21*A32 - A22*A31))
 
-                angle_start = math.atan2(ay_ - uy, ax_ - ux)
-                angle_end = math.atan2(cy_ - uy, cx_ - ux)
-                arc_angle = abs(angle_end - angle_start)
-                if arc_angle > math.pi:
-                    arc_angle = 2 * math.pi - arc_angle
-                arc_angle_deg = round(math.degrees(arc_angle), 1)
+                if abs(D) < 1e-10:
+                    continue
 
-                height_gain = abs(centerline[-1][height_axis] - centerline[0][height_axis])
+                a_val = ((sfx*(A22*A33 - A23*A32)
+                          - A12*(sfy*A33 - A23*sf_sum)
+                          + A13*(sfy*A32 - A22*sf_sum)) / D)
+                b_val = ((A11*(sfy*A33 - A23*sf_sum)
+                          - sfx*(A21*A33 - A23*A31)
+                          + A13*(A21*sf_sum - sfy*A31)) / D)
 
-                if height_gain > 1:
+                ux = a_val / 2
+                uy = b_val / 2
+
+                dists = [math.sqrt((p[0] - ux)**2 + (p[1] - uy)**2)
+                         for p in pts_2d]
+                r = sum(dists) / len(dists)
+                std_d = math.sqrt(sum((d - r)**2 for d in dists) / len(dists))
+                residual = std_d / r if r > 0 else float('inf')
+
+                if residual < best_residual:
+                    # 累積角度
+                    total_ac = 0.0
+                    for i in range(len(pts_2d) - 1):
+                        a1_ = math.atan2(pts_2d[i][1] - uy, pts_2d[i][0] - ux)
+                        a2_ = math.atan2(pts_2d[i+1][1] - uy, pts_2d[i+1][0] - ux)
+                        da = a2_ - a1_
+                        while da > math.pi:
+                            da -= 2 * math.pi
+                        while da < -math.pi:
+                            da += 2 * math.pi
+                        total_ac += da
+
+                    # 高低差
+                    if corrected_start and corrected_end:
+                        hg = abs(corrected_end[h_ax] - corrected_start[h_ax])
+                    else:
+                        hg = abs(fit_cl[-1][h_ax] - fit_cl[0][h_ax])
+
+                    best_residual = residual
+                    best_arc = {
+                        'radius': r,
+                        'angle': abs(total_ac),
+                        'angle_deg': round(math.degrees(abs(total_ac)), 1),
+                        'height_gain': hg,
+                        'height_axis': h_ax,
+                    }
+
+            if best_arc and best_arc['angle_deg'] > 5:
+                arc_radius = best_arc['radius']
+                arc_angle = best_arc['angle']
+                arc_angle_deg = best_arc['angle_deg']
+                height_gain = best_arc['height_gain']
+                height_axis = best_arc['height_axis']
+
+                # 弧長：優先使用 U 參數範圍（最精確）
+                if _arc_length_from_u > 0:
+                    cl_arc = _arc_length_from_u
+                elif height_gain > 1:
                     cl_arc = math.sqrt((arc_radius * arc_angle) ** 2 + height_gain ** 2)
                 else:
                     cl_arc = arc_radius * arc_angle
@@ -1912,7 +2024,10 @@ class MockCADEngine:
             feat = next((f for f in self.features if f.id == fid), None)
 
             # 腳架長度計算：total_length - 50，個位數4捨5入到10位數
-            # "total length" = 腳架實體的最大邊界框尺寸（物理總長度，含管壁）
+            # total_length = (bbox_max + face_extent) / 2
+            #   bbox_max = 實體邊界框最大維度（含底板等附屬結構）
+            #   face_extent = 圓柱面沿管方向跨距（較接近純管長）
+            #   平均值排除底板等多餘幾何的影響，得到最準確的管件物理長度
             if feat:
                 bl = feat.params.get('bbox_l', 0)
                 bw = feat.params.get('bbox_w', 0)
@@ -1922,8 +2037,14 @@ class MockCADEngine:
                 bl, bw, bh = 0, 0, 0
                 bbox_max = 0
 
-            # 優先使用 bbox_max（物理總長度），fallback 用管路中心線長度
-            if bbox_max > 0:
+            # 從 pipe_centerlines 讀取 face_extent
+            face_ext = pipe_data.get('face_extent') if pipe_data else None
+
+            # 優先使用 (bbox_max + face_extent) / 2，排除底板影響
+            if bbox_max > 0 and face_ext and face_ext > 0:
+                total_len = (bbox_max + face_ext) / 2
+                source = f'avg(bbox={bbox_max:.1f},fe={face_ext:.1f})'
+            elif bbox_max > 0:
                 total_len = bbox_max
                 source = 'bbox_max'
             elif pipe_data and pipe_data.get('total_length', 0) > 0:
@@ -5016,6 +5137,66 @@ Solid 名稱: {solid_name}
 
         return bottom_y
 
+    def _draw_balloon(self, msp, label, balloon_pt, target_pt,
+                      radius=5.0, text_height=4.0, color=7):
+        """
+        繪製業界標準球號標註（balloon annotation）。
+
+        業界慣例：
+          - 圓形氣泡（balloon）內置球號文字，文字水平置中
+          - 細引出線（leader）從圓邊緣到零件表面
+          - 引出線末端帶箭頭指向零件
+
+        Args:
+            msp: DXF modelspace
+            label: 球號文字 (e.g. 'U1', 'D1', '1')
+            balloon_pt: 氣泡中心座標 (x, y)
+            target_pt: 引出線指向的零件位置 (x, y)
+            radius: 氣泡圓半徑（紙面 mm）
+            text_height: 文字高度
+            color: DXF 顏色索引（7=白/黑, 1=紅）
+        """
+        import math
+        bx, by = balloon_pt
+        tx, ty = target_pt
+
+        # 氣泡圓
+        msp.add_circle((bx, by), radius, dxfattribs={'color': color})
+
+        # 球號文字（置中於圓內）
+        msp.add_text(str(label), dxfattribs={
+            'height': text_height, 'color': color
+        }).set_placement(
+            (bx, by - text_height * 0.35),
+            align=ezdxf.enums.TextEntityAlignment.CENTER
+        )
+
+        # 引出線：從圓邊緣到目標點
+        dx = tx - bx
+        dy = ty - by
+        dist = math.sqrt(dx**2 + dy**2)
+        if dist < 1e-6:
+            return
+        ux, uy = dx / dist, dy / dist  # 方向單位向量
+
+        # 引出線起點（圓邊緣）
+        leader_start = (bx + ux * radius, by + uy * radius)
+        # 引出線終點（目標點）
+        leader_end = target_pt
+
+        msp.add_line(leader_start, leader_end, dxfattribs={'color': color})
+
+        # 箭頭（在目標端，指向目標）
+        arrow_len = 2.5
+        arrow_half_w = 0.8
+        # 箭頭兩翼
+        ax1 = tx - ux * arrow_len + uy * arrow_half_w
+        ay1 = ty - uy * arrow_len - ux * arrow_half_w
+        ax2 = tx - ux * arrow_len - uy * arrow_half_w
+        ay2 = ty - uy * arrow_len + ux * arrow_half_w
+        msp.add_line((tx, ty), (ax1, ay1), dxfattribs={'color': color})
+        msp.add_line((tx, ty), (ax2, ay2), dxfattribs={'color': color})
+
     def _draw_cutting_list_table(self, msp, x, y, items):
         """
         繪製軌道取料明細表
@@ -5316,14 +5497,20 @@ Solid 名稱: {solid_name}
                 ccw_span = arc_angle_deg
         plan_span_deg = ccw_span
 
-        # Bounding box（包含支架延伸）
-        bb_margin = bracket_arm_ext + pipe_r + 10 if draw_brackets else pipe_r + 10
+        # Bounding box（包含軌道外壁 + 支架向凹側延伸）
+        bb_out_margin = pipe_r + 15  # 外側：軌道管壁 + 餘裕
+        bb_in_margin = pipe_r + bracket_arm_ext + 15  # 內側：含支架延伸
         bb_pts = []
         for i in range(101):
             t = i / 100
             a = math.radians(plan_sa_deg + t * plan_span_deg)
-            bb_pts.append((arc_cx + (R_arc + bb_margin) * math.cos(a),
-                           arc_cy + (R_arc + bb_margin) * math.sin(a)))
+            ca, sa = math.cos(a), math.sin(a)
+            # 外側弧
+            bb_pts.append((arc_cx + (R_arc + bb_out_margin) * ca,
+                           arc_cy + (R_arc + bb_out_margin) * sa))
+            # 內側弧（支架端部）
+            bb_pts.append((arc_cx + max(0, R_arc - bb_in_margin) * ca,
+                           arc_cy + max(0, R_arc - bb_in_margin) * sa))
         bb_x0 = min(p[0] for p in bb_pts) - pipe_diameter
         bb_x1 = max(p[0] for p in bb_pts) + pipe_diameter
         bb_y0 = min(p[1] for p in bb_pts) - pipe_diameter
@@ -5367,74 +5554,133 @@ Solid 名稱: {solid_name}
                         arc_cy + (R_arc - pipe_r) * math.sin(ea_rad))
             msp.add_line(p_out, p_in)
 
-        # 支撐架標記（延伸到管壁外 + 旋轉 X-marks + 圓圈在延伸端點）
+        # 支撐架標記 — 以圓柱延長顯示（俯視：雙管壁線 + 端部圓柱截面）
+        # 標準表示法（參考 2-2-2.jpg）:
+        #   從軌道中心線向弧心方向（凹側/下側）延伸，
+        #   繪製雙管壁平行線（實際管徑 d≈13mm）+
+        #   端部小圓（圓柱端面，實際管徑）
         if bracket_count > 0:
-            circle_r = 1.2
-            x_sz = 1.5  # X-mark half size
+            # 取支撐架實際管徑（從 pipe_centerlines 讀取）
+            _brk_pipes = [pc for pc in stp_data.get('pipe_centerlines', [])
+                          if ({c['feature_id']: c for c in stp_data.get(
+                              'part_classifications', [])}).get(
+                              pc['solid_id'], {}).get('class') == 'bracket']
+            _brk_pipe_diam = 0
+            if _brk_pipes:
+                _brk_pipe_diam = _brk_pipes[0].get('diameter', 0)
+            if _brk_pipe_diam <= 0:
+                _brk_pipe_diam = 13  # 典型支撐架管徑
+            bracket_circle_r = _brk_pipe_diam / 2 * view_scale  # 紙面半徑
+            bracket_circle_r = max(bracket_circle_r, 1.0)   # 最小可見
+            _brk_hw = _brk_pipe_diam / 2 * view_scale  # 管壁半寬（紙面）
+            _brk_hw = max(_brk_hw, 0.5)
+
+            # 支撐架延伸長度（俯視投影）
+            _brk_arm_model = 0   # 水平臂長
+            _brk_vert_model = 0  # 垂直段長
+            if _brk_pipes:
+                for seg in _brk_pipes[0].get('segments', []):
+                    if seg.get('type') == 'straight':
+                        dx, dy, dz = seg.get('direction', (0, 0, 0))
+                        horiz = math.sqrt(dx**2 + dy**2)
+                        vert = abs(dz)
+                        if horiz > vert:
+                            _brk_arm_model = max(_brk_arm_model, seg['length'])
+                        else:
+                            _brk_vert_model = max(_brk_vert_model, seg['length'])
+
+            # 仰角造成的垂直段水平投影
+            elevation_deg = stp_data.get('elevation_deg', 0)
+            _vert_proj = (_brk_vert_model * math.sin(math.radians(elevation_deg))
+                          if elevation_deg > 0 else 0)
+            _total_ext_model = _brk_arm_model + _vert_proj
+            if _total_ext_model < 10:
+                _total_ext_model = pipe_diameter * 1.5  # fallback
+
             for bi in range(bracket_count):
                 bt = (bi + 0.5) / bracket_count
                 ba = math.radians(plan_sa_deg + bt * plan_span_deg)
                 cos_ba, sin_ba = math.cos(ba), math.sin(ba)
-                # 管壁交叉點
-                u_pt = _m2d(arc_cx + (R_arc + pipe_r) * cos_ba,
-                            arc_cy + (R_arc + pipe_r) * sin_ba)
-                l_pt = _m2d(arc_cx + (R_arc - pipe_r) * cos_ba,
-                            arc_cy + (R_arc - pipe_r) * sin_ba)
-                # 內側延伸端點（向弧心方向延伸，標準圖只有內側有圓圈）
-                inner_ext = _m2d(arc_cx + (R_arc - pipe_r - bracket_arm_ext) * cos_ba,
-                                 arc_cy + (R_arc - pipe_r - bracket_arm_ext) * sin_ba)
-                # 連接線（從外壁到內側延伸，不超出外壁）
-                msp.add_line(u_pt, inner_ext)
-                # 旋轉 X-marks（對齊徑向/切向）
-                rdx = x_dir * cos_ba
-                rdy = sin_ba
-                r_len = math.sqrt(rdx**2 + rdy**2)
-                if r_len > 1e-9:
-                    rdx, rdy = rdx / r_len, rdy / r_len
-                tdx, tdy = -rdy, rdx  # 切向
-                _ax = (rdx + tdx) * x_sz
-                _ay = (rdy + tdy) * x_sz
-                _bx = (rdx - tdx) * x_sz
-                _by = (rdy - tdy) * x_sz
-                # X marks at outer pipe wall intersection
-                msp.add_line((u_pt[0] - _ax, u_pt[1] - _ay),
-                             (u_pt[0] + _ax, u_pt[1] + _ay))
-                msp.add_line((u_pt[0] - _bx, u_pt[1] - _by),
-                             (u_pt[0] + _bx, u_pt[1] + _by))
-                # X marks at inner pipe wall intersection
-                msp.add_line((l_pt[0] - _ax, l_pt[1] - _ay),
-                             (l_pt[0] + _ax, l_pt[1] + _ay))
-                msp.add_line((l_pt[0] - _bx, l_pt[1] - _by),
-                             (l_pt[0] + _bx, l_pt[1] + _by))
-                # 圓圈只在內側延伸端點（標準圖外側無圓圈）
-                msp.add_circle(inner_ext, circle_r)
 
-        # R 尺寸標註（帶徑向引線）
-        r_label_angle = math.radians(plan_sa_deg + plan_span_deg * 0.7)
+                # 根部（軌道中心線上）
+                root_mx = arc_cx + R_arc * cos_ba
+                root_my = arc_cy + R_arc * sin_ba
+                root_pt = _m2d(root_mx, root_my)
+
+                # 外端（從軌道中心線向弧心方向延伸，即下側/凹側）
+                # 標準圖中支撐架懸掛於軌道下方，俯視投影在弧心側（凹側）
+                tip_mx = root_mx - _total_ext_model * cos_ba
+                tip_my = root_my - _total_ext_model * sin_ba
+                tip_pt = _m2d(tip_mx, tip_my)
+
+                # 徑向單位向量（紙面座標）及法線
+                ldx = tip_pt[0] - root_pt[0]
+                ldy = tip_pt[1] - root_pt[1]
+                ll = math.sqrt(ldx**2 + ldy**2)
+                if ll > 1e-9:
+                    nx_p, ny_p = -ldy / ll * _brk_hw, ldx / ll * _brk_hw
+                else:
+                    nx_p, ny_p = 0, _brk_hw
+
+                # 雙管壁平行線（管徑 = 支撐架直徑）
+                msp.add_line((root_pt[0] + nx_p, root_pt[1] + ny_p),
+                             (tip_pt[0] + nx_p, tip_pt[1] + ny_p))
+                msp.add_line((root_pt[0] - nx_p, root_pt[1] - ny_p),
+                             (tip_pt[0] - nx_p, tip_pt[1] - ny_p))
+                # 外端封口
+                msp.add_line((tip_pt[0] + nx_p, tip_pt[1] + ny_p),
+                             (tip_pt[0] - nx_p, tip_pt[1] - ny_p))
+                # 外端圓柱截面（實際管徑）
+                msp.add_circle(tip_pt, bracket_circle_r)
+
+        # R 半徑標註（業界慣例：引出線從弧心出發 → 穿過弧面 → 箭頭在弧面 → 延伸到文字）
+        # 參考標準圖 2-2-2.jpg：R250 leader 起點在弧心
+        r_label_angle = math.radians(plan_sa_deg + plan_span_deg * 0.8)
+        # 弧心（紙面座標）
+        center_pt = _m2d(arc_cx, arc_cy)
+        # 弧面交點（紙面座標）
         r_arc_pt = _m2d(arc_cx + R_arc * math.cos(r_label_angle),
                         arc_cy + R_arc * math.sin(r_label_angle))
-        r_dir_x = math.cos(r_label_angle) * x_dir
-        r_dir_y = math.sin(r_label_angle)
+        # 弧面外延伸：箭頭之後再延伸到文字位置
+        r_dir_x = r_arc_pt[0] - center_pt[0]
+        r_dir_y = r_arc_pt[1] - center_pt[1]
+        r_dir_len = math.sqrt(r_dir_x**2 + r_dir_y**2)
+        if r_dir_len > 1e-9:
+            r_dir_x, r_dir_y = r_dir_x / r_dir_len, r_dir_y / r_dir_len
+        else:
+            r_dir_x, r_dir_y = 0, 1
+        # 文字端點（弧面再延伸）
         r_ext = 15
-        r_tip = (r_arc_pt[0] + r_dir_x * r_ext,
-                 r_arc_pt[1] + r_dir_y * r_ext)
-        msp.add_line(r_arc_pt, r_tip)
+        r_text_end = (r_arc_pt[0] + r_dir_x * r_ext,
+                      r_arc_pt[1] + r_dir_y * r_ext)
+        # 引出線：弧心 → 弧面 → 文字端
+        msp.add_line(center_pt, r_arc_pt)
+        msp.add_line(r_arc_pt, r_text_end)
+        # 箭頭（在弧面端，指向弧面方向 = 從中心到弧面）
+        arrow_l = 3.0
+        # 箭頭兩翼（從弧面端往中心方向的兩翼）
+        ax_back = -r_dir_x * arrow_l
+        ay_back = -r_dir_y * arrow_l
+        msp.add_line(r_arc_pt, (r_arc_pt[0] + ax_back + r_dir_y * arrow_l * 0.3,
+                                r_arc_pt[1] + ay_back - r_dir_x * arrow_l * 0.3))
+        msp.add_line(r_arc_pt, (r_arc_pt[0] + ax_back - r_dir_y * arrow_l * 0.3,
+                                r_arc_pt[1] + ay_back + r_dir_x * arrow_l * 0.3))
+        # 文字 R250
         msp.add_text(f"R{arc_radius:.0f}", dxfattribs={
-            'height': 8.0}).set_placement((r_tip[0] + 2, r_tip[1]))
+            'height': 7.0}).set_placement((r_text_end[0] + 1, r_text_end[1] + 1))
 
-        # 計算含支架延伸的總寬度（外側到外壁，內側延伸到 inner_ext）
+        # 計算軌道外壁的總寬度（不含支架延伸）
         _all_mx = []
-        if bracket_count > 0:
-            for bi in range(bracket_count):
-                bt = (bi + 0.5) / bracket_count
-                ba = math.radians(plan_sa_deg + bt * plan_span_deg)
-                cos_ba = math.cos(ba)
-                _all_mx.append(arc_cx + (R_arc + pipe_r) * cos_ba)  # 外壁（不延伸）
-                _all_mx.append(arc_cx + (R_arc - pipe_r - bracket_arm_ext) * cos_ba)  # 內側延伸
         for _ea_i in [plan_sa_deg, plan_sa_deg + plan_span_deg]:
             _ea_r = math.radians(_ea_i)
             _all_mx.append(arc_cx + (R_arc + pipe_r) * math.cos(_ea_r))
             _all_mx.append(arc_cx + (R_arc - pipe_r) * math.cos(_ea_r))
+        # 也包含弧線極值點
+        for i in range(101):
+            t = i / 100
+            a = math.radians(plan_sa_deg + t * plan_span_deg)
+            _all_mx.append(arc_cx + (R_arc + pipe_r) * math.cos(a))
+            _all_mx.append(arc_cx + (R_arc - pipe_r) * math.cos(a))
         bracket_total_width = max(_all_mx) - min(_all_mx) if _all_mx else 0
 
         return {
@@ -5946,7 +6192,7 @@ Solid 名稱: {solid_name}
             ll = leg.get('line_length', 0)  # from stp_data (cutting_list)
             through = rail_spacing
             remain = max(0, ll - through)
-            above = min(remain * 0.08, 40)
+            above = min(remain * 0.15, 40)
             below = remain - above
             leg_below_heights.append(below)
 
@@ -6055,21 +6301,30 @@ Solid 名稱: {solid_name}
                             dim_side * x_dir * (pipe_hw + 8),
                             f"{seg_len:.1f}")
 
-                    # 球號標註（段中點，垂直偏移）
+                    # 取料球號標註（藍色文字 + 引線指向材料中心點）
+                    # 不使用氣泡圓以避免與 BOM 球號混淆
                     if label and draw_len > 5:
+                        # 材料中心點（段中點）
                         mid_sx = (sx + ex) / 2
                         mid_sy = (sy + ey) / 2
-                        label_offset = dim_side * x_dir * (pipe_hw + 18)
+                        # 文字偏移位置（法線方向偏移）
+                        label_offset = dim_side * x_dir * (pipe_hw + 16)
                         seg_d_lbl = math.sqrt(dx**2 + dy**2)
                         if seg_d_lbl > 1e-6:
                             lbl_nx = -dy / seg_d_lbl
                             lbl_ny = dx / seg_d_lbl
                         else:
                             lbl_nx, lbl_ny = 0, 1
+                        lbl_x = mid_sx + lbl_nx * label_offset
+                        lbl_y = mid_sy + lbl_ny * label_offset
+                        # 藍色文字
                         msp.add_text(str(label), dxfattribs={
-                            'height': 5.0
-                        }).set_placement((mid_sx + lbl_nx * label_offset,
-                                          mid_sy + lbl_ny * label_offset))
+                            'height': 4.5, 'color': 5
+                        }).set_placement((lbl_x, lbl_y),
+                                         align=ezdxf.enums.TextEntityAlignment.CENTER)
+                        # 引線：從文字指向材料中心點
+                        msp.add_line((lbl_x, lbl_y), (mid_sx, mid_sy),
+                                     dxfattribs={'color': 5})
 
                     # 垂直分量：只在段末端畫輔助線（不加文字標註，避免重疊）
                     vert_comp = abs(seg_len * math.sin(rad))
@@ -6153,13 +6408,20 @@ Solid 名稱: {solid_name}
                             msp.add_line((cx, cy), (cx, cy + ref_len),
                                          dxfattribs={'color': 8})
 
-                    # 彎曲段球號標註（在轉折點旁）
+                    # 彎曲段取料球號標註（藍色文字 + 引線指向彎點中心）
                     arc_label = item.get('label', '')
                     if arc_label:
-                        arc_lbl_offset = dim_side * x_dir * (pipe_hw + 25)
+                        arc_lbl_offset = dim_side * x_dir * (pipe_hw + 22)
+                        lbl_x = cx + arc_lbl_offset * 0.5
+                        lbl_y = cy + abs(arc_lbl_offset) * 0.7
+                        # 藍色文字
                         msp.add_text(str(arc_label), dxfattribs={
-                            'height': 5.0
-                        }).set_placement((cx + arc_lbl_offset * 0.5, cy + abs(arc_lbl_offset) * 0.8))
+                            'height': 4.5, 'color': 5
+                        }).set_placement((lbl_x, lbl_y),
+                                         align=ezdxf.enums.TextEntityAlignment.CENTER)
+                        # 引線：從文字指向彎點中心
+                        msp.add_line((lbl_x, lbl_y), (cx, cy),
+                                     dxfattribs={'color': 5})
 
             # 端蓋
             if seg_positions:
@@ -6350,26 +6612,39 @@ Solid 名稱: {solid_name}
         for li, leg in enumerate(section_legs):
             ll = leg.get('line_length', 0)  # from stp_data (cutting_list)
 
-            # 取得腳架重心並投影到軌道方向
-            lc = leg.get('centroid', (0, 0, 0))
-            leg_proj = _proj_along(lc)
+            # === 腳架在繪圖路徑上的位置 ===
+            # 標準圖慣例：腳架位於軌道的末端（terminal end）
+            # 單一腳架：直接放在上軌路徑終點
+            # 多支腳架：從路徑中段到末端均勻分布
+            if n_legs == 1:
+                # 單一腳架：放在上軌路徑終點
+                if upper_seg_positions:
+                    last_seg = upper_seg_positions[-1]
+                    leg_draw_x = last_seg[2]  # 終點 X
+                    upper_y = last_seg[3]       # 終點 Y
+                else:
+                    leg_draw_x, upper_y = _interp_path(0.95)
+            else:
+                # 多支腳架：從路徑中段到末端均勻分布
+                t = 0.55 + (li / max(n_legs - 1, 1)) * 0.35  # 0.55 ~ 0.90
+                leg_draw_x, upper_y = _interp_path(t)
 
-            # 計算 t 值：腳架在軌道方向的位置比例
-            t = (leg_proj - track_proj_min) / track_proj_span
-            t = max(0.05, min(0.95, t))
-
-            # 沿繪圖路徑插值位置
-            leg_draw_x, upper_y = _interp_path(t)
-            # 下軌 Y = 上軌 Y - rail_spacing * scale
-            lower_y = upper_y - rail_spacing * scale
+            # 下軌 Y：使用下軌實際路徑在 leg_draw_x 處的 Y 值
+            # （非固定偏移，避免上下軌角度差造成的位置偏差）
+            lower_y = _find_y_on_path(lower_seg_positions, leg_draw_x,
+                                      upper_y - rail_spacing * scale)
 
             leg_upper_pt = (leg_draw_x, upper_y)
             leg_lower_pt = (leg_draw_x, lower_y)
 
             # 腳架幾何
+            # 標準圖：腳架從上軌上方少量延伸，經過上下軌（rail_spacing），
+            # 到下軌下方延伸至底座。上方延伸小，下方延伸至底板。
             through = rail_spacing
             remain = max(0, ll - through)
-            above_len = min(remain * 0.08, 40)
+            # 上方僅保留焊接/夾持餘量（約 remain 的 15%，最多 40mm）
+            # 下方為主要延伸（至底座）
+            above_len = min(remain * 0.15, 40)
             below_len = remain - above_len
 
             leg_top = (leg_upper_pt[0], leg_upper_pt[1] + above_len * scale)
@@ -6429,16 +6704,11 @@ Solid 名稱: {solid_name}
                                       f"{ll:.1f}",
                                       vertical=True)
 
-            # 球號氣泡 + 引線
-            balloon_x = leg_foot[0] + 15
-            balloon_y = leg_foot[1] - 5
-            balloon_r = 5
-            msp.add_circle((balloon_x, balloon_y), balloon_r)
-            msp.add_text(f"{li + 1}", dxfattribs={
-                'height': 8.0
-            }).set_placement((balloon_x - 2, balloon_y - 2))
-            msp.add_line((balloon_x - balloon_r, balloon_y),
-                         (leg_foot[0] + 2, leg_foot[1]))
+            # BOM 球號氣泡（業界慣例：圓 + 文字 + 引線 + 箭頭）
+            balloon_pt = (leg_foot[0] + 18, leg_foot[1] - 8)
+            target_pt = (leg_foot[0], leg_foot[1])
+            self._draw_balloon(msp, str(li + 1), balloon_pt, target_pt,
+                               radius=6.0, text_height=5.0, color=7)
 
         # ===== 管徑標註 =====
         if pipe_diameter > 0 and upper_seg_positions:
@@ -6919,44 +7189,41 @@ Solid 名稱: {solid_name}
 
             log_print(f"  上圖繪製完成（共用 plan view）")
 
-            # 含支架延伸的總寬度尺寸標註（上圖下方）
-            _btw = plan_r2.get('bracket_total_width', 0) if plan_r2 else 0
-            if _btw > 0 and bracket_count > 0:
-                _baw = plan_r2.get('bracket_arm_ext', 0)
-                _bpr = plan_r2.get('pipe_r', pipe_r)
-                # 收集所有支架/管壁位置的紙面座標
-                _dim_pts = []
-                for bi in range(bracket_count):
-                    bt = (bi + 0.5) / bracket_count
-                    ba = math.radians(plan_sa_deg + bt * plan_span_deg)
-                    cos_ba, sin_ba = math.cos(ba), math.sin(ba)
-                    _dim_pts.append(_m2u(
-                        arc_cx_m + (R_arc + _bpr + _baw) * cos_ba,
-                        arc_cy_m + (R_arc + _bpr + _baw) * sin_ba))
-                    _dim_pts.append(_m2u(
-                        arc_cx_m + (R_arc - _bpr - _baw) * cos_ba,
-                        arc_cy_m + (R_arc - _bpr - _baw) * sin_ba))
-                for _ea_i in [plan_sa_deg, plan_sa_deg + plan_span_deg]:
-                    _ea_r = math.radians(_ea_i)
-                    for _r_off in [R_arc + _bpr, R_arc - _bpr]:
-                        _dim_pts.append(_m2u(
-                            arc_cx_m + _r_off * math.cos(_ea_r),
-                            arc_cy_m + _r_off * math.sin(_ea_r)))
-                dim_left = min(p[0] for p in _dim_pts)
-                dim_right = max(p[0] for p in _dim_pts)
-                dim_bottom = min(p[1] for p in _dim_pts) - 5
-                self._draw_dimension_line(msp2,
-                                          (dim_left, dim_bottom),
-                                          (dim_right, dim_bottom),
-                                          -8, f"{_btw:.0f}")
+            # ---- 彎軌區段的上下軌實際間距（取 centroid Z 軸向距離）----
+            _curved_rail_spacing = rail_spacing  # fallback
+            if c_upper and c_lower:
+                _u_fid_c = c_upper[0].get('solid_id', '')
+                _l_fid_c = c_lower[0].get('solid_id', '')
+                _u_cen = class_map_all.get(_u_fid_c, {}).get('centroid', None)
+                _l_cen = class_map_all.get(_l_fid_c, {}).get('centroid', None)
+                if _u_cen and _l_cen:
+                    gn = self._ground_normal
+                    y_up = (gn == (0, 1, 0))
+                    _curved_rail_spacing = (abs(_u_cen[1] - _l_cen[1]) if y_up
+                                            else abs(_u_cen[2] - _l_cen[2]))
+                    log_print(f"  彎軌 rail_spacing={_curved_rail_spacing:.1f} "
+                              f"(vs averaged={rail_spacing:.1f})")
+
+            # 軌道兩端點 3D 距離標註（上圖下方）
+            # 計算弧管端點間 3D 距離
+            _arc_ep_3d_dist = 0
+            if u_sp_3d != (0, 0, 0) and u_ep_3d != (0, 0, 0):
+                _d3 = math.sqrt(sum((a - b)**2 for a, b in zip(u_sp_3d, u_ep_3d)))
+                _arc_ep_3d_dist = _d3
             elif plan_valid:
+                # fallback: XY chord + height
+                _xy_ch = math.sqrt((plan_p1[0] - plan_p2[0])**2 + (plan_p1[1] - plan_p2[1])**2)
+                _arc_ep_3d_dist = math.sqrt(_xy_ch**2 + arc_height_gain**2)
+
+            if plan_valid:
                 p1_d = _m2u(*plan_p1)
                 p2_d = _m2u(*plan_p2)
                 chord_dim_y = min(p1_d[1], p2_d[1]) - 5
+                dim_text = f"{_arc_ep_3d_dist:.0f}" if _arc_ep_3d_dist > 0 else f"{chord_length:.0f}"
                 self._draw_dimension_line(msp2,
                                           (min(p1_d[0], p2_d[0]), chord_dim_y),
                                           (max(p1_d[0], p2_d[0]), chord_dim_y),
-                                          -8, f"{chord_length:.0f}")
+                                          -8, dim_text)
 
             # ================================================================
             # 下半部：左前視圖 — 使用 pipe_data 3D→2D 投影
@@ -7087,12 +7354,11 @@ Solid 名稱: {solid_name}
             if l_pts_2d:
                 _draw_pipe_curve(msp2, l_pts_2d, pipe_hw_l, center_color=8)
 
-            # 支撐架（連接上下軌 + 延伸到下軌以下 + 旋轉 X 標記 + 圓圈）
-            _first_below_len = 0  # 記錄第一支腳架下軌以下延伸長度（供尺寸標注）
+            # 支撐架（連接上下軌，不超過上下軌範圍 + X 標記 + 圓圈）
             if bracket_count > 0 and u_pts_2d and l_pts_2d:
                 n_u = len(u_pts_2d)
                 n_l = len(l_pts_2d)
-                leg_hw = min(pipe_hw_l * 0.6, 1.5)  # 腳架管壁半寬
+                leg_hw = min(pipe_hw_l * 0.6, 1.5)  # 支撐架管壁半寬
                 x_sz = min(1.5, pipe_hw_l * 0.6)     # X 標記大小
                 circle_r = x_sz * 0.5
                 for bi in range(bracket_count):
@@ -7103,21 +7369,11 @@ Solid 名稱: {solid_name}
                     u_pt = _m2l(*u_pts_2d[idx_u])
                     l_pt = _m2l(*l_pts_2d[idx_l])
 
-                    # 計算腳架延伸（下軌以下）
-                    _ll = leg_lengths[bi] if bi < len(leg_lengths) else (
-                        leg_lengths[0] if leg_lengths else 0)
-                    _through = rail_spacing
-                    _remain = max(0, _ll - _through)
-                    _above = min(_remain * 0.08, 40)
-                    _below = _remain - _above
-                    if bi == 0:
-                        _first_below_len = _below
+                    # 支撐架只在上下軌之間，不延伸超過
+                    leg_top = u_pt
+                    leg_foot = l_pt
 
-                    # 腳架頂端和底端（含延伸）
-                    leg_top = (u_pt[0], u_pt[1] + _above * lower_scale)
-                    leg_foot = (l_pt[0], l_pt[1] - _below * lower_scale)
-
-                    # 腳架管壁雙線（從頂端到底端）
+                    # 支撐架管壁雙線（從上軌到下軌）
                     msp2.add_line((leg_top[0] - leg_hw, leg_top[1]),
                                  (leg_foot[0] - leg_hw, leg_foot[1]))
                     msp2.add_line((leg_top[0] + leg_hw, leg_top[1]),
@@ -7131,7 +7387,7 @@ Solid 名稱: {solid_name}
                         _bdx, _bdy = _bdx / _bd, _bdy / _bd
                     else:
                         _bdx, _bdy = 0, -1
-                    _tdx, _tdy = -_bdy, _bdx  # 垂直方向（軌道切線）
+                    _tdx, _tdy = -_bdy, _bdx
                     _xax = (_bdx + _tdx) * x_sz
                     _xay = (_bdy + _tdy) * x_sz
                     _xbx = (_bdx - _tdx) * x_sz
@@ -7153,14 +7409,77 @@ Solid 名稱: {solid_name}
                     msp2.add_circle((u_pt[0] + leg_hw, u_pt[1]), circle_r)
                     msp2.add_circle((l_pt[0] - leg_hw, l_pt[1]), circle_r)
                     msp2.add_circle((l_pt[0] + leg_hw, l_pt[1]), circle_r)
-                    # 腳架底部圓圈
-                    if _below > 1:
-                        msp2.add_circle((leg_foot[0] - leg_hw, leg_foot[1]), circle_r)
-                        msp2.add_circle((leg_foot[0] + leg_hw, leg_foot[1]), circle_r)
 
             log_print(f"  下圖繪製完成（pipe_data 左前視圖）")
 
+            # ================================================================
+            # 球號標註
+            # 軌道取料球號：U1（上軌）、D1（下軌）→ 藍色文字 + 引線指向材料中心
+            # BOM 球號：1（支撐架）→ 業界慣例氣泡
+            # ================================================================
+            balloon_r = 5.0      # BOM 氣泡圓半徑
+            balloon_th = 3.5     # BOM 球號文字高度
+            cl_label_offset = 18  # 取料球號離軌道的偏移距離
+
+            # ---- 軌道取料球號：U1（上軌）— 藍色文字 + 引線 ----
+            if u_pts_2d and len(u_pts_2d) > 10:
+                # 材料中心點（上軌中點）
+                u_mid_idx = len(u_pts_2d) // 2
+                u_center = _m2l(*u_pts_2d[u_mid_idx])
+                # 文字放在中心點外側偏移處
+                u_lbl = (u_center[0] - cl_label_offset,
+                         u_center[1] + cl_label_offset)
+                msp2.add_text('U1', dxfattribs={
+                    'height': 4.5, 'color': 5
+                }).set_placement(u_lbl,
+                                 align=ezdxf.enums.TextEntityAlignment.CENTER)
+                # 引線：從文字指向材料中心
+                msp2.add_line(u_lbl, u_center, dxfattribs={'color': 5})
+
+            # ---- 軌道取料球號：D1（下軌）— 藍色文字 + 引線 ----
+            if l_pts_2d and len(l_pts_2d) > 10:
+                # 材料中心點（下軌中點）
+                l_mid_idx = len(l_pts_2d) // 2
+                l_center = _m2l(*l_pts_2d[l_mid_idx])
+                # 文字放在中心點外側偏移處
+                l_lbl = (l_center[0] - cl_label_offset,
+                         l_center[1] - cl_label_offset)
+                msp2.add_text('D1', dxfattribs={
+                    'height': 4.5, 'color': 5
+                }).set_placement(l_lbl,
+                                 align=ezdxf.enums.TextEntityAlignment.CENTER)
+                # 引線：從文字指向材料中心
+                msp2.add_line(l_lbl, l_center, dxfattribs={'color': 5})
+
+            # ---- BOM 球號：1（支撐架）— 標註於側視圖中間的支撐架 ----
+            if (bracket_count > 0 and u_pts_2d and l_pts_2d
+                    and len(u_pts_2d) > 5 and len(l_pts_2d) > 5):
+                # 選中間支撐架
+                mid_bi = bracket_count // 2
+                n_u = len(u_pts_2d)
+                n_l = len(l_pts_2d)
+                idx_u_mid = int((mid_bi + 0.5) / bracket_count * (n_u - 1))
+                idx_l_mid = int((mid_bi + 0.5) / bracket_count * (n_l - 1))
+                idx_u_mid = max(0, min(idx_u_mid, n_u - 1))
+                idx_l_mid = max(0, min(idx_l_mid, n_l - 1))
+                brk_u = _m2l(*u_pts_2d[idx_u_mid])
+                brk_l = _m2l(*l_pts_2d[idx_l_mid])
+                # 支撐架中點
+                brk_mid = ((brk_u[0] + brk_l[0]) / 2,
+                           (brk_u[1] + brk_l[1]) / 2)
+                # 氣泡放在支撐架右側
+                brk_balloon = (brk_mid[0] + cl_label_offset + 5,
+                               brk_mid[1])
+                self._draw_balloon(msp2, '1', brk_balloon, brk_mid,
+                                   radius=balloon_r, text_height=balloon_th)
+
+            log_print(f"  球號標註完成（U1, D1, BOM-1）")
+
             # ---- 高低差標註（右側垂直：上軌起點→上軌終點的 Z 差）----
+            # 同時記錄 dim_x_right 和低 Y 端點，供 rail_spacing 標註使用
+            _hg_dim_x = None   # 高低差尺寸線 X 座標
+            _hg_lower_y = None  # 高低差尺寸的下端 Y 座標
+            _hg_lower_track_y = None  # 對應的下軌端點 Y 座標
             if arc_height_gain > 1 and u_pts_2d:
                 u_start_d = _m2l(*u_pts_2d[0])
                 u_end_d = _m2l(*u_pts_2d[-1])
@@ -7171,28 +7490,25 @@ Solid 名稱: {solid_name}
                                           (dim_x_right, u_end_d[1]),
                                           10, f"{arc_height_gain:.1f}",
                                           vertical=True)
+                _hg_dim_x = dim_x_right
+                # 記錄高低差的低端 Y（= 上軌的低端）
+                _hg_lower_y = min(u_start_d[1], u_end_d[1])
+                # 找出對應端（與低 Y 同側的下軌端點）
+                if l_pts_2d:
+                    if u_start_d[1] < u_end_d[1]:
+                        # start 是低端 → 用 l_pts_2d[0]
+                        _hg_lower_track_y = _m2l(*l_pts_2d[0])[1]
+                    else:
+                        # end 是低端 → 用 l_pts_2d[-1]
+                        _hg_lower_track_y = _m2l(*l_pts_2d[-1])[1]
 
-            # ---- 上下軌距離標註（底部：弧起點處上下軌 Z 差，匹配標準圖）----
-            if rail_spacing > 0 and u_pts_2d and l_pts_2d:
-                # 取弧起點（較低 Z = 圖面下方）
-                u_start_d = _m2l(*u_pts_2d[0])
-                l_start_d = _m2l(*l_pts_2d[0])
-                dim_x_sp = min(u_start_d[0], l_start_d[0]) - 15
+            # ---- 上下軌距離標註（正下方，與高低差同 X 座標）----
+            if _curved_rail_spacing > 0 and _hg_dim_x is not None and \
+                    _hg_lower_y is not None and _hg_lower_track_y is not None:
                 self._draw_dimension_line(msp2,
-                                          (dim_x_sp, u_start_d[1]),
-                                          (dim_x_sp, l_start_d[1]),
-                                          -10, f"{rail_spacing:.1f}",
-                                          vertical=True)
-
-            # ---- 腳架延伸長度標註（下軌到底端的垂直距離）----
-            if _first_below_len > 1 and l_pts_2d:
-                l_start_d = _m2l(*l_pts_2d[0])
-                _foot_y = l_start_d[1] - _first_below_len * lower_scale
-                dim_x_leg = min(l_start_d[0], l_start_d[0]) - 30
-                self._draw_dimension_line(msp2,
-                                          (dim_x_leg, l_start_d[1]),
-                                          (dim_x_leg, _foot_y),
-                                          -10, f"{_first_below_len:.1f}",
+                                          (_hg_dim_x, _hg_lower_y),
+                                          (_hg_dim_x, _hg_lower_track_y),
+                                          10, f"{_curved_rail_spacing:.1f}",
                                           vertical=True)
 
             # ================================================================
