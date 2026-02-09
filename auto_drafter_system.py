@@ -1907,43 +1907,36 @@ class MockCADEngine:
         leg_parts = [c for c in self._part_classifications if c['class'] == 'leg']
         for i, leg in enumerate(leg_parts, 1):
             fid = leg['feature_id']
-
-            # 腳架線長計算：優先使用 pipe_data 的中心線長度
-            # pipe_data 直接提供管路中心線的真實長度
-            # bounding box 會包含法蘭等附件，導致長度過大
+            centroid = leg['centroid']
             pipe_data = pipe_map.get(fid)
             feat = next((f for f in self.features if f.id == fid), None)
 
-            if pipe_data and pipe_data.get('total_length', 0) > 0:
-                # 腳架線長計算：
-                # OCP 方法的 total_length 來自圓柱面面積加總，包含底座插入部分
-                # face_extent 是主要圓柱面沿管方向的 min/max 跨距（含間隙）
-                # face_extent - pipe_diameter ≈ 製造切管長度（扣除端面效應）
-                fe = pipe_data.get('face_extent')
-                pd = pipe_data.get('pipe_diameter', 0)
-                if fe is not None and pd > 0 and pipe_data.get('method') == 'ocp':
-                    line_length = round(fe - pd, 1)
-                    log_print(f"  [LineLength] {fid}: face_extent={fe:.1f} - pipe_d={pd:.1f} = {line_length:.1f}")
-                else:
-                    line_length = pipe_data.get('total_length', 0)
-            elif feat:
+            # 腳架長度 = total_length - 腳架座
+            # 腳架座 = max(bbox) - total_length（bbox 包含腳架座，pipe 不含）
+            if feat:
                 bl = feat.params.get('bbox_l', 0)
                 bw = feat.params.get('bbox_w', 0)
                 bh = feat.params.get('bbox_h', 0)
-                # 腳架垂直放置，取最長邊作為線長
+                bbox_max = max(bl, bw, bh)
+            else:
+                bl, bw, bh = 0, 0, 0
+                bbox_max = 0
+
+            if pipe_data and pipe_data.get('total_length', 0) > 0:
+                total_len = pipe_data.get('total_length', 0)
+                base_socket = bbox_max - total_len if bbox_max > total_len else 0  # 腳架座
+                line_length = round(total_len - base_socket, 1)
+                log_print(f"  [LineLength] {fid}: total={total_len:.1f}, bbox_max={bbox_max:.1f}, "
+                          f"腳架座={base_socket:.1f}, 腳架長度={line_length:.1f}")
+            elif feat:
                 line_length = max(bl, bw, bh)
             else:
                 line_length = 0
 
-            # centroid from part_classifications
-            pc_entry = next((c for c in self._part_classifications
-                             if c['feature_id'] == fid), None)
-            centroid = pc_entry['centroid'] if pc_entry else (0, 0, 0)
-
             result['leg_items'].append({
                 'item': i,
                 'name': '腳架',
-                'quantity': 2,  # 修正：腳架應該有2隻
+                'quantity': 2,
                 'spec': f"線長L={line_length:.1f}",
                 'feature_id': fid,
                 'centroid': centroid,
@@ -5576,9 +5569,20 @@ Solid 名稱: {solid_name}
         track_pipes = [pc for pc in pipe_centerlines
                        if class_map.get(pc['solid_id'], {}).get('class') == 'track']
 
-        # 收集所有 track pipe 端點
+        # 使用 _detect_track_sections 區分上/下軌，只取上軌端點
+        track_items = stp_data.get('track_items', [])
+        sections = self._detect_track_sections(pipe_centerlines, part_classifications, track_items)
+        upper_solid_ids = set()
+        for sec in sections:
+            for t in sec.get('upper_tracks', []):
+                upper_solid_ids.add(t['solid_id'])
+
+        upper_track_pipes = [tp for tp in track_pipes if tp['solid_id'] in upper_solid_ids]
+        log_print(f"  [Drawing 0] 上軌 {len(upper_track_pipes)}/{len(track_pipes)} tracks")
+
+        # 收集上軌 track pipe 端點
         all_endpoints = []
-        for tp in track_pipes:
+        for tp in upper_track_pipes:
             sp = tp.get('start_point', (0, 0, 0))
             ep = tp.get('end_point', (0, 0, 0))
             all_endpoints.append(sp)
@@ -5606,14 +5610,19 @@ Solid 名稱: {solid_name}
                   f"track_span_xy={track_span_xy:.1f}, arc_R={arc_radius:.0f}")
 
         # ==== 3D → 2D 投影輔助函數 ====
-        # 等角投影方向（從右前上方觀看）
-        iso_main = (1, 1, 1)  # 視線方向
-        iso_x = (1, 0, -1)    # 水平軸
-        # 正規化
+        # 等角投影方向（從右後上方觀看，顯示彎軌凹面）
+        iso_main = (0.5, 1.5, 0.8)  # 視線方向（正面為主、微側、微俯）
+        iso_x_hint = (1, -1, -0.35)  # 水平軸提示（OCP 會正交化）
+        # 正規化 main
         iso_main_len = math.sqrt(sum(c**2 for c in iso_main))
         iso_main_n = tuple(c / iso_main_len for c in iso_main)
-        iso_x_len = math.sqrt(sum(c**2 for c in iso_x))
-        iso_x_n = tuple(c / iso_x_len for c in iso_x)
+        # 正交化 iso_x：移除沿 main 的分量，確保與 HLR 一致
+        _xr_len = math.sqrt(sum(c**2 for c in iso_x_hint))
+        _xr = tuple(c / _xr_len for c in iso_x_hint)
+        _dot = sum(_xr[i] * iso_main_n[i] for i in range(3))
+        _xo = tuple(_xr[i] - _dot * iso_main_n[i] for i in range(3))
+        _xo_len = math.sqrt(sum(c**2 for c in _xo))
+        iso_x_n = tuple(c / _xo_len for c in _xo)
         # y_dir = cross(main, x)
         iso_y_n = (
             iso_main_n[1] * iso_x_n[2] - iso_main_n[2] * iso_x_n[1],
@@ -5664,7 +5673,7 @@ Solid 名稱: {solid_name}
 
         # ==== 右半：俯視 HLR 視圖（獨立於 Drawing 2） ====
         top_main = (0, 0, -1)  # 從上往下看
-        top_x = (1, 0, 0)     # X 向右
+        top_x = (0, 1, 0)     # Y 向右（弧沿 Y 展開→螢幕水平）
         top_polylines, top_bbox = self._hlr_project_to_polylines(top_main, top_x)
 
         right_area_x = PW * 0.50 + 5
@@ -5686,10 +5695,10 @@ Solid 名稱: {solid_name}
                 if len(dxf_pts) >= 2:
                     msp.add_lwpolyline(dxf_pts)
 
-            # 投影 3D→2D：top-down view (main=(0,0,-1), x=(1,0,0))
-            # HLR Y 方向 = cross(main, x) = (0,-1,0) → projected_y = -model_y
+            # 投影 3D→2D：top-down view (main=(0,0,-1), x=(0,1,0))
+            # HLR maps: screen_x = dot(pt, x_dir) = model_y, screen_y = model_x
             def _project_top(pt3d):
-                return (pt3d[0], -pt3d[1])
+                return (pt3d[1], pt3d[0])
 
             # 軌道端點跨距尺寸（自動偵測方向）
             top_a = _project_top(pt_a)
@@ -5760,8 +5769,8 @@ Solid 名稱: {solid_name}
                                r_proj[1] * top_scale + top_off_y)
 
                     # 引線方向（從弧面徑向外推）
-                    r_dir_x = math.cos(r_angle)
-                    r_dir_y = -math.sin(r_angle)  # 對應 flip: -model_y
+                    r_dir_x = math.sin(r_angle)
+                    r_dir_y = math.cos(r_angle)  # 對應新投影: swap X↔Y
                     r_ext = 15
                     r_tip = (r_paper[0] + r_dir_x * r_ext,
                              r_paper[1] + r_dir_y * r_ext)
