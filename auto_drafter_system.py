@@ -5197,6 +5197,39 @@ Solid 名稱: {solid_name}
         msp.add_line((tx, ty), (ax1, ay1), dxfattribs={'color': color})
         msp.add_line((tx, ty), (ax2, ay2), dxfattribs={'color': color})
 
+    # 取料球號引線固定長度（紙面 mm）— Draw 0/1/2/3 全圖面一致
+    CL_LEADER_LEN = 18
+
+    def _draw_cl_label(self, msp, label, center_pt, dim_side,
+                       text_height=4.5):
+        """
+        繪製取料球號標示（藍色文字 + 引線指向材料中心點）。
+        Draw 0/1/2/3 共用 — 統一規格。
+
+        規格：
+          - 藍色文字（DXF color=5），不使用氣泡圓
+          - 引線長度一致：固定 CL_LEADER_LEN（18mm 紙面）
+          - 垂直外側方向：上軌(dim_side=+1)向上、下軌(dim_side=-1)向下
+
+        Args:
+            msp: DXF modelspace
+            label: 球號文字 (e.g. 'U1', 'D1', 'U2')
+            center_pt: 材料中心線座標 (x, y)
+            dim_side: +1=上方（上軌）, -1=下方（下軌）
+            text_height: 文字高度，預設 4.5
+        """
+        cx, cy = center_pt
+        lbl_x = cx
+        lbl_y = cy + dim_side * self.CL_LEADER_LEN
+        # 藍色文字
+        msp.add_text(str(label), dxfattribs={
+            'height': text_height, 'color': 5
+        }).set_placement((lbl_x, lbl_y),
+                         align=ezdxf.enums.TextEntityAlignment.CENTER)
+        # 引線：從文字指向材料中心點（長度固定 = CL_LEADER_LEN）
+        msp.add_line((lbl_x, lbl_y), (cx, cy),
+                     dxfattribs={'color': 5})
+
     def _draw_cutting_list_table(self, msp, x, y, items):
         """
         繪製軌道取料明細表
@@ -6301,30 +6334,10 @@ Solid 名稱: {solid_name}
                             dim_side * x_dir * (pipe_hw + 8),
                             f"{seg_len:.1f}")
 
-                    # 取料球號標註（藍色文字 + 引線指向材料中心點）
-                    # 不使用氣泡圓以避免與 BOM 球號混淆
+                    # 取料球號標註（共用 _draw_cl_label）
                     if label and draw_len > 5:
-                        # 材料中心點（段中點）
-                        mid_sx = (sx + ex) / 2
-                        mid_sy = (sy + ey) / 2
-                        # 文字偏移位置（法線方向偏移）
-                        label_offset = dim_side * x_dir * (pipe_hw + 16)
-                        seg_d_lbl = math.sqrt(dx**2 + dy**2)
-                        if seg_d_lbl > 1e-6:
-                            lbl_nx = -dy / seg_d_lbl
-                            lbl_ny = dx / seg_d_lbl
-                        else:
-                            lbl_nx, lbl_ny = 0, 1
-                        lbl_x = mid_sx + lbl_nx * label_offset
-                        lbl_y = mid_sy + lbl_ny * label_offset
-                        # 藍色文字
-                        msp.add_text(str(label), dxfattribs={
-                            'height': 4.5, 'color': 5
-                        }).set_placement((lbl_x, lbl_y),
-                                         align=ezdxf.enums.TextEntityAlignment.CENTER)
-                        # 引線：從文字指向材料中心點
-                        msp.add_line((lbl_x, lbl_y), (mid_sx, mid_sy),
-                                     dxfattribs={'color': 5})
+                        mid_pt = ((sx + ex) / 2, (sy + ey) / 2)
+                        self._draw_cl_label(msp, label, mid_pt, dim_side)
 
                     # 垂直分量：只在段末端畫輔助線（不加文字標註，避免重疊）
                     vert_comp = abs(seg_len * math.sin(rad))
@@ -6408,20 +6421,11 @@ Solid 名稱: {solid_name}
                             msp.add_line((cx, cy), (cx, cy + ref_len),
                                          dxfattribs={'color': 8})
 
-                    # 彎曲段取料球號標註（藍色文字 + 引線指向彎點中心）
+                    # 彎曲段取料球號標註（共用 _draw_cl_label）
                     arc_label = item.get('label', '')
                     if arc_label:
-                        arc_lbl_offset = dim_side * x_dir * (pipe_hw + 22)
-                        lbl_x = cx + arc_lbl_offset * 0.5
-                        lbl_y = cy + abs(arc_lbl_offset) * 0.7
-                        # 藍色文字
-                        msp.add_text(str(arc_label), dxfattribs={
-                            'height': 4.5, 'color': 5
-                        }).set_placement((lbl_x, lbl_y),
-                                         align=ezdxf.enums.TextEntityAlignment.CENTER)
-                        # 引線：從文字指向彎點中心
-                        msp.add_line((lbl_x, lbl_y), (cx, cy),
-                                     dxfattribs={'color': 5})
+                        self._draw_cl_label(msp, arc_label, (cx, cy),
+                                            dim_side)
 
             # 端蓋
             if seg_positions:
@@ -6613,17 +6617,13 @@ Solid 名稱: {solid_name}
             ll = leg.get('line_length', 0)  # from stp_data (cutting_list)
 
             # === 腳架在繪圖路徑上的位置 ===
-            # 標準圖慣例：腳架位於軌道的末端（terminal end）
-            # 單一腳架：直接放在上軌路徑終點
+            # 標準圖：腳架位於轉折點（bend）附近，約 40-50% 沿路徑
+            # 單一腳架：放在路徑約 45% 處（靠近彎點）
             # 多支腳架：從路徑中段到末端均勻分布
             if n_legs == 1:
-                # 單一腳架：放在上軌路徑終點
-                if upper_seg_positions:
-                    last_seg = upper_seg_positions[-1]
-                    leg_draw_x = last_seg[2]  # 終點 X
-                    upper_y = last_seg[3]       # 終點 Y
-                else:
-                    leg_draw_x, upper_y = _interp_path(0.95)
+                # 單一腳架：放在路徑約 45%（彎點附近，偏向入口端）
+                t = 0.45
+                leg_draw_x, upper_y = _interp_path(t)
             else:
                 # 多支腳架：從路徑中段到末端均勻分布
                 t = 0.55 + (li / max(n_legs - 1, 1)) * 0.35  # 0.55 ~ 0.90
@@ -7419,37 +7419,18 @@ Solid 名稱: {solid_name}
             # ================================================================
             balloon_r = 5.0      # BOM 氣泡圓半徑
             balloon_th = 3.5     # BOM 球號文字高度
-            cl_label_offset = 18  # 取料球號離軌道的偏移距離
 
-            # ---- 軌道取料球號：U1（上軌）— 藍色文字 + 引線 ----
+            # ---- 軌道取料球號：U1（上軌）— 共用 _draw_cl_label ----
             if u_pts_2d and len(u_pts_2d) > 10:
-                # 材料中心點（上軌中點）
                 u_mid_idx = len(u_pts_2d) // 2
                 u_center = _m2l(*u_pts_2d[u_mid_idx])
-                # 文字放在中心點外側偏移處
-                u_lbl = (u_center[0] - cl_label_offset,
-                         u_center[1] + cl_label_offset)
-                msp2.add_text('U1', dxfattribs={
-                    'height': 4.5, 'color': 5
-                }).set_placement(u_lbl,
-                                 align=ezdxf.enums.TextEntityAlignment.CENTER)
-                # 引線：從文字指向材料中心
-                msp2.add_line(u_lbl, u_center, dxfattribs={'color': 5})
+                self._draw_cl_label(msp2, 'U1', u_center, dim_side=+1)
 
-            # ---- 軌道取料球號：D1（下軌）— 藍色文字 + 引線 ----
+            # ---- 軌道取料球號：D1（下軌）— 共用 _draw_cl_label ----
             if l_pts_2d and len(l_pts_2d) > 10:
-                # 材料中心點（下軌中點）
                 l_mid_idx = len(l_pts_2d) // 2
                 l_center = _m2l(*l_pts_2d[l_mid_idx])
-                # 文字放在中心點外側偏移處
-                l_lbl = (l_center[0] - cl_label_offset,
-                         l_center[1] - cl_label_offset)
-                msp2.add_text('D1', dxfattribs={
-                    'height': 4.5, 'color': 5
-                }).set_placement(l_lbl,
-                                 align=ezdxf.enums.TextEntityAlignment.CENTER)
-                # 引線：從文字指向材料中心
-                msp2.add_line(l_lbl, l_center, dxfattribs={'color': 5})
+                self._draw_cl_label(msp2, 'D1', l_center, dim_side=-1)
 
             # ---- BOM 球號：1（支撐架）— 標註於側視圖中間的支撐架 ----
             if (bracket_count > 0 and u_pts_2d and l_pts_2d
@@ -7468,7 +7449,7 @@ Solid 名稱: {solid_name}
                 brk_mid = ((brk_u[0] + brk_l[0]) / 2,
                            (brk_u[1] + brk_l[1]) / 2)
                 # 氣泡放在支撐架右側
-                brk_balloon = (brk_mid[0] + cl_label_offset + 5,
+                brk_balloon = (brk_mid[0] + self.CL_LEADER_LEN + 5,
                                brk_mid[1])
                 self._draw_balloon(msp2, '1', brk_balloon, brk_mid,
                                    radius=balloon_r, text_height=balloon_th)
