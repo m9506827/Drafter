@@ -108,6 +108,18 @@ class MockCADEngine:
     負責實際的幾何運算與 3D->2D 投影
     支援從 STEP/STL 檔案讀取 3D 模型
     """
+    # ---- 標題欄預設值（當 config 及 STP 均無資料時使用） ----
+    _TB_DEFAULTS = {
+        'company':        'iDrafter股份有限公司',
+        'drawer':         'Drafter',
+        'units':          'mm',
+        'scale':          '1:10',
+        'material':       'STK-400',
+        'finish':         '裁切及焊接',
+        'version':        '01',
+        'quantity':        '1',
+    }
+
     def __init__(self, model_file: Optional[str] = None):
         """
         初始化 CAD 引擎
@@ -125,9 +137,11 @@ class MockCADEngine:
         self._angles = []  # 角度計算結果
         self._ground_normal = (0, 1, 0)  # 模型垂直軸方向 (Y-up 預設)
         self._cutting_list = {}  # 取料明細
+        self._drafter_config = {}  # 外部設定檔覆蓋值
 
         if model_file and os.path.exists(model_file):
             self.load_3d_file(model_file)
+            self._load_drafter_config(model_file)
         else:
             # 模擬載入了一個帶有一個孔的方塊
             self.features = [
@@ -135,7 +149,87 @@ class MockCADEngine:
                 GeometricFeature("F02", "circle", {'radius': 10, 'x': 0, 'y': 0}, "center_hole")
             ]
             log_print("[CAD Kernel] Using mock data (no 3D file loaded)")
-    
+
+    # ----------------------------------------------------------------
+    # 設定檔載入 / 標題欄資訊建構
+    # ----------------------------------------------------------------
+
+    def _load_drafter_config(self, model_file: str):
+        """
+        載入 drafter_config.json 設定檔。
+        搜尋順序：
+          1. 與 STP 同目錄的 drafter_config.json
+          2. 工作目錄的 drafter_config.json
+        有效的 key（全部可選）：
+          company, drawer, material, finish, scale, version, quantity
+        """
+        import json as _json
+        candidates = []
+        if model_file:
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(model_file)),
+                                           'drafter_config.json'))
+        candidates.append(os.path.join(os.getcwd(), 'drafter_config.json'))
+
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        cfg = _json.load(f)
+                    if isinstance(cfg, dict):
+                        self._drafter_config = cfg
+                        log_print(f"[Config] 載入設定檔: {path}")
+                        for k, v in cfg.items():
+                            log_print(f"  {k} = {v}")
+                        return
+                except Exception as e:
+                    log_print(f"[Config] 讀取設定檔失敗 ({path}): {e}", "warning")
+        # 沒有找到設定檔 — 靜默使用預設值
+
+    def _build_tb_info(self, info: Dict, base_name: str,
+                       drawing_name: str, drawing_number: str,
+                       today: str, **overrides) -> Dict:
+        """
+        建構標題欄資訊字典（所有 Drawing 共用）。
+
+        優先順序：overrides > config > STP 中繼資料 > hardcoded 預設值
+
+        Args:
+            info: get_model_info() 的回傳值（含 STP 中繼資料）
+            base_name: 檔案基本名稱（如 '2-2'）
+            drawing_name: 圖面名稱（如 '彎軌軌道總圖'）
+            drawing_number: 圖號（如 '2-2', 'LM-11'）
+            today: 日期字串 YYYY/MM/DD
+            **overrides: 額外覆蓋值
+        """
+        cfg = self._drafter_config
+        defaults = self._TB_DEFAULTS
+
+        # 案名：config > STP product_name > base_name
+        project = (cfg.get('project')
+                   or info.get('product_name')
+                   or base_name)
+
+        # 日期：config > STP creation_date > 系統日期
+        date_str = cfg.get('date') or info.get('creation_date') or today
+
+        tb = {
+            'company':        cfg.get('company',  defaults['company']),
+            'project':        project,
+            'drawing_name':   drawing_name,
+            'drawer':         cfg.get('drawer',   defaults['drawer']),
+            'date':           date_str,
+            'units':          cfg.get('units',    info.get('units') or defaults['units']),
+            'scale':          cfg.get('scale',    defaults['scale']),
+            'material':       cfg.get('material', defaults['material']),
+            'finish':         cfg.get('finish',   defaults['finish']),
+            'drawing_number': drawing_number,
+            'version':        cfg.get('version',  defaults['version']),
+            'quantity':       cfg.get('quantity', defaults['quantity']),
+        }
+        # 呼叫端可透過 overrides 覆蓋任何欄位
+        tb.update(overrides)
+        return tb
+
     def load_3d_file(self, filename: str):
         """
         從檔案讀取 3D 模型 (支援 STEP/STL)
@@ -3605,6 +3699,12 @@ class MockCADEngine:
         """
         從 STEP 檔案中提取元資料
         STEP 檔案包含豐富的元資料，如作者、組織、軟體來源等
+
+        解析順序：
+        1. FILE_NAME 實體（ISO 10303-21 標準 header）：日期、作者、組織、軟體
+        2. PRODUCT 實體：產品名稱（優先 name，其次 id）
+        3. FILE_DESCRIPTION 實體：描述、來源軟體
+        4. SI_UNIT / LENGTH_UNIT：長度單位
         """
         if not self.model_file or not os.path.exists(self.model_file):
             return info
@@ -3619,62 +3719,99 @@ class MockCADEngine:
                     lines.append(line)
                 content = ''.join(lines)
 
-            # 提取來源軟體
             import re
 
-            # 提取產品名稱 - 從 PRODUCT 實體中查找
-            # STEP 格式: PRODUCT('id', 'Product Name', 'description', (context));
-            product_patterns = [
-                r"PRODUCT\s*\(\s*'[^']*'\s*,\s*'([^']+)'",  # PRODUCT 第二個參數是產品名稱
-                r"PRODUCT_DEFINITION_FORMATION.*?'([^']+)'",
-                r"SHAPE_DEFINITION_REPRESENTATION.*?PRODUCT.*?'([^']+)'",
-            ]
-            for pattern in product_patterns:
-                product_match = re.search(pattern, content, re.IGNORECASE)
-                if product_match and product_match.group(1) and product_match.group(1).strip():
-                    name = product_match.group(1).strip()
-                    # 過濾掉明顯不是產品名稱的內容（如 ID、空字串、純數字）
-                    if name and not name.isdigit() and len(name) > 1:
-                        info["product_name"] = name
+            # ---- 1. 解析 FILE_NAME 實體（ISO 10303-21 標準） ----
+            # 格式: FILE_NAME('path','timestamp',('author'),('org'),'preprocessor','originating_sys','auth');
+            fn_match = re.search(
+                r"FILE_NAME\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*\(([^)]*)\)\s*,\s*\(([^)]*)\)\s*,\s*'([^']*)'\s*,\s*'([^']*)'",
+                content, re.IGNORECASE)
+            if fn_match:
+                _fn_path = fn_match.group(1).strip()      # 原始檔案路徑
+                _fn_ts   = fn_match.group(2).strip()       # 時間戳記
+                _fn_auth = fn_match.group(3).strip()       # 作者（含引號）
+                _fn_org  = fn_match.group(4).strip()       # 組織（含引號）
+                _fn_prep = fn_match.group(5).strip()       # preprocessor_version
+                _fn_orig = fn_match.group(6).strip()       # originating_system
+
+                # 日期：從 ISO 時間戳轉換
+                if _fn_ts and _fn_ts != 'none':
+                    try:
+                        # ISO format: 2026-02-02T08:59:06+00:00
+                        dt = datetime.fromisoformat(_fn_ts.replace('+00:00', '+00:00'))
+                        info["creation_date"] = dt.strftime("%Y/%m/%d")
+                    except (ValueError, TypeError):
+                        info["creation_date"] = _fn_ts
+
+                # 作者：清理引號，過濾 'none'
+                _auth_clean = re.findall(r"'([^']+)'", _fn_auth)
+                if _auth_clean:
+                    auth_val = _auth_clean[0].strip()
+                    if auth_val.lower() not in ('none', '', ' '):
+                        info["author"] = auth_val
+
+                # 組織：清理引號，過濾 'none'
+                _org_clean = re.findall(r"'([^']+)'", _fn_org)
+                if _org_clean:
+                    org_val = _org_clean[0].strip()
+                    if org_val.lower() not in ('none', '', ' '):
+                        info["organization"] = org_val
+
+                # 來源軟體：preprocessor_version 或 originating_system
+                if _fn_prep and _fn_prep.lower() != 'none':
+                    info["source_software"] = _fn_prep
+                elif _fn_orig and _fn_orig.lower() != 'none':
+                    info["source_software"] = _fn_orig
+
+            # ---- 2. 解析 PRODUCT 實體 ----
+            # STEP 格式: PRODUCT('id', 'name', 'description', (context));
+            # 優先取 name（第 2 參數），若為空則取 id（第 1 參數）
+            prod_match = re.search(
+                r"PRODUCT\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'",
+                content)
+            if prod_match:
+                prod_id   = prod_match.group(1).strip()
+                prod_name = prod_match.group(2).strip()
+                # 優先用 name（非空、非純數字、長度>1）
+                if prod_name and not prod_name.isdigit() and len(prod_name) > 1:
+                    info["product_name"] = prod_name
+                elif prod_id and len(prod_id) > 0:
+                    info["product_name"] = prod_id
+
+            # ---- 3. 若 FILE_NAME 未取到軟體，用 fallback 方式 ----
+            if not info.get("source_software"):
+                software_patterns = [
+                    r"ORIGINATING_SYSTEM\s*\(\s*'([^']+)'",
+                    r"(SolidWorks|CATIA|AutoCAD|Inventor|Fusion\s*360|Creo|NX|FreeCAD|OpenSCAD|Onshape)",
+                ]
+                for pattern in software_patterns:
+                    match = re.search(pattern, content, re.IGNORECASE)
+                    if match:
+                        info["source_software"] = match.group(1).strip()
                         break
 
-            # 查找來源軟體 - 常見格式
-            software_patterns = [
-                r"ORIGINATING_SYSTEM\s*\(\s*'([^']+)'",
-                r"FILE_DESCRIPTION.*?implementation_level.*?'([^']+)'",
-                r"preprocessor_version\s*=\s*'([^']+)'",
-                r"originating_system\s*=\s*'([^']+)'",
-                # 常見 CAD 軟體名稱
-                r"(SolidWorks|CATIA|AutoCAD|Inventor|Fusion\s*360|Creo|NX|FreeCAD|OpenSCAD|Onshape)",
-            ]
+            # ---- 4. 若 FILE_NAME 未取到作者/組織/日期，用 fallback ----
+            if not info.get("author"):
+                author_match = re.search(r"AUTHOR\s*\(\s*'([^']*)'", content, re.IGNORECASE)
+                if author_match and author_match.group(1):
+                    info["author"] = author_match.group(1)
 
-            for pattern in software_patterns:
-                match = re.search(pattern, content, re.IGNORECASE)
-                if match:
-                    info["source_software"] = match.group(1).strip()
-                    break
+            if not info.get("organization"):
+                org_match = re.search(r"ORGANIZATION\s*\(\s*'([^']*)'", content, re.IGNORECASE)
+                if org_match and org_match.group(1):
+                    info["organization"] = org_match.group(1)
 
-            # 查找作者
-            author_match = re.search(r"AUTHOR\s*\(\s*'([^']*)'", content, re.IGNORECASE)
-            if author_match and author_match.group(1):
-                info["author"] = author_match.group(1)
+            if not info.get("creation_date"):
+                date_match = re.search(r"TIME_STAMP\s*\(\s*'([^']*)'", content, re.IGNORECASE)
+                if date_match and date_match.group(1):
+                    info["creation_date"] = date_match.group(1)
 
-            # 查找組織
-            org_match = re.search(r"ORGANIZATION\s*\(\s*'([^']*)'", content, re.IGNORECASE)
-            if org_match and org_match.group(1):
-                info["organization"] = org_match.group(1)
-
-            # 查找日期
-            date_match = re.search(r"TIME_STAMP\s*\(\s*'([^']*)'", content, re.IGNORECASE)
-            if date_match and date_match.group(1):
-                info["creation_date"] = date_match.group(1)
-
-            # 查找描述
+            # ---- 5. 描述 ----
             desc_match = re.search(r"FILE_DESCRIPTION\s*\(\s*\(\s*'([^']*)'", content, re.IGNORECASE)
             if desc_match and desc_match.group(1):
                 info["description"] = desc_match.group(1)
 
-            # 查找單位
+            # ---- 6. 單位 ----
             unit_patterns = [
                 (r"SI_UNIT.*?\.MILLI\.", "mm"),
                 (r"SI_UNIT.*?\.CENTI\.", "cm"),
@@ -5849,21 +5986,12 @@ Solid 名稱: {solid_name}
             (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
             (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
 
-        # 標題欄
-        tb_info = {
-            'company': 'iDrafter股份有限公司',
-            'project': project,
-            'drawing_name': '彎軌軌道總圖',
-            'drawer': 'Drafter',
-            'date': today,
-            'units': 'mm',
-            'scale': '1:10',
-            'material': 'STK-400',
-            'finish': '裁切及焊接',
-            'drawing_number': base_name,
-            'version': '01',
-            'quantity': '1',
-        }
+        # 標題欄（config > STP > hardcoded）
+        info = self.get_model_info()
+        tb_info = self._build_tb_info(info, base_name,
+                                      drawing_name='彎軌軌道總圖',
+                                      drawing_number=base_name,
+                                      today=today)
         self._draw_title_block(msp, PW, PH, tb_info)
 
         # 圖號（右上角大字 — 只顯示 base_name，如 "2-2"）
@@ -5920,9 +6048,10 @@ Solid 名稱: {solid_name}
                   f"track_span_xy={track_span_xy:.1f}, arc_R={arc_radius:.0f}")
 
         # ==== 3D → 2D 投影輔助函數 ====
-        # 等角投影方向（X 軸旋轉 180°：Y→-Y, Z→-Z）
-        iso_main = (0.5, -1.5, -0.8)  # 視線方向（X 軸旋轉 180°）
-        iso_x_hint = (1, 1, 0.35)     # 水平軸提示（X 軸旋轉 180°）
+        # 標準等角投影（follow 標準圖旋轉方式）
+        # 從 +X+Y+Z 角落觀看（右前上方），Z 軸（垂直）向上
+        iso_main = (1, 1, 1)        # 視線方向：從右前上方看向模型
+        iso_x_hint = (-1, 1, 0)     # 水平軸：-X+Y 方向向右
         # 正規化 main
         iso_main_len = math.sqrt(sum(c**2 for c in iso_main))
         iso_main_n = tuple(c / iso_main_len for c in iso_main)
@@ -5941,16 +6070,16 @@ Solid 名稱: {solid_name}
         )
 
         def project_iso(pt):
-            """3D 點 → 等角投影 2D（flip_v 一致）"""
+            """3D 點 → 等角投影 2D（Z 軸向上，不翻轉）"""
             return (
                 sum(pt[i] * iso_x_n[i] for i in range(3)),
-                -sum(pt[i] * iso_y_n[i] for i in range(3)),
+                sum(pt[i] * iso_y_n[i] for i in range(3)),
             )
 
         # ==== 左半：等角 HLR 視圖 ====
-        # flip_v=True 讓 Z 軸向上在頁面上也朝上
+        # flip_v=False：Z 軸自然向上（y_n 的 Z 分量為正）
         iso_polylines, iso_bbox = self._hlr_project_to_polylines(
-            iso_main, iso_x_hint, flip_v=True)
+            iso_main, iso_x_hint, flip_v=False)
 
         # 繪圖區域（左半頁面）
         left_area_x = MARGIN + 5
@@ -5977,14 +6106,23 @@ Solid 名稱: {solid_name}
             dim_a = (iso_a[0] * iso_scale + iso_off_x, iso_a[1] * iso_scale + iso_off_y)
             dim_b = (iso_b[0] * iso_scale + iso_off_x, iso_b[1] * iso_scale + iso_off_y)
 
-            # 繪製斜向尺寸線
-            dim_text = f"{track_endpoint_length:.1f}"
+            # 繪製斜向尺寸線（上軌兩端點內側長度）
+            # 內側距離 = 3D 距離，但 X 方向扣除管徑（外管壁到外管壁 → 內管壁到內管壁）
+            pipe_diameter = stp_data['pipe_diameter']
+            _dx = abs(pt_a[0] - pt_b[0])
+            _dy = pt_a[1] - pt_b[1]
+            _dz = pt_a[2] - pt_b[2]
+            _inner_dx = max(_dx - pipe_diameter, 0)
+            track_inner_length = math.sqrt(_inner_dx**2 + _dy**2 + _dz**2)
+            dim_text = f"{track_inner_length:.1f}"
             self._draw_dimension_line_along(msp, dim_a, dim_b, -8, dim_text)
 
-        # ==== 右半：俯視 HLR 視圖（X 軸旋轉 180°） ====
-        top_main = (0, 0, 1)   # 從下往上看（X 軸旋轉 180°）
-        top_x = (0, -1, 0)    # -Y 向右（X 軸旋轉 180°）
-        top_polylines, top_bbox = self._hlr_project_to_polylines(top_main, top_x)
+        # ==== 右半：俯視 HLR 視圖（follow 標準圖旋轉方式） ====
+        # 從正上方（+Z）往下看，model_Y 向右，model_X 向上
+        top_main = (0, 0, -1)  # 從上往下看（視線方向 -Z）
+        top_x = (0, 1, 0)     # model Y 向右
+        top_polylines, top_bbox = self._hlr_project_to_polylines(
+            top_main, top_x, flip_v=False)
 
         right_area_x = PW * 0.50 + 5
         right_area_y = MARGIN + 40
@@ -6005,24 +6143,29 @@ Solid 名稱: {solid_name}
                 if len(dxf_pts) >= 2:
                     msp.add_lwpolyline(dxf_pts)
 
-            # 投影 3D→2D：top-down view (main=(0,0,1), x=(0,-1,0))
-            # HLR maps: screen_x = -model_y, screen_y = model_x
+            # 投影 3D→2D：top-down view (main=(0,0,-1), x=(0,1,0))
+            # HLR maps: screen_x = model_Y, screen_y = model_X
             def _project_top(pt3d):
-                return (-pt3d[1], pt3d[0])
+                return (pt3d[1], pt3d[0])
 
-            # 軌道外側跨距尺寸（使用 HLR bbox 的 screen-Y 跨距 = model-X 含管壁）
-            # bbox screen-Y 範圍 = model X 全幅（含管壁）
-            track_span_bbox = by1 - by0  # HLR bbox Y span (model X extent)
-            dim_text_v = f"{track_span_bbox:.1f}"
-            # 用 bbox Y 邊界作為尺寸端點（screen-Y → paper-Y）
-            dim_left_x = bx0 * top_scale + top_off_x - 12  # 尺寸線放在模型左側
-            dim_top_pt = (dim_left_x, by1 * top_scale + top_off_y)
-            dim_bot_pt = (dim_left_x, by0 * top_scale + top_off_y)
+            # 軌道外側跨距尺寸（上軌端點 X 跨距 + 管徑）
+            # model_X 對應 screen_y，所以跨距是垂直尺寸
+            pipe_diameter_top = stp_data['pipe_diameter']
+            x_max_trk = max(p[0] for p in all_endpoints)
+            x_min_trk = min(p[0] for p in all_endpoints)
+            track_outer_span = (x_max_trk - x_min_trk) + pipe_diameter_top
+            dim_text_v = f"{track_outer_span:.1f}"
+            # 尺寸線端點：screen_y = model_X，加上管壁半徑
+            pipe_r_screen = pipe_diameter_top / 2
+            dim_left_x = bx0 * top_scale + top_off_x - 12
+            dim_top_pt = (dim_left_x,
+                          (x_max_trk + pipe_r_screen) * top_scale + top_off_y)
+            dim_bot_pt = (dim_left_x,
+                          (x_min_trk - pipe_r_screen) * top_scale + top_off_y)
             self._draw_dimension_line(msp, dim_top_pt, dim_bot_pt,
                                       0, dim_text_v, vertical=True)
 
-            # 弧頂標註：上軌端點距離（引線）
-            # 在弧的頂部位置標註 track_endpoint_length
+            # 弧半徑標註：R250（follow 彎軌施工圖側視圖標示方式）
             arc_pipe = None
             for tp in track_pipes:
                 for seg in tp.get('segments', []):
@@ -6035,7 +6178,7 @@ Solid 名稱: {solid_name}
             if arc_pipe:
                 sp_3d = arc_pipe.get('start_point', (0, 0, 0))
                 ep_3d = arc_pipe.get('end_point', (0, 0, 0))
-                # 弧頂取標註點（弧的 XY 中點附近）
+                # 弧的 XY 中點（俯視投影）
                 mid_3d = ((sp_3d[0] + ep_3d[0]) / 2,
                           (sp_3d[1] + ep_3d[1]) / 2,
                           (sp_3d[2] + ep_3d[2]) / 2)
@@ -6043,11 +6186,11 @@ Solid 名稱: {solid_name}
                 r_paper = (r_proj[0] * top_scale + top_off_x,
                            r_proj[1] * top_scale + top_off_y)
 
-                # 引線方向（從弧頂向外推）
+                # 引線方向（從弧頂向外推 — 向右上方延伸）
                 r_ext = 15
                 r_tip = (r_paper[0] + r_ext, r_paper[1] + r_ext)
                 msp.add_line(r_paper, r_tip)
-                msp.add_text(f"R{track_endpoint_length:.1f}", dxfattribs={
+                msp.add_text(f"R{arc_radius:.0f}", dxfattribs={
                     'height': 8.0}).set_placement((r_tip[0] + 2, r_tip[1]))
 
         # 儲存
@@ -6095,21 +6238,12 @@ Solid 名稱: {solid_name}
             (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
             (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
 
-        # 標題欄
-        tb_info = {
-            'company': 'iDrafter股份有限公司',
-            'project': project,
-            'drawing_name': '直線段施工圖',
-            'drawer': 'Drafter',
-            'date': today,
-            'units': 'mm',
-            'scale': '1:10',
-            'material': 'STK-400',
-            'finish': '裁切及焊接',
-            'drawing_number': 'LM-11',
-            'version': '01',
-            'quantity': '1',
-        }
+        # 標題欄（config > STP > hardcoded）
+        info = self.get_model_info()
+        tb_info = self._build_tb_info(info, base_name,
+                                      drawing_name='直線段施工圖',
+                                      drawing_number='LM-11',
+                                      today=today)
         if tb_override:
             tb_info.update(tb_override)
         tb_top = self._draw_title_block(msp, PW, PH, tb_info)
@@ -6952,9 +7086,9 @@ Solid 名稱: {solid_name}
 
         log_print(f"軌道彎曲方向: {bend_direction}")
 
-        # 共用標題欄資訊
-        project = info.get('product_name') or base_name
+        # 共用標題欄資訊（config > STP > hardcoded）
         today = datetime.now().strftime("%Y/%m/%d")
+        project = self._build_tb_info(info, base_name, '', '', today).get('project', base_name)
 
         # A3 紙張參數
         PW, PH = 420, 297
@@ -7094,21 +7228,11 @@ Solid 名稱: {solid_name}
             log_print(f"  [stp_data] R={arc_radius:.0f}, angle={arc_angle_deg:.1f}°, "
                       f"elev={elevation_deg:.1f}°, chord={chord_length:.0f}")
 
-            # 標題欄（公司資訊 — 匹配標準圖 LM-12）
-            tb_info2 = {
-                'company': 'iDrafter股份有限公司',
-                'project': project,
-                'drawing_name': '彎軌軌道製圖',
-                'drawer': 'Drafter',
-                'date': today,
-                'units': 'mm',
-                'scale': '1:10',
-                'material': 'STK-400',
-                'finish': '裁切及焊接',
-                'drawing_number': 'LM-12',
-                'version': '01',
-                'quantity': '1',
-            }
+            # 標題欄（config > STP > hardcoded）
+            tb_info2 = self._build_tb_info(info, base_name,
+                                           drawing_name='彎軌軌道製圖',
+                                           drawing_number='LM-12',
+                                           today=today)
             tb_top2 = self._draw_title_block(msp2, PW, PH, tb_info2)
 
             # 圖號（右上角大字）
@@ -7639,7 +7763,6 @@ Solid 名稱: {solid_name}
                 leg_angles_map,
                 base_name, f"{base_name}-3", project, today,
                 tb_override={
-                    'company': 'iDrafter股份有限公司',
                     'drawing_name': '彎軌軌道製圖',
                     'drawing_number': 'LM-13',
                 },
