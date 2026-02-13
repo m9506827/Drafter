@@ -10,9 +10,9 @@
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐ │
 │  │   Input     │    │   Engine    │    │      Output         │ │
 │  │             │    │             │    │                     │ │
-│  │  STEP File  │───▶│ MockCAD     │───▶│  DXF (Drawing 1-3)  │ │
+│  │  STEP File  │───▶│ MockCAD     │───▶│  DXF (Drawing 0-3)  │ │
 │  │  (.stp)     │    │ Engine      │    │  PNG (Preview)      │ │
-│  │             │    │             │    │  TXT (Info)         │ │
+│  │  config.json│    │             │    │  TXT (Info)         │ │
 │  └─────────────┘    └─────────────┘    └─────────────────────┘ │
 │                            │                                    │
 │                            ▼                                    │
@@ -39,9 +39,15 @@
 
 ```python
 class MockCADEngine:
+    _TB_DEFAULTS: Dict                    # 標題欄預設值
+    _drafter_config: Dict                 # drafter_config.json 內容
+
     def __init__(self, model_file: str)
     def load_3d_file(self, filepath: str)
-    def generate_sub_assembly_drawing(self, output_dir: str) -> List[str]
+    def _load_drafter_config(self, model_file: str)
+    def _build_tb_info(self, info, base_name, ..., **overrides) -> Dict
+    def _extract_step_metadata(self, step_path: str) -> Dict
+    def generate_sub_assembly_drawing(self, output_dir: str) -> List[str]  # 4 張
     def export_projections_to_dxf(self, output_dir: str) -> List[str]
 ```
 
@@ -151,7 +157,8 @@ def _generate_cutting_list() -> Dict:
 
 ```python
 def generate_sub_assembly_drawing() -> List[str]:
-    # 生成 3 張施工圖
+    # 生成 4 張施工圖
+    # Drawing 0: 組件總覽圖（等角視圖 + 俯視圖）
     # Drawing 1: 直線段施工圖
     # Drawing 2: 彎軌施工圖
     # Drawing 3: 完整組合施工圖
@@ -278,6 +285,66 @@ simple_viewer.py
 ├── matplotlib - GUI 顯示
 └── PIL - 影像處理
 ```
+
+## 設定檔系統
+
+### drafter_config.json
+
+系統支援透過外部 JSON 設定檔自訂標題欄欄位。載入順序：
+
+1. STEP 檔案同目錄的 `drafter_config.json`
+2. 專案根目錄（CWD）的 `drafter_config.json`
+
+```python
+def _load_drafter_config(self, model_file: str):
+    # 搜尋順序：model 同目錄 > CWD
+    # 載入成功後存入 self._drafter_config
+```
+
+### _TB_DEFAULTS
+
+類別層級的預設值字典，作為所有標題欄欄位的最終 fallback：
+
+```python
+_TB_DEFAULTS = {
+    'company':   'iDrafter股份有限公司',
+    'drawer':    'Drafter',
+    'units':     'mm',
+    'scale':     '1:10',
+    'material':  'STK-400',
+    'finish':    '裁切及焊接',
+    'version':   __version__,   # 程式版本
+    'quantity':  '1',
+}
+```
+
+### _build_tb_info
+
+統一建構標題欄資訊的共用方法，所有 Drawing 共用同一套邏輯：
+
+```python
+def _build_tb_info(self, info, base_name, drawing_name,
+                   drawing_number, today, **overrides) -> Dict:
+    # 優先順序：overrides > config > STP 中繼資料 > _TB_DEFAULTS
+```
+
+### 版本管理
+
+標題欄「版次」欄位直接取用模組層級的 `__version__` 常數，不允許從設定檔覆蓋：
+
+```python
+__version__ = '1.0.0'  # auto_drafter_system.py 頂部
+```
+
+## STEP 中繼資料解析
+
+`_extract_step_metadata()` 從 STEP 標頭擷取以下資訊：
+
+| 資料來源 | 擷取欄位 |
+|---------|---------|
+| `FILE_NAME` 實體 | `creation_date`, `author`, `organization`, `source_software` |
+| `PRODUCT` 實體 | `product_name`（優先取 name，fallback 取 id） |
+| `FILE_DESCRIPTION` | `file_description` |
 
 ## 另請參閱
 

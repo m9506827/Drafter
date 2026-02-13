@@ -84,9 +84,13 @@
 
 ## 標題欄
 
-- 公司名稱：iDrafter股份有限公司
+由 `_build_tb_info()` 統一建構：
+- 公司名稱：由 `drafter_config.json` 設定（預設 iDrafter股份有限公司）
 - 圖面名稱：完整組合施工圖
 - 圖號：LM-17
+- 版次：程式版本 `__version__`
+
+詳見 [設定檔系統](../architecture.md#設定檔系統)
 
 ## 繪製邏輯
 

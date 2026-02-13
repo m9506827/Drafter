@@ -532,29 +532,39 @@ def test_dxf_content_draw1(T):
                      f"not found")
 
 
+def _load_draw3_dxf():
+    """載入 Drawing 3 DXF，回傳 (doc, msp) 或 (None, None)"""
+    import ezdxf
+    for name in ['2-2_3.dxf', '2-2-3.dxf']:
+        p = os.path.join(ROOT_DIR, 'output', name)
+        if os.path.exists(p):
+            doc = ezdxf.readfile(p)
+            return doc, doc.modelspace()
+    return None, None
+
+
+def _collect_draw3_entities(msp):
+    """收集 Drawing 3 DXF 中所有 TEXT 實體及其座標"""
+    text_entities = []
+    for e in msp:
+        if e.dxftype() == 'TEXT':
+            t = e.dxf.text.strip()
+            x, y = e.dxf.insert.x, e.dxf.insert.y
+            text_entities.append({'text': t, 'x': x, 'y': y,
+                                  'color': e.dxf.color, 'entity': e})
+    return text_entities
+
+
 def test_dxf_content_draw3(T):
     """測試 Drawing 3 DXF 中的腳架長度和球號標註"""
     print("\n--- Test: Drawing 3 DXF Content ---")
 
-    import ezdxf
-    # Drawing 3 可能為 2-2_3.dxf 或 2-2-3.dxf
-    dxf_path = None
-    for name in ['2-2_3.dxf', '2-2-3.dxf']:
-        p = os.path.join(ROOT_DIR, 'output', name)
-        if os.path.exists(p):
-            dxf_path = p
-            break
-    if not dxf_path:
+    doc, msp = _load_draw3_dxf()
+    if not msp:
         T.check_true("Draw 3 DXF exists", False, "not found")
         return
 
-    doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
-
-    all_text = []
-    for e in msp:
-        if e.dxftype() == 'TEXT':
-            all_text.append(e.dxf.text.strip())
+    all_text = [e.dxf.text.strip() for e in msp if e.dxftype() == 'TEXT']
 
     # 腳架長度（Drawing 3 的第三支腳架）
     leg3_len = EXPECTED['leg_lengths'][2]  # 430
@@ -586,13 +596,140 @@ def test_dxf_content_draw3(T):
 
     # BOM 球號（腳架 = 1）— 使用氣泡圓，區別於取料球號
     circles = [e for e in msp if e.dxftype() == 'CIRCLE']
-    # 至少應有 1 個 BOM 球號圓（腳架）
     T.check_true("Draw 3: BOM balloon circle exists (>= 1)",
                  len(circles) >= 1,
                  f"found {len(circles)} circles")
     bom_found = any(t == '1' for t in all_text)
     T.check_true("Draw 3: BOM balloon '1' exists",
                  bom_found, "not found")
+
+
+def test_draw3_angles(T):
+    """測試 Drawing 3 角度標註：42°/58°/16° 的值和位置"""
+    print("\n--- Test: Drawing 3 Angle Annotations ---")
+
+    doc, msp = _load_draw3_dxf()
+    if not msp:
+        T.check_true("Draw 3 DXF exists for angle test", False, "not found")
+        return
+
+    te = _collect_draw3_entities(msp)
+
+    # ---- 角度值存在性 ----
+    # 文字格式: "42°", "58°", "16°" (使用 Unicode °)
+    angle_42 = [t for t in te if t['text'] in ('42°', '42\u00B0')]
+    angle_58 = [t for t in te if t['text'] in ('58°', '58\u00B0')]
+    angle_16 = [t for t in te if t['text'] in ('16°', '16\u00B0')]
+
+    T.check_true("Draw 3: angle 42° text exists",
+                 len(angle_42) >= 1,
+                 f"found {len(angle_42)}")
+    T.check_true("Draw 3: angle 58° text exists",
+                 len(angle_58) >= 1,
+                 f"found {len(angle_58)}")
+    T.check_true("Draw 3: angle 16° text exists",
+                 len(angle_16) >= 1,
+                 f"found {len(angle_16)}")
+
+    # ---- 角度位置驗證 ----
+    # 標準圖配置：42° 在最高（腳架-上軌交點），58° 在中間（腳架-下軌交點），16° 在最低（D2彎曲處）
+    if angle_42 and angle_58 and angle_16:
+        y_42 = angle_42[0]['y']
+        y_58 = angle_58[0]['y']
+        y_16 = angle_16[0]['y']
+
+        T.check_true("Draw 3: 42° above 58° (Y position)",
+                     y_42 > y_58,
+                     f"42°.y={y_42:.1f}, 58°.y={y_58:.1f}")
+        T.check_true("Draw 3: 58° above 16° (Y position)",
+                     y_58 > y_16,
+                     f"58°.y={y_58:.1f}, 16°.y={y_16:.1f}")
+
+        # 42° 和 58° 應在腳架同一 X 位置附近（X 差 < 15）
+        x_42 = angle_42[0]['x']
+        x_58 = angle_58[0]['x']
+        x_diff_42_58 = abs(x_42 - x_58)
+        T.check_true("Draw 3: 42° and 58° at similar X (leg position)",
+                     x_diff_42_58 < 15,
+                     f"42°.x={x_42:.1f}, 58°.x={x_58:.1f}, diff={x_diff_42_58:.1f}")
+
+    # ---- 角度弧線存在性 ----
+    arcs = [e for e in msp if e.dxftype() == 'ARC']
+    T.check_true("Draw 3: angle arcs exist (>= 3)",
+                 len(arcs) >= 3,
+                 f"found {len(arcs)} arcs")
+
+
+def test_draw3_dimensions(T):
+    """測試 Drawing 3 尺寸標註：段長、總長"""
+    print("\n--- Test: Drawing 3 Dimension Values ---")
+
+    doc, msp = _load_draw3_dxf()
+    if not msp:
+        T.check_true("Draw 3 DXF exists for dim test", False, "not found")
+        return
+
+    te = _collect_draw3_entities(msp)
+    all_text = [t['text'] for t in te]
+
+    # ---- 直線段長度（取料明細的直線段） ----
+    # 標準圖: U1=89.1, U3=147.3, D1=244.2
+    for seg_len in ['89.1', '147.3', '244.2']:
+        T.check_true(f"Draw 3: segment length {seg_len} exists",
+                     any(seg_len in t for t in all_text),
+                     f"not found in DXF text")
+
+    # ---- 上軌端點距離 ----
+    # 標準圖: 295.5 (兩端點直線距離，非展開長)
+    # 允許範圍: 294 ~ 297
+    upper_total_found = False
+    upper_total_val = None
+    for t in te:
+        try:
+            v = float(t['text'])
+            if 293 <= v <= 298:
+                upper_total_found = True
+                upper_total_val = v
+                break
+        except ValueError:
+            pass
+    T.check_true("Draw 3: upper track endpoint distance ~295.5",
+                 upper_total_found,
+                 f"found value: {upper_total_val}" if upper_total_val else "no value in range 293-298")
+
+    # ---- 下軌端點距離 ----
+    # 標準圖: 318.8 (兩端點直線距離，非展開長)
+    # 允許範圍: 317 ~ 320
+    lower_total_found = False
+    lower_total_val = None
+    for t in te:
+        try:
+            v = float(t['text'])
+            if 317 <= v <= 320:
+                lower_total_found = True
+                lower_total_val = v
+                break
+        except ValueError:
+            pass
+    T.check_true("Draw 3: lower track endpoint distance ~318.8",
+                 lower_total_found,
+                 f"found value: {lower_total_val}" if lower_total_val else "no value in range 317-320")
+
+    # ---- 整體尺寸（上下軌中心線垂直距離 / 起始端＆末端） ----
+    # 標準圖: 196.4 (起始端) / 230.2 (末端)
+    # 目前程式計算為 perpendicular spacing / cos(angle) 的結果
+    # 至少應有一個垂直尺寸在合理範圍 (80~250)
+    vert_dims = []
+    for t in te:
+        try:
+            v = float(t['text'])
+            if 80 <= v <= 260 and v not in (89.1, 147.3, 244.2):
+                vert_dims.append(v)
+        except ValueError:
+            pass
+    T.check_true("Draw 3: vertical dimensions exist (>= 1)",
+                 len(vert_dims) >= 1,
+                 f"found values: {vert_dims}")
 
 
 # =====================================================================
@@ -636,11 +773,15 @@ def main():
             test_balloon_annotations(T)
         elif args.draw3:
             test_dxf_content_draw3(T)
+            test_draw3_angles(T)
+            test_draw3_dimensions(T)
         else:
             test_dxf_content_draw2(T)
             test_balloon_annotations(T)
             test_dxf_content_draw1(T)
             test_dxf_content_draw3(T)
+            test_draw3_angles(T)
+            test_draw3_dimensions(T)
 
     # ---- 結果彙報 ----
     success = T.summary()

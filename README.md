@@ -1,17 +1,20 @@
 # Drafter - AI 自動繪圖系統
 
+> **版本 1.0.0**
+
 一個智能的 3D 到 2D 工程圖自動轉換系統，支援 STEP/STL 檔案轉換為 DXF 工程圖。
 
 ## 功能特色
 
+- **四張施工圖自動生成**：從 STEP 檔案自動產出 4 張標準化 DXF 施工圖（總覽圖 + 直線段 + 彎軌 + 組合圖）
+- **HLR 投影**：使用 OpenCASCADE Hidden Line Removal 產生等角視圖、俯視圖等精確 2D 線圖
+- **智能特徵提取**：自動從 3D 模型中提取管路中心線、軌道、腳架、支撐架等幾何特徵
+- **STEP 中繼資料解析**：自動從 STEP 標頭擷取作者、日期、軟體、產品名稱等資訊
+- **設定檔系統**：透過 `drafter_config.json` 自訂公司名稱、繪圖者、材料等標題欄資訊
+- **程式版本管理**：標題欄「版次」自動取用程式版本 (`__version__`)，無需手動維護
 - **3D 模型檢視**：支援 STL、STEP/STP 格式的 3D 模型預覽（使用 PyVista）
 - **2D 工程圖檢視**：支援 DXF、DWG 格式的 2D 工程圖檢視（使用 Matplotlib）
-- **六方向投影**：自動生成 XY/XZ/YZ 三平面的直接投影與反向投影（共 6 張 DXF）
-- **完整邊緣提取**：使用 OCP TopExp_Explorer 遍歷複合體所有 solid 的邊，支援多實體組合件
-- **自動轉換**：將 3D 模型自動轉換為 2D 工程圖（使用 CadQuery + OCP）
-- **智能特徵提取**：自動從 3D 模型中提取幾何特徵（圓形、矩形、多段線等）
 - **Headless 測試**：支援無 GUI 的自動投影測試，可輸出 PNG 並與基準圖比對（SSIM）
-- **圖檔資訊視窗**：獨立視窗完整顯示圖檔資訊，包含 BOM、來源軟體、零件、單位等
 - **自動儲存**：轉換後的檔案自動儲存到 `output/` 目錄
 
 ## 系統需求
@@ -50,22 +53,14 @@ python auto_drafter_system.py
 
 **執行流程：**
 1. 彈出檔案選擇對話框，選擇 3D 模型檔案（STEP/STP）
-2. **開啟圖檔資訊視窗**，完整顯示：
-   - 基本檔案資訊（路徑、大小、格式）
-   - 來源軟體與元資料（作者、組織、建立日期）
-   - 單位資訊
-   - 幾何統計（實體數、面數、邊數、體積、表面積）
-   - 邊界框資訊
-   - 零件列表
-   - BOM 材料清單
-   - 幾何特徵列表
-   - 若無特定資訊則顯示「無資訊」
-3. 關閉資訊視窗或按 Enter 繼續
-4. 自動將 3D 模型轉換為 2D 工程圖
-5. 自動儲存到 `output/原檔名.dxf`（例如：`output/1-2.dxf`）
-6. 自動顯示 2D 工程圖視窗（Matplotlib）
-
-**注意：** 目前版本直接轉換，不修改原圖內容。修改功能已註解，可根據需要啟用。
+2. 若同目錄或專案根目錄有 `drafter_config.json`，自動載入設定
+3. 開啟圖檔資訊視窗，顯示 STEP 中繼資料、幾何特徵、BOM 等
+4. 自動生成 **4 張施工圖** 到 `output/` 目錄：
+   - `{name}-0.dxf` — Drawing 0: 組件總覽圖（等角視圖 + 俯視圖）
+   - `{name}-1.dxf` — Drawing 1: 直線段施工圖
+   - `{name}_2.dxf` — Drawing 2: 彎軌施工圖
+   - `{name}_3.dxf` — Drawing 3: 完整組合施工圖
+5. 自動顯示 2D 工程圖視窗（Matplotlib）
 
 ### 2. 檔案檢視器（獨立工具）
 
@@ -107,22 +102,70 @@ python test/test_projection.py
 3. 若 `test/reference/` 有基準圖，自動進行 SSIM 比對
 4. 輸出 PASS/FAIL 結果摘要
 
+## 設定檔 (`drafter_config.json`)
+
+可在 STEP 檔案同目錄或專案根目錄建立 `drafter_config.json`，自訂標題欄資訊：
+
+```json
+{
+  "company": "iDrafter股份有限公司",
+  "drawer": "Drafter",
+  "material": "STK-400",
+  "finish": "裁切及焊接",
+  "scale": "1:10",
+  "quantity": "1"
+}
+```
+
+### 欄位說明
+
+| 欄位 | 說明 | 預設值 |
+|------|------|--------|
+| `company` | 公司名稱 | iDrafter股份有限公司 |
+| `drawer` | 繪圖者 | Drafter |
+| `material` | 材料 | STK-400 |
+| `finish` | 表面處理 | 裁切及焊接 |
+| `scale` | 比例 | 1:10 |
+| `quantity` | 數量 | 1 |
+| `project` | 案名（覆蓋 STP 產品名稱） | *(自動從 STP 讀取)* |
+| `date` | 日期（覆蓋 STP 建立日期） | *(自動從 STP 讀取)* |
+
+> **注意**：`version`（版次）由程式版本 `__version__` 自動帶入，不在設定檔中設定。
+
+### 優先順序
+
+標題欄各欄位的取值優先順序為：
+
+1. **函式參數覆蓋** (overrides) — 各圖面特定值
+2. **設定檔** (`drafter_config.json`) — 使用者自訂
+3. **STEP 中繼資料** — 從 STEP 標頭自動擷取（案名、日期、單位）
+4. **程式預設值** (`_TB_DEFAULTS`) — 硬編碼預設
+
 ## 專案結構
 
 ```
 Drafter/
 ├── auto_drafter_system.py       # 主要系統：3D 到 2D 自動轉換
+│   ├── __version__              #   程式版本號（標題欄版次來源）
 │   ├── MockCADEngine            #   CAD 核心（模型載入、特徵提取、投影）
+│   │   ├── _TB_DEFAULTS         #     標題欄預設值
+│   │   ├── _load_drafter_config #     載入 drafter_config.json
+│   │   ├── _build_tb_info       #     建構標題欄（統一優先順序）
+│   │   └── _extract_step_metadata #   STEP 中繼資料解析
 │   ├── AIIntentParser           #   AI 意圖解析器
 │   └── AutoDraftingSystem       #   系統協調器
 ├── simple_viewer.py             # 檔案檢視器：3D/2D 檢視 + PNG 輸出
 │   └── EngineeringViewer        #   工程檔案檢視器類別
+├── drafter_config.json          # 標題欄設定檔（可自訂）
 ├── generate_assembly_drawing.py # 組合件工程圖生成器
 ├── info2xml.py                  # STEP 資訊轉 XML 工具
 ├── test/                        # 自動化測試
+│   ├── verify_values.py         #   主要數值驗證測試（67 項）
 │   ├── test_projection.py       #   Headless 投影測試腳本
+│   ├── 2-2.stp                  #   測試用 STEP 檔案
 │   ├── output/                  #   測試輸出 PNG（自動生成）
 │   └── reference/               #   基準 PNG（用於 SSIM 比對）
+├── docs/                        # 完整技術文件
 ├── output/                      # 輸出目錄（自動生成）
 ├── .gitignore                   # Git 忽略規則
 └── README.md                    # 本文件
@@ -153,10 +196,11 @@ Drafter/
 
 1. **MockCADEngine** (`auto_drafter_system.py`)
    - 負責 3D 模型載入（STEP/STL）
-   - 特徵提取（從 3D 模型提取幾何特徵）
-   - 3D 到 2D 投影：使用 OCP `TopExp_Explorer` 遍歷所有 solid 邊緣，投影到 XY/XZ/YZ 平面
-   - 支援多實體複合件（Compound Shape），確保所有零件邊緣都被投影
-   - **圖檔資訊提取**：從 STEP 檔案提取元資料（來源軟體、作者、單位等）
+   - 特徵提取（管路中心線、軌道分段、角度計算、取料明細）
+   - HLR (Hidden Line Removal) 投影：產生等角視圖、俯視圖等 2D 線圖
+   - STEP 中繼資料解析：從 `FILE_NAME` 和 `PRODUCT` 實體擷取作者、日期、軟體等
+   - 設定檔系統：載入 `drafter_config.json` 並與 STP 中繼資料合併
+   - 標題欄建構：`_build_tb_info()` 統一管理各欄位的優先順序
 
 2. **AIIntentParser** (`auto_drafter_system.py`)
    - AI 意圖解析器（目前為簡化版本，使用關鍵字匹配）
@@ -177,11 +221,15 @@ Drafter/
 ```
 3D 模型 (STEP/STP)
     ↓
-CadQuery 載入
+XCAF 載入 + STEP 中繼資料解析
     ↓
-直接導出為 DXF（或提取特徵後生成 DXF）
+drafter_config.json 載入（可選）
     ↓
-儲存到 output/目錄
+幾何特徵提取 → 管路中心線 → 軌道分段 → 角度計算 → 取料明細
+    ↓
+生成 4 張施工圖（Drawing 0-3）
+    ↓
+儲存到 output/ 目錄 + 標題欄（config + STP 中繼資料 + 預設值）
     ↓
 顯示 2D 工程圖
 ```
@@ -189,34 +237,34 @@ CadQuery 載入
 ### 擴展建議
 
 - **整合 LLM API**：擴展 `AIIntentParser` 整合 OpenAI/Claude API
-- **改進特徵提取**：增強 `_extract_features()` 提取更複雜的幾何特徵
-- **尺寸標註**：自動添加尺寸標註和技術要求
-- **圖層管理**：支援 DXF 圖層和線型設定
+- **改進特徵提取**：增強幾何特徵提取支援更多管路結構
+- **多語言標題欄**：擴展設定檔支援多語系標題欄
+- **批次處理**：支援多個 STEP 檔案批次生成施工圖
 
 ## 更新日誌
 
-### v1.3 (最新)
+### v1.0.0 (最新)
+- **四張施工圖**：新增 Drawing 0 組件總覽圖（等角視圖 + 俯視圖），系統完整產出 4 張施工圖
+- **Drawing 0 投影修正**：等角視圖 `(1,1,1)` 與俯視圖 `(0,0,-1)` 方向正確對齊標準圖
+- **Drawing 0 尺寸修正**：等角視圖內側距離計算扣除管徑、俯視圖外側跨距加上管徑、半徑標註使用實際弧半徑 R250
+- **設定檔系統**：新增 `drafter_config.json` 外部設定檔，自訂公司、繪圖者、材料等標題欄欄位
+- **STEP 中繼資料增強**：解析 `FILE_NAME` 實體取得建立日期、作者、軟體；改善 `PRODUCT` 實體解析
+- **標題欄重構**：新增 `_build_tb_info()` 共用方法，統一 4 張圖的標題欄建構邏輯（overrides > config > STP > defaults）
+- **程式版本管理**：標題欄「版次」自動取用 `__version__`，不再由設定檔覆蓋
+
+### v0.3
 - **六方向投影**：XY/XZ/YZ 直接投影 + 反向投影，共 6 張 DXF
-- **完整邊緣提取**：使用 OCP `TopExp_Explorer` 遍歷 Compound 中所有 Solid（修正多實體組合件邊緣遺漏問題）
+- **完整邊緣提取**：使用 OCP `TopExp_Explorer` 遍歷 Compound 中所有 Solid
 - **Headless 測試**：`test/test_projection.py` 支援無 GUI 自動測試 + SSIM 基準比對
 - **PNG 輸出**：`view_2d_dxf()` 和 `view_projected_2d()` 支援 `save_path` 參數直接輸出 PNG
 
-### v1.2
+### v0.2
 - 圖檔資訊視窗：獨立視窗完整顯示圖檔資訊
 - BOM 材料清單：自動生成並顯示
 - 來源軟體識別、單位資訊、元資料提取
 - 幾何統計：實體數、面數、邊數、頂點數、體積、表面積
-- 零件列表、視窗可捲動
 
-### v1.1
-- ✅ 支援 DWG 檔案讀取（需要 ODA File Converter）
-- ✅ 同時顯示 3D 和 2D 視圖功能
-- ✅ 改進的顏色處理（保留原始顏色，白色自動轉黑色）
-- ✅ 自動儲存到 output 目錄
-- ✅ 改進的錯誤處理和調試訊息
-- ✅ 直接使用 CadQuery 導出 DXF（更快更可靠）
-
-### v1.0
+### v0.1
 - 基本 3D 到 2D 轉換功能
 - 支援 STEP/STL 檔案讀取
 - 支援 DXF 檔案檢視和生成
@@ -251,7 +299,10 @@ A: 執行 `auto_drafter_system.py` 後，會自動彈出圖檔資訊視窗，顯
 ### 執行測試
 
 ```bash
-# 執行所有測試
+# 主要數值驗證測試（67 項）
+py test/verify_values.py
+
+# 執行所有 unittest 測試
 python -m unittest discover test -v
 
 # 使用 PowerShell 腳本
@@ -259,19 +310,16 @@ python -m unittest discover test -v
 
 # 監控模式（檔案變更時自動執行）
 .\run_tests.ps1 -Watch
-
-# 快速測試
-.\run_tests.ps1 -Quick
 ```
 
-### 自動測試設定
+### 測試涵蓋範圍
 
-**GitHub Actions**：推送到 GitHub 後自動執行測試（已設定）
-
-**本地 pre-commit hook**：
-```bash
-git config core.hooksPath .githooks
-```
+- 管路中心線提取（弧形半徑、角度、高低差、弧長）
+- 取料明細（直管、彎管、腳架）
+- stp_data 組裝參數（管徑、弧半徑、仰角、弦長等）
+- 4 張施工圖 DXF 生成與內容驗證
+- Drawing 2 尺寸標註、支撐架、BOM 球號
+- Drawing 1/3 腳架長度、取料明細標籤
 
 詳細說明請參閱 [測試文件](docs/testing.md)
 

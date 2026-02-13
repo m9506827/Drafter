@@ -71,7 +71,7 @@ eggs/
 *.tar.gz
 *.pdf
 #*.png
-*.jpg
+#*.jpg
 
 # --- CAD/工程檔案 (針對 3D/2D 轉換專案) ---
 *.stp

@@ -34,6 +34,27 @@ cad = MockCADEngine("model.stp")
 cad = MockCADEngine()
 ```
 
+## 模組常數
+
+```python
+__version__ = '1.0.0'   # 程式版本，標題欄「版次」來源
+```
+
+## 類別常數
+
+```python
+_TB_DEFAULTS = {
+    'company':   'iDrafter股份有限公司',
+    'drawer':    'Drafter',
+    'units':     'mm',
+    'scale':     '1:10',
+    'material':  'STK-400',
+    'finish':    '裁切及焊接',
+    'version':   __version__,
+    'quantity':  '1',
+}
+```
+
 ## 屬性
 
 | 屬性 | 類型 | 說明 |
@@ -41,6 +62,7 @@ cad = MockCADEngine()
 | `model_file` | `str` | 載入的模型檔案路徑 |
 | `cad_model` | `object` | CadQuery 模型物件 |
 | `features` | `List[GeometricFeature]` | 提取的幾何特徵 |
+| `_drafter_config` | `Dict` | 從 `drafter_config.json` 載入的設定 |
 | `_pipe_centerlines` | `List[Dict]` | 管路中心線資料 |
 | `_part_classifications` | `List[Dict]` | 零件分類結果 |
 | `_angles` | `List[Dict]` | 角度計算結果 |
@@ -105,7 +127,7 @@ def save_info_to_file(self, output_dir: str = "output") -> str
 
 ### generate_sub_assembly_drawing
 
-生成子系統施工圖（3 張）。
+生成子系統施工圖（4 張）。
 
 ```python
 def generate_sub_assembly_drawing(self, output_dir: str = "output") -> List[str]
@@ -122,6 +144,7 @@ def generate_sub_assembly_drawing(self, output_dir: str = "output") -> List[str]
 #### 生成的檔案
 | 檔案 | 說明 |
 |-----|------|
+| `{name}-0.dxf` | Drawing 0: 組件總覽圖（等角 + 俯視） |
 | `{name}-1.dxf` | Drawing 1: 直線段施工圖 |
 | `{name}_2.dxf` | Drawing 2: 彎軌施工圖 |
 | `{name}_3.dxf` | Drawing 3: 完整組合施工圖 |
@@ -161,9 +184,80 @@ def export_projections_to_dxf(self, output_dir: str = "output") -> List[str]
 
 ---
 
+---
+
+### _load_drafter_config
+
+載入標題欄設定檔。
+
+```python
+def _load_drafter_config(self, model_file: str) -> None
+```
+
+#### 說明
+搜尋 `drafter_config.json`，順序為：
+1. `model_file` 同目錄
+2. 目前工作目錄 (CWD)
+
+找到後載入至 `self._drafter_config`。
+
+---
+
+### _build_tb_info
+
+建構標題欄資訊字典（所有 Drawing 共用）。
+
+```python
+def _build_tb_info(self, info: Dict, base_name: str,
+                   drawing_name: str, drawing_number: str,
+                   today: str, **overrides) -> Dict
+```
+
+#### 參數
+| 參數 | 類型 | 說明 |
+|-----|------|------|
+| `info` | `Dict` | `get_model_info()` 的回傳值（含 STP 中繼資料） |
+| `base_name` | `str` | 檔案基本名稱（如 '2-2'） |
+| `drawing_name` | `str` | 圖面名稱（如 '彎軌軌道總圖'） |
+| `drawing_number` | `str` | 圖號（如 '2-2', 'LM-11'） |
+| `today` | `str` | 日期字串 YYYY/MM/DD |
+| `**overrides` | | 額外覆蓋值 |
+
+#### 回傳
+`Dict` - 包含以下欄位：`company`, `project`, `drawing_name`, `drawer`, `date`, `units`, `scale`, `material`, `finish`, `drawing_number`, `version`, `quantity`
+
+#### 優先順序
+`overrides` > `drafter_config.json` > STP 中繼資料 > `_TB_DEFAULTS`
+
+> **注意**：`version` 欄位固定取用 `__version__`，不受 config 影響。
+
+---
+
 ## 內部方法
 
 以下方法為內部使用，但可供進階使用者參考。
+
+### _extract_step_metadata
+
+從 STEP 標頭擷取中繼資料。
+
+```python
+def _extract_step_metadata(self, step_path: str) -> Dict
+```
+
+#### 回傳的字典結構
+```python
+{
+    'product_name': str,         # 產品名稱（PRODUCT id 或 name）
+    'source_software': str,      # 來源軟體
+    'author': str,               # 作者
+    'organization': str,         # 組織
+    'creation_date': str,        # 建立日期 (YYYY/MM/DD)
+    'file_description': str,     # 檔案描述
+}
+```
+
+---
 
 ### _extract_geometric_features
 

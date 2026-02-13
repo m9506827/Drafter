@@ -128,6 +128,13 @@ dxf_files = cad.export_projections_to_dxf("output/")
 
 ## 輸出圖面規格
 
+### Drawing 0: 組件總覽圖
+- 等角視圖（HLR 投影，從右前上方觀看）
+- 俯視圖（HLR 投影，從上往下觀看）
+- 上軌端點內側距離標註
+- 軌道外側跨距標註
+- 弧半徑標註 (R250)
+
 ### Drawing 1: 直線段施工圖
 - 側視圖：上下軌 + 腳架
 - 取料明細表
@@ -146,13 +153,41 @@ dxf_files = cad.export_projections_to_dxf("output/")
 - 完整取料明細
 - 完整 BOM
 
+## 設定檔 (`drafter_config.json`)
+
+系統支援透過 JSON 設定檔自訂標題欄內容。將 `drafter_config.json` 放在
+STEP 檔案同目錄或專案根目錄即可自動載入。
+
+```json
+{
+  "company": "iDrafter股份有限公司",
+  "drawer": "Drafter",
+  "material": "STK-400",
+  "finish": "裁切及焊接",
+  "scale": "1:10",
+  "quantity": "1"
+}
+```
+
+可設定欄位：`company`, `drawer`, `material`, `finish`, `scale`, `quantity`, `project`, `date`
+
+> **注意**：`version`（版次）由程式版本 `__version__` 自動帶入，不在設定檔中設定。
+
+### 優先順序
+
+1. 函式參數覆蓋 (overrides)
+2. 設定檔 (`drafter_config.json`)
+3. STEP 中繼資料（案名、日期、單位）
+4. 程式預設值 (`_TB_DEFAULTS`)
+
 ## 圖面規範
 
 - 圖紙大小：A3 橫向（420 x 297 mm）
-- 比例：1:10
+- 比例：1:10（可透過設定檔修改）
 - 單位：mm
-- 材料：STK-400
+- 材料：STK-400（可透過設定檔修改）
 - 標準：依據工程製圖規範
+- 版次：自動取用程式版本 (`__version__`)
 
 ## 故障排除
 

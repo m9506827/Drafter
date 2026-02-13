@@ -58,6 +58,7 @@ python simple_viewer.py test\2-2.stp --dxf
 ```
 
 這將在 `output/` 目錄生成：
+- `2-2-0.dxf` - 組件總覽圖（等角 + 俯視）
 - `2-2-1.dxf` - 直線段施工圖
 - `2-2_2.dxf` - 彎軌施工圖
 - `2-2_3.dxf` - 完整組合施工圖
@@ -75,11 +76,31 @@ python simple_viewer.py test\2-2.stp --dxf --no-gui
 
 | 檔案 | 說明 |
 |-----|------|
+| `*-0.dxf` | Drawing 0: 組件總覽圖（等角 + 俯視） |
 | `*-1.dxf` | Drawing 1: 直線段施工圖（腳架詳圖） |
 | `*_2.dxf` | Drawing 2: 彎軌施工圖 |
 | `*_3.dxf` | Drawing 3: 完整組合施工圖 |
 | `*_preview.png` | 各圖的 PNG 預覽 |
 | `*_info.txt` | 模型資訊文字檔 |
+
+## 設定檔（可選）
+
+若需自訂標題欄資訊（公司名稱、繪圖者等），可在專案根目錄建立 `drafter_config.json`：
+
+```json
+{
+  "company": "iDrafter股份有限公司",
+  "drawer": "Drafter",
+  "material": "STK-400",
+  "finish": "裁切及焊接",
+  "scale": "1:10",
+  "quantity": "1"
+}
+```
+
+> 版次 (`version`) 由程式版本自動帶入，無需設定。
+
+詳見 [使用者手冊](user-guide.md) 的「設定檔」章節。
 
 ## 下一步
 

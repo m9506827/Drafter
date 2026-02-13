@@ -21,7 +21,16 @@ test/
 
 ## 執行測試
 
-### 執行所有測試
+### 數值驗證測試（推薦）
+
+```bash
+py test/verify_values.py
+```
+
+此腳本涵蓋 67 項檢查，包含管路中心線、取料明細、stp_data 參數、
+4 張施工圖 DXF 生成與內容驗證。所有檢查通過會顯示 `ALL PASSED: 67/67`。
+
+### 執行所有 unittest 測試
 
 ```bash
 python -m unittest discover test -v
@@ -51,8 +60,8 @@ python -m unittest test.test_components.TestSubAssemblyDrawings.test_04_drawing1
 #### 檔案生成
 | # | 測試名稱 | 說明 |
 |---|---------|------|
-| 02 | `test_02_generates_3_dxf` | 生成 3 個 DXF 檔案 |
-| 03 | `test_03_generates_3_png` | 生成 3 個 PNG 預覽（>1KB, <5MB） |
+| 02 | `test_02_generates_3_dxf` | 生成 4 個 DXF 檔案 |
+| 03 | `test_03_generates_3_png` | 生成 PNG 預覽（>1KB, <5MB） |
 
 #### Drawing 1 驗證
 | # | 測試名稱 | 說明 |
