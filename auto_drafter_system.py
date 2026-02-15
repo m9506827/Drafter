@@ -7288,27 +7288,49 @@ Solid 名稱: {solid_name}
             self._annotate_leg_block(msp, leg_top, leg_foot, leg_lower_pt,
                                      ll, below_len, li, scale)
 
-        # ========== 角度標註（58°/42°/16°）==========
-        # 標準圖配置（以腳架位置為中心）：
-        #   58°（腳架與上軌夾角）→ 腳架與上軌交點（上軌在過渡段側）
-        #   42°（腳架與下軌夾角）→ 腳架與下軌交點（下軌在主管段側）
-        #   16°（彎曲角）        → 下軌彎曲中心外側
+        # ========== 角度標註（腳架與軌道夾角 + 彎曲角）==========
+        # 角度標示邏輯：
+        #   - 1 隻腳架：標示該腳架的上軌夾角 + 下軌夾角
+        #   - 2 隻腳架：標示每隻腳架的上軌夾角（不標下軌）
+        # 角度值 = 90° - 軌道仰角（complement），取腳架位置所在的軌道段仰角
+        #   彎曲角（12°/16° 等）→ 下軌彎曲中心外側（不受腳架數量影響）
         if leg_draw_data and upper_bends:
-            ld = leg_draw_data[0]  # 取第一個腳架
-            leg_upper = ld['leg_upper_pt']  # (x, y) 腳架與上軌交點
-            leg_lower = ld['leg_lower_pt']  # (x, y) 腳架與下軌交點
-            ub = upper_bends[0]
-            # 42°/58°: 取 bend 前後的較大角（主管段角）和較小角（過渡段角）
-            # 反轉 cutting list 時 prev/post 互換，故用 max/min 確保一致
-            _main_bend_a = max(ub['prev_angle'], ub['post_angle'])
-            _trans_bend_a = min(ub['prev_angle'], ub['post_angle'])
-            # 腳架位置：上軌在過渡段側，下軌在主管段側
-            # 58°：腳架與上軌夾角 → 標示於上軌下側（below=True）
-            self._draw_elev_angle(
-                msp, leg_upper, _trans_bend_a, scale, x_dir, below=True)
-            # 42°：腳架與下軌夾角 → 標示於下軌上側（below=False）
-            self._draw_elev_angle(
-                msp, leg_lower, _main_bend_a, scale, x_dir, below=False)
+            def _get_elev_at_x(seg_positions, draw_x):
+                """取得 draw_x 位置的軌道仰角（從水平量測）"""
+                for seg in seg_positions:
+                    sx, sy, ex, ey = seg[0], seg[1], seg[2], seg[3]
+                    min_x, max_x = min(sx, ex), max(sx, ex)
+                    if min_x - 2 <= draw_x <= max_x + 2:
+                        dxf_deg = math.degrees(math.atan2(ey - sy, ex - sx))
+                        return (180 - dxf_deg) if x_dir < 0 else dxf_deg
+                # fallback：取最近段
+                best_dist, best_elev = float('inf'), 0
+                for seg in seg_positions:
+                    sx, sy, ex, ey = seg[0], seg[1], seg[2], seg[3]
+                    for px in [sx, ex]:
+                        d = abs(px - draw_x)
+                        if d < best_dist:
+                            best_dist = d
+                            dxf_deg = math.degrees(math.atan2(ey - sy, ex - sx))
+                            best_elev = (180 - dxf_deg) if x_dir < 0 else dxf_deg
+                return best_elev
+
+            n_legs = len(leg_draw_data)
+            if n_legs == 1:
+                # 1 隻腳架：上軌夾角 + 下軌夾角
+                ld = leg_draw_data[0]
+                upper_elev = _get_elev_at_x(upper_seg_positions, ld['draw_x'])
+                lower_elev = _get_elev_at_x(lower_seg_positions, ld['draw_x'])
+                self._draw_elev_angle(
+                    msp, ld['leg_upper_pt'], upper_elev, scale, x_dir, below=True)
+                self._draw_elev_angle(
+                    msp, ld['leg_lower_pt'], lower_elev, scale, x_dir, below=False)
+            else:
+                # 2+ 隻腳架：每隻腳架的上軌夾角
+                for ld in leg_draw_data:
+                    upper_elev = _get_elev_at_x(upper_seg_positions, ld['draw_x'])
+                    self._draw_elev_angle(
+                        msp, ld['leg_upper_pt'], upper_elev, scale, x_dir, below=True)
 
         for lb in lower_bends:
             if lb['bend_deg'] < 0.5:
@@ -7585,8 +7607,8 @@ Solid 名稱: {solid_name}
             # ---- Rectangle 2: 腳架與軌道角度 ----
             # （已由上方「角度標註 42°/58°/16°」區塊統一處理，此處不重複繪製）
 
-        # ===== 管徑標註（共用）=====
-        if _SHOW_ANNOTATIONS and pipe_diameter > 0 and upper_seg_positions:
+        # ===== 管徑標註（共用）— Drawing 1 不繪製（標準圖 2-2-1 無此標示）=====
+        if _SHOW_ANNOTATIONS and pipe_diameter > 0 and upper_seg_positions and not _is_drawing1:
             if _annotation_like_draw3:
                 # 管徑標示在過渡端（繪圖起始側，右上方）（Drawing 1 跟隨 Drawing 3）
                 _pd_x = upper_seg_positions[0][0] + 5
