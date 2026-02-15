@@ -7335,6 +7335,9 @@ Solid 名稱: {solid_name}
         for lb in lower_bends:
             if lb['bend_deg'] < 0.5:
                 continue
+            # Drawing 1 不繪製彎曲角標示（標準圖 2-2-1 無此標示）
+            if _is_drawing1:
+                continue
             # 16°：弧線往上（在軌道方向之間），文字在下方（軌道外側）
             cx_b, cy_b = lb['center']
             _pre_a = lb['prev_angle']
