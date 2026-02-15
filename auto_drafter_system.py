@@ -13,8 +13,23 @@ from typing import List, Tuple, Dict, Optional
 import tkinter as tk
 from tkinter import filedialog, Tk, Toplevel, Text, Scrollbar, Frame, Label, Button
 from simple_viewer import EngineeringViewer
+import time
+import multiprocessing
 
 __version__ = '1.0.0'
+
+# 彎管工程圖轉換用：檢視器是否可用、帶時間戳的 log、worker 程序
+VIEWER_AVAILABLE = hasattr(EngineeringViewer, 'view_2d_dxf')
+
+
+def log_with_time(message: str) -> None:
+    """輸出帶時間戳的訊息到 logger（供彎管工程圖轉換等使用）"""
+    logger.info(f"{datetime.now().strftime('%H:%M:%S')} {message}")
+
+
+def export_tube_worker_process(filepath: str, output_path: str, plane: str) -> None:
+    """彎管工程圖轉換的 worker 程序（multiprocessing target）。子行程中執行。"""
+    raise NotImplementedError("export_tube_worker_process 尚未實作")
 
 # ==========================================
 # 日誌設定 (Logging Configuration)
@@ -6514,10 +6529,16 @@ Solid 名稱: {solid_name}
         # 側視圖方向：統一使用 x_dir=-1（軌道從右向左延伸）
         x_dir = -1  # 軌道從右向左延伸
 
-        # Drawing 3 (-3): 不反轉 cutting list（保持 U1→U2→U3 順序）
+        # Drawing 3 (-3): 不反轉 cutting list（保持 U1→U2→U3 順序），
         # 使軌道從過渡端(右下)向主端(左上)延伸，彎曲朝上
         _start_is_transition = bool(
             drawing_number and str(drawing_number).endswith('-3'))
+        # Drawing 1 (-1): 也不反轉 cutting list（保持 U1→U2→U3 順序），
+        # 但 U2/D2 角度為「下彎」（entry/exit 弧在 Draw 1 標準圖為向下）
+        _is_drawing1 = bool(
+            drawing_number and str(drawing_number).endswith('-1'))
+        # 標註風格：Drawing 1 與 Drawing 3 相同（標示位置、方向）
+        _annotation_like_draw3 = _start_is_transition or _is_drawing1
 
 
         doc = ezdxf.new(dxfversion='R2010')
@@ -6593,8 +6614,15 @@ Solid 名稱: {solid_name}
             lower_base_elev = stp_data['elevation_deg'] if stp_data else 0
 
         # 從 cutting list 分離上軌和下軌的 items
-        upper_cl = [it for it in section_cutting_list if str(it.get('item', '')).startswith('U')]
-        lower_cl = [it for it in section_cutting_list if str(it.get('item', '')).startswith('D')]
+        import copy as _copy_pre
+        upper_cl = [_copy_pre.copy(it) for it in section_cutting_list if str(it.get('item', '')).startswith('U')]
+        lower_cl = [_copy_pre.copy(it) for it in section_cutting_list if str(it.get('item', '')).startswith('D')]
+
+        # Drawing 1：U2/D2 角度應為下彎（標準圖 2-2-1），對 exit/entry_tail 弧取反 bend_sign
+        if _is_drawing1:
+            for it in upper_cl + lower_cl:
+                if it.get('type') == 'arc' and (it.get('is_exit_bend') or it.get('is_entry_tail_bend')):
+                    it['bend_sign'] = -it.get('bend_sign', 1)
 
         # 確保上下軌都從主管段（有 solid_id）開始繪製，
         # 使兩軌從同一物理端出發，軌距標示才正確。
@@ -6611,8 +6639,8 @@ Solid 名稱: {solid_name}
                 if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
                     it['bend_sign'] = -it.get('bend_sign', 1)
             return rev, True  # 已反轉
-        if _start_is_transition:
-            # Drawing 3: 上軌保持原始順序（過渡段在前）
+        if _start_is_transition or _is_drawing1:
+            # Drawing 3 / Drawing 1: 上軌保持原始順序（過渡段在前）
             _upper_cl_reversed = False
             # 下軌：若主管段(solid_id)在前，反轉使過渡段(弧段)在前
             _first_lower_str = next(
@@ -7353,8 +7381,8 @@ Solid 名稱: {solid_name}
             l_sy = lower_start_y
             start_ref_x = upper_seg_positions[0][0]
 
-            # 決定起始端和末端的標註值
-            if _start_is_transition:
+            # 決定起始端和末端的標註值（Drawing 1 跟隨 Drawing 3）
+            if _annotation_like_draw3:
                 _start_gap_val = transition_vert_gap
                 _end_gap_val = main_vert_gap
             else:
@@ -7389,8 +7417,9 @@ Solid 名稱: {solid_name}
             # ---- Circle 1: 上下軌道內側距離（末端位置）----
             # 使用 perpendicular spacing - pipe_diameter（垂直於軌道方向的管壁間距）
             # 標示在末端外側（介於中心線垂直距標註和軌道之間）
+            # Drawing 1 不繪製（標準圖 2-2-1 無此標示）
             inner_dist_3d = section_rail_spacing - pipe_diameter
-            if inner_dist_3d > 1:
+            if inner_dist_3d > 1 and not _is_drawing1:
                 # 末端位置，介於 196.4 和軌道之間
                 _inner_offset_at_end = x_dir * 25
                 self._draw_dimension_line(
@@ -7404,12 +7433,12 @@ Solid 名稱: {solid_name}
             # 實務：沿內側軌道（左=下軌D）末端，與軌道垂直方向向外側標示
             # 左側自下軌道向下延伸：兩條延伸線都往同一方向（外側）
             # 延伸線方向 = track_dxf + 90°（perpendicular, 遠離上軌）
-            # 尺寸線在外側為垂直線（量測垂直內壁距離）
-            if _start_is_transition:
+            # 尺寸線在外側為垂直線（量測垂直內壁距離）（Drawing 1 跟隨 Drawing 3）
+            if _annotation_like_draw3:
                 _end_inner_dist = main_vert_gap - pipe_diameter
             else:
                 _end_inner_dist = transition_vert_gap - pipe_diameter
-            if _end_inner_dist > 1:
+            if _end_inner_dist > 1 and not _is_drawing1:
                 # 取內側軌道（下軌）在末端的仰角
                 _end_lower_angle = _get_track_angle_at_x(lower_seg_positions, ref_end_x)
                 if x_dir < 0:
@@ -7466,12 +7495,12 @@ Solid 名稱: {solid_name}
             # 實務：沿內側軌道（右=上軌U）末端，與軌道垂直方向向外側標示
             # 右側自上軌道向上延伸：兩條延伸線都往同一方向（外側）
             # 延伸線方向 = track_dxf - 90°（perpendicular, 遠離下軌）
-            # 尺寸線在外側為垂直線（量測垂直內壁距離）
-            if _start_is_transition:
+            # 尺寸線在外側為垂直線（量測垂直內壁距離）（Drawing 1 跟隨 Drawing 3）
+            if _annotation_like_draw3:
                 _start_inner_dist = transition_vert_gap - pipe_diameter
             else:
                 _start_inner_dist = main_vert_gap - pipe_diameter
-            if _start_inner_dist > 1:
+            if _start_inner_dist > 1 and not _is_drawing1:
                 # 取內側軌道（上軌）在起始端的仰角
                 _start_upper_angle = _get_track_angle_at_x(upper_seg_positions, start_ref_x)
                 if x_dir < 0:
@@ -7543,8 +7572,8 @@ Solid 名稱: {solid_name}
                     d = abs(leg_cum - bp['cum'])
                     if d < best_d:
                         best_d, best_bp = d, bp
-                if best_bp and best_d > 3:
-                    _leg_dim_offset = (-x_dir if _start_is_transition
+                if best_bp and best_d > 3 and not _is_drawing1:
+                    _leg_dim_offset = (-x_dir if _annotation_like_draw3
                                        else x_dir) * (pipe_hw + 18)
                     self._draw_dimension_line_along(
                         msp,
@@ -7558,8 +7587,8 @@ Solid 名稱: {solid_name}
 
         # ===== 管徑標註（共用）=====
         if _SHOW_ANNOTATIONS and pipe_diameter > 0 and upper_seg_positions:
-            if _start_is_transition:
-                # 管徑標示在過渡端（繪圖起始側，右上方）
+            if _annotation_like_draw3:
+                # 管徑標示在過渡端（繪圖起始側，右上方）（Drawing 1 跟隨 Drawing 3）
                 _pd_x = upper_seg_positions[0][0] + 5
                 _pd_y = upper_seg_positions[0][1]
             else:
