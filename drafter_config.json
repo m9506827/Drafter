@@ -4,5 +4,8 @@
   "material": "STK-400",
   "finish": "裁切及焊接",
   "scale": "1:10",
-  "quantity": "1"
+  "quantity": "1",
+  "show_basic_info": true,
+  "show_leg_angles": true,
+  "show_track_relations": false
 }
