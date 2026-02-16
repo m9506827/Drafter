@@ -7496,19 +7496,28 @@ Solid 名稱: {solid_name}
                     x_dir * _vert_gap_offset, f"{_end_gap_val:.1f}",
                     vertical=True)
 
-            # ---- Circle 1: 上下軌道內側距離（末端位置）----
-            # 使用 perpendicular spacing - pipe_diameter（垂直於軌道方向的管壁間距）
-            # 標示在末端外側（介於中心線垂直距標註和軌道之間）
-            # Drawing 1 不繪製（標準圖 2-2-1 無此標示）
-            inner_dist_3d = section_rail_spacing - pipe_diameter
-            if inner_dist_3d > 1 and not _is_drawing1:
-                # 末端位置，介於 196.4 和軌道之間
+            # ---- 上下軌道內側距離（末端）----
+            # 末端（左側）往軌道外側標示
+            _end_inner_dist_wall = _end_gap_val - pipe_diameter
+            if _end_inner_dist_wall > 1:
                 _inner_offset_at_end = x_dir * 25
                 self._draw_dimension_line(
                     msp,
                     (ref_end_x, min(end_ly, end_uy) + pipe_hw),
                     (ref_end_x, max(end_ly, end_uy) - pipe_hw),
-                    _inner_offset_at_end, f"{inner_dist_3d:.1f}",
+                    _inner_offset_at_end, f"{_end_inner_dist_wall:.1f}",
+                    vertical=True)
+
+            # ---- 上下軌道內側距離（起始端）----
+            # 起始端（右側）往軌道外側標示
+            _start_inner_dist_wall = _start_gap_val - pipe_diameter
+            if _start_inner_dist_wall > 1:
+                _inner_offset_at_start = -x_dir * 25
+                self._draw_dimension_line(
+                    msp,
+                    (start_ref_x, min(l_sy, u_sy) + pipe_hw),
+                    (start_ref_x, max(l_sy, u_sy) - pipe_hw),
+                    _inner_offset_at_start, f"{_start_inner_dist_wall:.1f}",
                     vertical=True)
 
             # ---- 上下軌道末端距離（末端側垂直內壁距離）----
@@ -7520,7 +7529,7 @@ Solid 名稱: {solid_name}
                 _end_inner_dist = main_vert_gap - pipe_diameter
             else:
                 _end_inner_dist = transition_vert_gap - pipe_diameter
-            if _end_inner_dist > 1 and not _is_drawing1:
+            if _end_inner_dist > 1:
                 # 取內側軌道（下軌）在末端的仰角
                 _end_lower_angle = _get_track_angle_at_x(lower_seg_positions, ref_end_x)
                 if x_dir < 0:
@@ -7582,7 +7591,7 @@ Solid 名稱: {solid_name}
                 _start_inner_dist = transition_vert_gap - pipe_diameter
             else:
                 _start_inner_dist = main_vert_gap - pipe_diameter
-            if _start_inner_dist > 1 and not _is_drawing1:
+            if _start_inner_dist > 1:
                 # 取內側軌道（上軌）在起始端的仰角
                 _start_upper_angle = _get_track_angle_at_x(upper_seg_positions, start_ref_x)
                 if x_dir < 0:
