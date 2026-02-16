@@ -7,5 +7,5 @@
   "quantity": "1",
   "show_basic_info": true,
   "show_leg_angles": true,
-  "show_track_relations": false
+  "show_track_relations": true
 }

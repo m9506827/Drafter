@@ -6732,7 +6732,7 @@ Solid 名稱: {solid_name}
         lower_start_elev = _calc_start_elev(lower_cl, lower_base_elev)
         lower_path = _build_path_info(lower_cl, lower_start_elev)
 
-        # --- 計算繪圖用垂直間距（取代 section_rail_spacing）---
+        # --- 計算繪圖用垂直間距（從 3D 主管端點推算）---
         # 主管段角度：優先從有 solid_id 的直線段取得（不受 CL 順序影響）
         _main_a_u = next(
             (seg['angle_deg'] for seg in upper_path
@@ -6742,14 +6742,7 @@ Solid 名稱: {solid_name}
             (seg['angle_deg'] for seg in lower_path
              if seg['type'] == 'straight' and seg.get('solid_id')),
             lower_path[0]['angle_deg'] if lower_path else 0)
-        _main_angle = max(_main_a_u, _main_a_l) if max(_main_a_u, _main_a_l) > 1 else 0
-        # 垂直間距 = perpendicular / cos(main_angle)
-        if _main_angle > 1:
-            main_vert_gap = section_rail_spacing / math.cos(math.radians(_main_angle))
-        else:
-            main_vert_gap = section_rail_spacing
 
-        # 過渡端垂直間距 = main + (lower_displacement - upper_displacement)
         def _calc_path_y_displacement(path_info):
             """計算路徑的總垂直位移"""
             y = 0.0
@@ -6765,11 +6758,67 @@ Solid 名稱: {solid_name}
             return y
         _upper_y_disp = _calc_path_y_displacement(upper_path)
         _lower_y_disp = _calc_path_y_displacement(lower_path)
-        # 過渡端垂直間距: 優先使用彎軌段實際軌距 (curved_rail_spacing)
-        if stp_data and 'curved_rail_spacing' in stp_data:
-            transition_vert_gap = stp_data['curved_rail_spacing']
+
+        # --- 從 3D 主管端點推算繪圖起始端/末端的實際垂直間距 ---
+        # 方法：找到上下軌主管段的 3D Z 座標，結合路徑 Y 位移推算兩端間距
+        def _compute_path_start_z(path_info, pcl_map, v_idx):
+            """計算路徑起始端（繪圖右側）的 Z 座標，基於主管段 3D 端點"""
+            main_seg = None
+            main_idx = None
+            for i, seg in enumerate(path_info):
+                if seg['type'] == 'straight' and seg.get('solid_id'):
+                    main_seg = seg
+                    main_idx = i
+                    break
+            if main_seg is None:
+                return None
+            pc = pcl_map.get(main_seg['solid_id'], {})
+            sp = pc.get('start_point')
+            ep = pc.get('end_point')
+            if not sp or not ep:
+                return None
+            angle = main_seg['angle_deg']
+            if abs(math.sin(math.radians(angle))) > 0.01:
+                tube_right_z = min(sp[v_idx], ep[v_idx]) if math.sin(math.radians(angle)) > 0 else max(sp[v_idx], ep[v_idx])
+            else:
+                tube_right_z = sp[v_idx]
+            y_before = 0.0
+            for i in range(main_idx):
+                seg = path_info[i]
+                if seg['type'] == 'straight':
+                    y_before += seg['length'] * math.sin(math.radians(seg['angle_deg']))
+                elif seg['type'] == 'arc':
+                    R = seg['radius']
+                    prev_a = math.radians(seg['prev_angle'])
+                    bs = seg.get('bend_sign', 1)
+                    end_a = prev_a + bs * math.radians(seg['angle_deg'])
+                    y_before += bs * R * (math.cos(prev_a) - math.cos(end_a))
+            return tube_right_z - y_before
+
+        gn = self._ground_normal
+        _v_idx = 1 if gn == (0, 1, 0) else 2
+        _z_u_right = _compute_path_start_z(upper_path, _pcl_map_sp, _v_idx)
+        _z_l_right = _compute_path_start_z(lower_path, _pcl_map_sp, _v_idx)
+
+        if _z_u_right is not None and _z_l_right is not None:
+            start_gap = abs(_z_u_right - _z_l_right)
+            end_gap = start_gap + _upper_y_disp - _lower_y_disp
+            if end_gap < 0:
+                end_gap = abs(end_gap)
+            logger.info(f"  3D-based gaps: start(right)={start_gap:.1f}, end(left)={end_gap:.1f}")
         else:
-            transition_vert_gap = main_vert_gap + _lower_y_disp - _upper_y_disp
+            _main_angle = max(_main_a_u, _main_a_l) if max(_main_a_u, _main_a_l) > 1 else 0
+            if _main_angle > 1:
+                start_gap = section_rail_spacing / math.cos(math.radians(_main_angle))
+            else:
+                start_gap = section_rail_spacing
+            end_gap = start_gap + _upper_y_disp - _lower_y_disp
+            if end_gap < 0:
+                end_gap = abs(end_gap)
+            logger.info(f"  Fallback gaps: start={start_gap:.1f}, end={end_gap:.1f}")
+
+        main_vert_gap = start_gap
+        transition_vert_gap = end_gap
 
         # 計算路徑水平位移（含弧段，用於末端距離計算）
         def _calc_path_x_displacement(path_info):
@@ -7463,13 +7512,12 @@ Solid 名稱: {solid_name}
             l_sy = lower_start_y
             start_ref_x = upper_seg_positions[0][0]
 
-            # 決定起始端和末端的標註值（Drawing 1 跟隨 Drawing 3）
-            if _annotation_like_draw3:
-                _start_gap_val = transition_vert_gap
-                _end_gap_val = main_vert_gap
-            else:
-                _start_gap_val = main_vert_gap
-                _end_gap_val = transition_vert_gap
+            # 起始端和末端的標註值：直接使用 3D 推算的 start_gap / end_gap
+            _start_gap_val = start_gap   # 繪圖起始端（右側）的垂直間距
+            _end_gap_val = end_gap       # 繪圖末端（左側）的垂直間距
+            # 兩端軌道角度（用於內側距離、末端距離計算）
+            _angle_at_start = upper_seg_positions[0][5] if upper_seg_positions else 0
+            _angle_at_end = upper_seg_positions[-1][5] if upper_seg_positions else 0
 
             # 起始端（右側）→ 往右標示（軌道外側）
             # 使用較大 offset 確保標註在軌道外側（不與管壁重疊）
@@ -7488,7 +7536,7 @@ Solid 名稱: {solid_name}
             end_uy = _find_y_on_path(upper_seg_positions, ref_end_x, u_ey)
             end_ly = _find_y_on_path(lower_seg_positions, ref_end_x, l_ey)
             # 末端（左側）→ 往左標示（軌道外側下方）
-            if abs(transition_vert_gap - main_vert_gap) > 3:
+            if abs(end_gap - start_gap) > 3:
                 self._draw_dimension_line(
                     msp,
                     (ref_end_x, min(end_ly, end_uy)),
@@ -7498,7 +7546,8 @@ Solid 名稱: {solid_name}
 
             # ---- 上下軌道內側距離（末端）----
             # 末端（左側）往軌道外側標示
-            _end_inner_dist_wall = _end_gap_val - pipe_diameter
+            # 內側距離 = 垂直間距 × cos(角度) − 管外徑（垂直於軌道方向的淨間距）
+            _end_inner_dist_wall = _end_gap_val * math.cos(math.radians(_angle_at_end)) - pipe_diameter
             if _end_inner_dist_wall > 1:
                 _inner_offset_at_end = x_dir * 25
                 self._draw_dimension_line(
@@ -7510,7 +7559,8 @@ Solid 名稱: {solid_name}
 
             # ---- 上下軌道內側距離（起始端）----
             # 起始端（右側）往軌道外側標示
-            _start_inner_dist_wall = _start_gap_val - pipe_diameter
+            # 內側距離 = 垂直間距 × cos(角度) − 管外徑（垂直於軌道方向的淨間距）
+            _start_inner_dist_wall = _start_gap_val * math.cos(math.radians(_angle_at_start)) - pipe_diameter
             if _start_inner_dist_wall > 1:
                 _inner_offset_at_start = -x_dir * 25
                 self._draw_dimension_line(
@@ -7520,15 +7570,10 @@ Solid 名稱: {solid_name}
                     _inner_offset_at_start, f"{_start_inner_dist_wall:.1f}",
                     vertical=True)
 
-            # ---- 上下軌道末端距離（末端側垂直內壁距離）----
-            # 實務：沿內側軌道（左=下軌D）末端，與軌道垂直方向向外側標示
-            # 左側自下軌道向下延伸：兩條延伸線都往同一方向（外側）
-            # 延伸線方向 = track_dxf + 90°（perpendicular, 遠離上軌）
-            # 尺寸線在外側為垂直線（量測垂直內壁距離）（Drawing 1 跟隨 Drawing 3）
-            if _annotation_like_draw3:
-                _end_inner_dist = main_vert_gap - pipe_diameter
-            else:
-                _end_inner_dist = transition_vert_gap - pipe_diameter
+            # ---- 上下軌道末端距離（末端側沿軌道方向投影距離）----
+            # 末端距離 = 垂直間距 × sin(角度)（沿軌道方向的投影距離）
+            # 左側沿下軌方向標示
+            _end_inner_dist = _end_gap_val * math.sin(math.radians(_angle_at_end))
             if _end_inner_dist > 1:
                 # 取內側軌道（下軌）在末端的仰角
                 _end_lower_angle = _get_track_angle_at_x(lower_seg_positions, ref_end_x)
@@ -7582,15 +7627,10 @@ Solid 名稱: {solid_name}
                     'height': 6.0, 'rotation': 90
                 }).set_placement((_eid_txt_x, _eid_d1[1] + 2))
 
-            # ---- Circle 2: 上下軌道末端距離（起始端側垂直內壁距離）----
-            # 實務：沿內側軌道（右=上軌U）末端，與軌道垂直方向向外側標示
-            # 右側自上軌道向上延伸：兩條延伸線都往同一方向（外側）
-            # 延伸線方向 = track_dxf - 90°（perpendicular, 遠離下軌）
-            # 尺寸線在外側為垂直線（量測垂直內壁距離）（Drawing 1 跟隨 Drawing 3）
-            if _annotation_like_draw3:
-                _start_inner_dist = transition_vert_gap - pipe_diameter
-            else:
-                _start_inner_dist = main_vert_gap - pipe_diameter
+            # ---- Circle 2: 上下軌道末端距離（起始端側沿軌道方向投影距離）----
+            # 末端距離 = 垂直間距 × sin(角度)（沿軌道方向的投影距離）
+            # 右側沿上軌方向標示
+            _start_inner_dist = _start_gap_val * math.sin(math.radians(_angle_at_start))
             if _start_inner_dist > 1:
                 # 取內側軌道（上軌）在起始端的仰角
                 _start_upper_angle = _get_track_angle_at_x(upper_seg_positions, start_ref_x)
