@@ -2460,6 +2460,75 @@ class MockCADEngine:
                 'lower_tracks': list(cur_lower),
             })
 
+        # ---- 後處理：偵測 180° 反轉弧的軌道誤分配 ----
+        pcl_map_ts = {pc['solid_id']: pc for pc in pipe_centerlines}
+
+        def _ts_dist3(a, b):
+            return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+        result_secs = []
+        i = 0
+        while i < len(sections):
+            sec = sections[i]
+            if sec['section_type'] == 'curved' and result_secs:
+                last_str_idx = next(
+                    (j for j in range(len(result_secs) - 1, -1, -1)
+                     if result_secs[j]['section_type'] == 'straight'), None)
+
+                moved = False
+                if last_str_idx is not None:
+                    c_ups = sec.get('upper_tracks', [])
+                    if c_ups:
+                        c_fid = c_ups[0].get('solid_id', '')
+                        c_pc = pcl_map_ts.get(c_fid, c_ups[0].get('pipe_data', {}))
+                        c_sp = c_pc.get('start_point', (0, 0, 0))
+                        c_ep = c_pc.get('end_point', (0, 0, 0))
+
+                        if c_sp != (0, 0, 0) and c_ep != (0, 0, 0):
+                            prev = result_secs[last_str_idx]
+                            stay_u, move_u = [], []
+                            stay_l, move_l = [], []
+
+                            for t in prev.get('upper_tracks', []):
+                                tpc = pcl_map_ts.get(t['solid_id'], t.get('pipe_data', {}))
+                                tsp = tpc.get('start_point', (0, 0, 0))
+                                tep = tpc.get('end_point', (0, 0, 0))
+                                d_in  = min(_ts_dist3(tsp, c_sp), _ts_dist3(tep, c_sp))
+                                d_out = min(_ts_dist3(tsp, c_ep), _ts_dist3(tep, c_ep))
+                                (move_u if d_out < d_in * 0.6 else stay_u).append(t)
+
+                            for t in prev.get('lower_tracks', []):
+                                tpc = pcl_map_ts.get(t['solid_id'], t.get('pipe_data', {}))
+                                tsp = tpc.get('start_point', (0, 0, 0))
+                                tep = tpc.get('end_point', (0, 0, 0))
+                                d_in  = min(_ts_dist3(tsp, c_sp), _ts_dist3(tep, c_sp))
+                                d_out = min(_ts_dist3(tsp, c_ep), _ts_dist3(tep, c_ep))
+                                (move_l if d_out < d_in * 0.6 else stay_l).append(t)
+
+                            if move_u or move_l:
+                                result_secs[last_str_idx] = {
+                                    'section_type': 'straight',
+                                    'upper_tracks': stay_u,
+                                    'lower_tracks': stay_l,
+                                }
+                                result_secs.append(sec)
+                                result_secs.append({
+                                    'section_type': 'straight',
+                                    'upper_tracks': move_u,
+                                    'lower_tracks': move_l,
+                                })
+                                log_print(f"  [SectionFix] 移動 {len(move_u)}U+{len(move_l)}L 軌道到彎段後方")
+                                i += 1
+                                moved = True
+
+                if not moved:
+                    result_secs.append(sec)
+            else:
+                result_secs.append(sec)
+            i += 1
+
+        sections = result_secs
+
         # ---- Debug Log: 分段取用結果 ----
         log_print(f"\n[TrackSections] 共 {len(sections)} 個分段, 主軸={primary_axis}")
         log_print(f"[TrackSections] 配對: {len(pairs)} pairs, {len(unpaired)} unpaired")
@@ -2553,52 +2622,41 @@ class MockCADEngine:
         # ========== 新增：彎軌出口 transition bend ==========
         if is_after_curved and n_pairs >= 1:
             # 從幾何計算 entry_bend_deg：
-            # 彎軌出口方向 ≈ 前一個 straight section 的最小仰角
-            # 當前 straight section 的仰角 ≈ 本段的平均仰角
-            # entry_bend_deg = 當前段仰角 - 前段最小仰角（即曲線出口方向）
-            current_elevs = []
-            for t in upper_tracks:
-                e = elev_map.get(t['solid_id'], 0)
-                if e > 0:
-                    current_elevs.append(e)
-            for t in lower_tracks:
-                e = elev_map.get(t['solid_id'], 0)
-                if e > 0:
-                    current_elevs.append(e)
-            
-            # 從 prev_curved_section 找出曲線入口端的仰角（≈ 前段 straight section 的仰角）
-            prev_elevs = []
+            # 直接從 prev_curved_section 的管段幾何中讀取弧段角度
+            # 這是最準確的方法，避免仰角差計算時混入其他 section 的軌道
+            entry_bend_deg = 0
             if prev_curved_section:
-                # 曲線段本身不在 elev_map 中（arc 類型），
-                # 但其入口端連接前一個 straight section
-                # 遍歷所有 pipe_centerlines 找出前段 straight section 的仰角
-                for pc in pipe_centerlines:
-                    fid = pc['solid_id']
-                    e = elev_map.get(fid, 0)
-                    if e > 0 and fid not in [t['solid_id'] for t in upper_tracks] \
-                             and fid not in [t['solid_id'] for t in lower_tracks]:
-                        # 排除當前 section 的 track，收集其他 straight track 的仰角
-                        cls = class_map.get(fid, {})
-                        if cls.get('class') == 'track':
-                            prev_elevs.append(e)
-            
-            if current_elevs and prev_elevs:
-                current_avg = sum(current_elevs) / len(current_elevs)
-                prev_min = min(prev_elevs)
-                entry_bend_deg = round(abs(current_avg - prev_min))
-                log_print(f"  計算 entry_bend_deg: 當前段仰角={current_avg:.1f}° "
-                          f"前段最小仰角={prev_min:.1f}° → {entry_bend_deg}°")
-            elif current_elevs:
-                # 只有當前段仰角，回退到估算
-                entry_bend_deg = round(abs(max(current_elevs) - min(current_elevs)))
-                if entry_bend_deg < 1:
-                    # 從 stp_data 推估：全域仰角作為參考
-                    _global_elev = stp_data['elevation_deg'] if stp_data else 0
-                    entry_bend_deg = _global_elev if _global_elev > 1 else 0
-                log_print(f"  entry_bend_deg fallback (section内差): {entry_bend_deg}°")
-            else:
+                for t in (prev_curved_section.get('upper_tracks', []) +
+                          prev_curved_section.get('lower_tracks', [])):
+                    fid = t.get('solid_id', '')
+                    pd = _pcl_map.get(fid, t.get('pipe_data', {}))
+                    for seg in pd.get('segments', []):
+                        if seg.get('type') == 'arc' and seg.get('angle_deg', 0) > 0:
+                            raw_arc_deg = seg['angle_deg']
+                            # 大弧（≥90°）是弧本身，不是 transition 角度
+                            # 改用仰角（直軌與弧管間的高度過渡角）
+                            if raw_arc_deg >= 90 and stp_data:
+                                _elev = stp_data.get('elevation_deg', 0)
+                                entry_bend_deg = round(_elev) if _elev > 0.5 else 0
+                                log_print(f"  entry_bend_deg from elevation (arc={raw_arc_deg:.0f}°≥90°): {entry_bend_deg}° (fid={fid})")
+                            else:
+                                entry_bend_deg = round(raw_arc_deg)
+                                log_print(f"  entry_bend_deg from curved arc geom: {entry_bend_deg}° (fid={fid})")
+                            break
+                    if entry_bend_deg > 0:
+                        break
+
+            if entry_bend_deg <= 0 and stp_data:
+                # fallback: 使用 stp_data.arc_angle_deg，但大弧不適用
+                _fb_arc = stp_data['arc_angle_deg']
+                if _fb_arc < 90:
+                    entry_bend_deg = round(_fb_arc)
+                    log_print(f"  entry_bend_deg fallback (stp_data.arc_angle_deg): {entry_bend_deg}°")
+                # 大弧（≥90°）直接跳到 elevation fallback
+
+            if entry_bend_deg <= 0:
                 _global_elev = stp_data['elevation_deg'] if stp_data else 0
-                entry_bend_deg = _global_elev if _global_elev > 1 else 0
+                entry_bend_deg = round(_global_elev) if _global_elev > 1 else 0
                 log_print(f"  entry_bend_deg fallback (stp_data elev): {entry_bend_deg}°")
             
             # 根據參考圖 2-2-3.jpg 的結構（左彎時）：
@@ -2691,43 +2749,92 @@ class MockCADEngine:
             
             if entry_straight_length_upper <= 0:
                 entry_straight_length_upper = 0  # 無法計算時不添加過渡段
-            
-            # 下軌沒有入口過渡段，彎角在直段後面
+
+            # 下軌入口過渡段（幾何計算，類似上軌）
             entry_straight_length_lower = 0
+            if n_lower >= 1 and prev_curved_section:
+                curve_lower = prev_curved_section.get('lower_tracks', [])
+                if curve_lower:
+                    _l_fid = lower_tracks[0].get('solid_id', '')
+                    _l_pc = _pcl_map.get(_l_fid, lower_tracks[0].get('pipe_data', {}))
+                    l_sp = _l_pc.get('start_point', (0, 0, 0))
+                    l_ep = _l_pc.get('end_point', (0, 0, 0))
+                    best_curve_pt_l = None
+                    best_track_pt_l = None
+                    min_dist_yz_l = float('inf')
+                    for ct in curve_lower:
+                        _c_fid = ct.get('solid_id', '')
+                        cpd = _pcl_map.get(_c_fid, ct.get('pipe_data', {}))
+                        for cpt in [cpd.get('start_point', (0, 0, 0)), cpd.get('end_point', (0, 0, 0))]:
+                            for tpt in [l_sp, l_ep]:
+                                d_yz = math.sqrt((tpt[1] - cpt[1])**2 + (tpt[2] - cpt[2])**2)
+                                if d_yz < min_dist_yz_l:
+                                    min_dist_yz_l = d_yz
+                                    best_curve_pt_l = cpt
+                                    best_track_pt_l = tpt
+                    if best_curve_pt_l and best_track_pt_l:
+                        entry_r_l = after_lower_r
+                        dy_l = l_ep[1] - l_sp[1]
+                        dz_l = l_ep[2] - l_sp[2]
+                        len_yz_l = math.sqrt(dy_l**2 + dz_l**2)
+                        if len_yz_l > 1e-6:
+                            d_track_y_l = dy_l / len_yz_l
+                            d_track_z_l = dz_l / len_yz_l
+                        else:
+                            d_track_y_l, d_track_z_l = 0, 1
+                        _fallback_elev_l = stp_data['elevation_deg'] if stp_data else 0
+                        track_elev_l = elev_map.get(lower_tracks[0]['solid_id'], _fallback_elev_l)
+                        trans_elev_l = track_elev_l - entry_bend_deg
+                        sign_y_l = 1.0 if d_track_y_l >= 0 else -1.0
+                        d_trans_y_l = sign_y_l * math.cos(math.radians(trans_elev_l))
+                        d_trans_z_l = math.sin(math.radians(trans_elev_l))
+                        right_track_y_l = d_track_z_l
+                        right_track_z_l = -d_track_y_l
+                        center_y_l = best_track_pt_l[1] + right_track_y_l * entry_r_l
+                        center_z_l = best_track_pt_l[2] + right_track_z_l * entry_r_l
+                        left_trans_y_l = -d_trans_z_l
+                        left_trans_z_l = d_trans_y_l
+                        entry_pt_y_l = center_y_l + left_trans_y_l * entry_r_l
+                        entry_pt_z_l = center_z_l + left_trans_z_l * entry_r_l
+                        gap_y_l = entry_pt_y_l - best_curve_pt_l[1]
+                        gap_z_l = entry_pt_z_l - best_curve_pt_l[2]
+                        proj_l = d_trans_y_l * gap_y_l + d_trans_z_l * gap_z_l
+                        entry_straight_length_lower = round(max(abs(proj_l), 0), 1)
+                        log_print(f"  Entry transition lower: bend_geom proj={proj_l:.1f} R={entry_r_l:.0f} → straight={entry_straight_length_lower:.1f}")
             
             bend_rad = math.radians(entry_bend_deg)
-            
-            # 上軌的 entry bend（在入口過渡段之後）— 從曲線進入直線段，角度遞增 → 上彎
+            # 大弧（≥90°）時，上下軌統一用 entry bend，不用 entry_tail
+            _large_arc_mode = bool(stp_data and stp_data.get('arc_angle_deg', 0) >= 90)
+
             bends.append({
                 'angle_deg': entry_bend_deg,
                 'upper_bend_deg': entry_bend_deg,
-                'lower_bend_deg': 0,  # 下軌不使用 entry bend
+                'lower_bend_deg': entry_bend_deg if _large_arc_mode else 0,
                 'arc_r': round(after_upper_r, 0),
                 'upper_r': round(after_upper_r, 0),
                 'lower_r': round(after_lower_r, 0),
                 'upper_arc': round((after_upper_r + pipe_diameter / 2) * bend_rad, 0),
-                'lower_arc': 0,  # 下軌不使用 entry arc
+                'lower_arc': round((after_lower_r + pipe_diameter / 2) * bend_rad, 0) if _large_arc_mode else 0,
                 'position': 'entry',
-                'bend_sign': 1,  # +1=上彎（從曲線進入直線段，仰角遞增）
+                'bend_sign': 1,
                 'entry_straight_upper': entry_straight_length_upper,
                 'entry_straight_lower': entry_straight_length_lower,
             })
-            
-            # 下軌的 entry_tail bend（在主段之後，屬於入口方向的尾端過渡）
-            # 注意：這不是 'exit'（彎軌入口方向），而是 is_after_curved 入口過渡的下軌部分
-            # 下軌的彎角放在直段末端（靠近曲線段那側），但語意上仍屬於入口過渡
-            bends.append({
-                'angle_deg': entry_bend_deg,
-                'upper_bend_deg': 0,  # 上軌不使用此 bend（已在 entry 中處理）
-                'lower_bend_deg': entry_bend_deg,
-                'arc_r': round(after_lower_r, 0),
-                'upper_r': round(after_upper_r, 0),
-                'lower_r': round(after_lower_r, 0),
-                'upper_arc': 0,  # 上軌不使用此 arc
-                'lower_arc': round((after_lower_r + pipe_diameter / 2) * bend_rad, 0),
-                'position': 'entry_tail',  # 入口過渡的尾端（下軌放在直段之後）
-                'bend_sign': 1,  # +1=上彎
-            })
+
+            # 小弧才需要 entry_tail（下軌放在直段末端）；大弧下軌已在 entry 處理
+            if not _large_arc_mode:
+                bends.append({
+                    'angle_deg': entry_bend_deg,
+                    'upper_bend_deg': 0,
+                    'lower_bend_deg': entry_bend_deg,
+                    'arc_r': round(after_lower_r, 0),
+                    'upper_r': round(after_upper_r, 0),
+                    'lower_r': round(after_lower_r, 0),
+                    'upper_arc': 0,
+                    'lower_arc': round((after_lower_r + pipe_diameter / 2) * bend_rad, 0),
+                    'position': 'entry_tail',
+                    'bend_sign': 1,
+                })
 
         # ========== 新增：彎軌入口 transition bend (is_before_curved) ==========
         # 當這個 section 的後面是 curved section 時，在尾端添加連接大彎軌的 transition bend
@@ -2869,10 +2976,11 @@ class MockCADEngine:
                     _fb_elev = stp_data['elevation_deg'] if stp_data else 0
                     post_transition_elev = elev_map.get(upper_tracks[-1]['solid_id'], _fb_elev)
                     inside_z_gap = abs(u_near[2] - l_near[2])
+                    _large_arc_exit = bool(stp_data and stp_data.get('arc_angle_deg', 0) >= 90)
 
                     exit_straight_upper = round(_compute_outside_transition(
                         upper_tracks[-1], u_near, u_curve_pt, outside_r, all_elevs), 1)
-                    if post_transition_elev > 1:
+                    if post_transition_elev > 1 and not _large_arc_exit:
                         exit_straight_lower = round(max(inside_z_gap / math.sin(math.radians(post_transition_elev)), 0), 1)
                     exit_pos_upper = 'after'
                     exit_pos_lower = 'before'
@@ -2883,10 +2991,11 @@ class MockCADEngine:
                     _fb_elev = stp_data['elevation_deg'] if stp_data else 0
                     post_transition_elev = elev_map.get(lower_tracks[-1]['solid_id'], _fb_elev)
                     inside_z_gap = abs(u_near[2] - l_near[2])
+                    _large_arc_exit = bool(stp_data and stp_data.get('arc_angle_deg', 0) >= 90)
 
                     exit_straight_lower = round(_compute_outside_transition(
                         lower_tracks[-1], l_near, l_curve_pt, outside_r, all_elevs), 1)
-                    if post_transition_elev > 1:
+                    if post_transition_elev > 1 and not _large_arc_exit:
                         exit_straight_upper = round(max(inside_z_gap / math.sin(math.radians(post_transition_elev)), 0), 1)
                     exit_pos_upper = 'before'
                     exit_pos_lower = 'after'
@@ -2928,15 +3037,25 @@ class MockCADEngine:
             elev_diff = avg_elev_b - avg_elev_a  # 保留正負號
             calculated_bend = abs(elev_diff)
             
-            # 如果計算出的仰角差太小，跳過
+            # 如果計算出的仰角差太小，跳過（或使用 fallback）
             if calculated_bend < 0.5:
-                continue
-            
-            # 使用計算出的彎角（四捨五入到整數）
-            unified_bend = round(calculated_bend)
-            # bend_sign: +1=上彎（仰角遞增）, -1=下彎（仰角遞減）
-            between_bend_sign = 1 if elev_diff >= 0 else -1
-            log_print(f"  軌道間 transition bend: {unified_bend:.0f}° (計算值: {calculated_bend:.1f}°)")
+                # 若四個仰角均為 0，表示 track_elev_map 缺少此段資料
+                # fallback: 使用 stp_data.arc_angle_deg（系統整體弧角）
+                _fallback_deg = stp_data.get('arc_angle_deg', 0) if stp_data else 0
+                if (_fallback_deg >= 0.5
+                        and u_elev_a == 0 and u_elev_b == 0
+                        and l_elev_a == 0 and l_elev_b == 0):
+                    unified_bend = round(_fallback_deg)
+                    between_bend_sign = 1  # 預設上彎
+                    log_print(f"  between_bend fallback (arc_angle_deg): {unified_bend}°")
+                else:
+                    continue
+            else:
+                # 使用計算出的彎角（四捨五入到整數）
+                unified_bend = round(calculated_bend)
+                # bend_sign: +1=上彎（仰角遞增）, -1=下彎（仰角遞減）
+                between_bend_sign = 1 if elev_diff >= 0 else -1
+                log_print(f"  軌道間 transition bend: {unified_bend:.0f}° (計算值: {calculated_bend:.1f}°)")
 
             # Fix 4: 從 track_arc_radius_map 查表取各軌的實際半徑
             # 取 transition 兩側 track 中有 arc 資料的半徑
@@ -3037,6 +3156,19 @@ class MockCADEngine:
                     x_vals = [t.get('centroid', (0,0,0))[0] for t in all_tracks]
                     curved_x_center_map[si] = sum(x_vals) / len(x_vals)
 
+        # 計算每個 straight section 的 XZ 重心（用於腳架 XZ 距離分配）
+        straight_xz_centroid = {}
+        for si, sec in enumerate(sections):
+            if sec['section_type'] == 'straight':
+                all_tracks = sec.get('upper_tracks', []) + sec.get('lower_tracks', [])
+                if all_tracks:
+                    x_vals = [t.get('centroid', (0,0,0))[0] for t in all_tracks]
+                    z_vals = [t.get('centroid', (0,0,0))[2] for t in all_tracks]
+                    straight_xz_centroid[si] = (
+                        sum(x_vals) / len(x_vals),
+                        sum(z_vals) / len(z_vals)
+                    )
+
         # 先將 curved section 範圍排除出 straight
         # 對每個 leg，先查是否落在 curved section 範圍，再查 straight
         assignment = {}
@@ -3063,23 +3195,32 @@ class MockCADEngine:
                             in_curved = True
                             break
 
-            if in_curved:
-                continue  # 歸屬 curved section，不計入 straight
-
-            # 查 straight sections —— 找距離最近的
+            # 查 straight sections —— 以 XZ 重心距離為準
+            # 對 180° U 型弧，兩段 straight section 在 Z 上可能重疊，
+            # 純 Z 距離無法分辨；XZ 重心距離可根據 X 偏移正確歸屬
             best_si = None
             best_dist = float('inf')
             for sr in section_ranges:
                 if sr['section_type'] != 'straight':
                     continue
-                if sr['v_min'] <= lv <= sr['v_max']:
-                    dist = 0
+                xz_cen = straight_xz_centroid.get(sr['section_idx'])
+                if xz_cen:
+                    dist = math.sqrt((lx - xz_cen[0]) ** 2 + (lv - xz_cen[1]) ** 2)
                 else:
-                    dist = min(abs(lv - sr['v_min']), abs(lv - sr['v_max']))
+                    # fallback: 純 Z 距離
+                    if sr['v_min'] <= lv <= sr['v_max']:
+                        dist = 0
+                    else:
+                        dist = min(abs(lv - sr['v_min']), abs(lv - sr['v_max']))
                 if dist < best_dist:
                     best_dist = dist
                     best_si = sr['section_idx']
-            if best_si is not None and best_dist <= 500:
+
+            if in_curved and (best_si is None or best_dist > 300):
+                # 腳架不在任何 straight section 範圍附近，歸屬 curved section
+                continue
+
+            if best_si is not None and best_dist <= 2000:
                 assignment.setdefault(best_si, []).append(leg)
 
         # 按沿軌道方向（Z 座標）分組，同一 Z 位置且同一 X 位置才合併
@@ -3131,7 +3272,7 @@ class MockCADEngine:
 
     def _build_section_cutting_list(self, section, bends, track_items,
                                     part_classifications, pipe_diameter,
-                                    stp_data=None):
+                                    stp_data=None, include_entry_transition=True):
         """
         對一個 straight section，產出 per-section 取料明細。
         直管 + 彎管交錯排列：U1(直) → U2(12°彎) → U3(直) → ...
@@ -3184,20 +3325,26 @@ class MockCADEngine:
         between_bends = [b for b in bends if b.get('position') == 'between']
 
         # 交錯插入 transition bends
-        def interleave_with_bends(segs, between_bends_list, entry_bend, exit_bend, entry_tail_bend, prefix, is_upper):
+        _is_large_arc = bool(stp_data and stp_data.get('arc_angle_deg', 0) >= 90)
+
+        def interleave_with_bends(segs, between_bends_list, entry_bend, exit_bend, entry_tail_bend, prefix, is_upper,
+                                  include_entry=True):
             """
             合併直管段和 transition bends，生成完整的取料清單
             直管段來自 pipe_data，transition bends 來自 _compute_transition_bends()
-            
+
             如果有 entry_bend（彎軌出口 bend），將第一個直軌分成入口過渡段和主段
             如果有 exit_bend（彎軌入口 bend），在所有直段之後添加
             如果有 entry_tail_bend（入口過渡的尾端 bend，下軌用），在直段之後添加
+            include_entry: 是否輸出 entry transition（過渡直段+弧）。Draw 3 設為 False。
             """
             items = []
             idx = 1
             
             # 處理入口 transition bend (彎軌出口) — 不分割原有軌道，新增獨立過渡段
-            if entry_bend and segs:
+            # include_entry=False 時跳過（Draw 3 不輸出入口過渡段）
+            # 大弧上軌跳過（entry 移到末尾，使 U1=主軌, U2=彎, U3=過渡段）
+            if include_entry and entry_bend and segs and not (_is_large_arc and is_upper):
                 entry_straight = entry_bend.get('entry_straight_upper' if is_upper else 'entry_straight_lower', 0)
                 arc_len_check = entry_bend['upper_arc'] if is_upper else entry_bend['lower_arc']
                 
@@ -3263,9 +3410,8 @@ class MockCADEngine:
                 # 插入 transition bend（在 seg[si] 和 seg[si+1] 之間）
                 for b in between_bends_list:
                     bet = b.get('between', (-1, -1))
-                    # 如果有 entry bend，段索引會偏移
-                    adj_si = si + (1 if entry_bend else 0)
-                    if bet[0] == adj_si:
+                    # bet[0] 是 segs 的原始索引，直接與 si 比較
+                    if bet[0] == si:
                         r = b['upper_r'] if is_upper else b['lower_r']
                         arc_len = b['upper_arc'] if is_upper else b['lower_arc']
                         bend_deg = b.get('upper_bend_deg', b['angle_deg']) if is_upper else b.get('lower_bend_deg', b['angle_deg'])
@@ -3283,10 +3429,40 @@ class MockCADEngine:
                             'spec': f"直徑{pipe_diameter:.1f} 角度{bend_deg:.0f}度(半徑{r:.0f})外弧長{arc_len:.0f}",
                         })
                         idx += 1
-            
+
+            # 大弧上軌末尾插入：主軌在前，彎角+過渡段在後（U1=主, U2=彎, U3=過渡）
+            if _is_large_arc and is_upper and include_entry and entry_bend and segs:
+                _u_arc_len = entry_bend.get('upper_arc', 0)
+                _u_entry_straight = entry_bend.get('entry_straight_upper', 0)
+                if _u_arc_len > 0:
+                    _u_r = entry_bend.get('upper_r', 0)
+                    _u_bend_deg = entry_bend.get('upper_bend_deg', entry_bend.get('angle_deg', 0))
+                    items.append({
+                        'item': f'{prefix}{idx}',
+                        'type': 'arc',
+                        'diameter': pipe_diameter,
+                        'angle_deg': _u_bend_deg,
+                        'radius': _u_r,
+                        'outer_arc_length': _u_arc_len,
+                        'height_gain': 0,
+                        'bend_sign': entry_bend.get('bend_sign', 1),
+                        'spec': f"直徑{pipe_diameter:.1f} 角度{_u_bend_deg:.0f}度(半徑{_u_r:.0f})外弧長{_u_arc_len:.0f}",
+                    })
+                    idx += 1
+                if _u_entry_straight > 0:
+                    items.append({
+                        'item': f'{prefix}{idx}',
+                        'type': 'straight',
+                        'diameter': segs[0].get('diameter', pipe_diameter),
+                        'length': round(_u_entry_straight, 1),
+                        'spec': f"直徑{segs[0].get('diameter', pipe_diameter):.1f} 長度{_u_entry_straight:.1f}",
+                    })
+                    idx += 1
+
             # 處理 entry_tail bend — 入口過渡的尾端 bend（下軌在直段之後）
             # 這是 is_after_curved 產生的下軌 transition，放在直段末端（靠近曲線段）
-            if entry_tail_bend:
+            # include_entry=False 時跳過（Draw 3 不輸出入口過渡段）
+            if include_entry and entry_tail_bend:
                 r = entry_tail_bend['upper_r'] if is_upper else entry_tail_bend['lower_r']
                 arc_len = entry_tail_bend['upper_arc'] if is_upper else entry_tail_bend['lower_arc']
                 bend_deg = entry_tail_bend.get('upper_bend_deg', entry_tail_bend['angle_deg']) if is_upper else entry_tail_bend.get('lower_bend_deg', entry_tail_bend['angle_deg'])
@@ -3378,8 +3554,10 @@ class MockCADEngine:
         entry_bend = entry_bends[0] if entry_bends else None
         entry_tail_bend = entry_tail_bends[0] if entry_tail_bends else None
         exit_bend = exit_bends[0] if exit_bends else None
-        result = interleave_with_bends(upper_segs, between_bends, entry_bend, exit_bend, entry_tail_bend, 'U', True)
-        result += interleave_with_bends(lower_segs, between_bends, entry_bend, exit_bend, entry_tail_bend, 'D', False)
+        result = interleave_with_bends(upper_segs, between_bends, entry_bend, exit_bend, entry_tail_bend, 'U', True,
+                                       include_entry=include_entry_transition)
+        result += interleave_with_bends(lower_segs, between_bends, entry_bend, exit_bend, entry_tail_bend, 'D', False,
+                                        include_entry=include_entry_transition)
 
         # ---- Debug Log: 最終取料清單 ----
         log_print(f"\n[CuttingList] 共 {len(result)} 項 "
@@ -8164,6 +8342,28 @@ Solid 名稱: {solid_name}
                 l_sp_3d = _l_pc.get('start_point', (0, 0, 0))
                 l_ep_3d = _l_pc.get('end_point', (0, 0, 0))
 
+            # 修正 2A：計算弦方向投影向量（弧起點 → 弧終點）
+            _sa_r = math.radians(plan_sa_deg)
+            _ea_r = math.radians(plan_sa_deg + plan_span_deg)
+            _lf_sp_x = arc_cx_m + R_arc * math.cos(_sa_r)
+            _lf_sp_y = arc_cy_m + R_arc * math.sin(_sa_r)
+            _lf_ep_x = arc_cx_m + R_arc * math.cos(_ea_r)
+            _lf_ep_y = arc_cy_m + R_arc * math.sin(_ea_r)
+            _lf_chord = math.sqrt((_lf_ep_x - _lf_sp_x) ** 2 + (_lf_ep_y - _lf_sp_y) ** 2)
+            if _lf_chord > 1e-6:
+                _lf_cos = (_lf_ep_x - _lf_sp_x) / _lf_chord
+                _lf_sin = (_lf_ep_y - _lf_sp_y) / _lf_chord
+            else:
+                _lf_cos, _lf_sin = 1.0, 0.0
+
+            # 修正 2C：Z fallback —— 若 3D 端點讀取失敗，以幾何估算
+            if u_sp_3d == (0, 0, 0) and u_ep_3d == (0, 0, 0) and arc_height_gain > 0:
+                u_sp_3d = (_lf_sp_x, _lf_sp_y, 0.0)
+                u_ep_3d = (_lf_ep_x, _lf_ep_y, arc_height_gain)
+            if l_sp_3d == (0, 0, 0) and l_ep_3d == (0, 0, 0) and arc_height_gain > 0:
+                l_sp_3d = (_lf_sp_x, _lf_sp_y, 0.0)
+                l_ep_3d = (_lf_ep_x, _lf_ep_y, arc_height_gain)
+
             log_print(f"  上圖繪製完成（共用 plan view）")
 
             # ---- 彎軌區段的上下軌實際間距（取 centroid Z 軸向距離）----
@@ -8218,10 +8418,10 @@ Solid 名稱: {solid_name}
             lower_area_w = PW * 0.52
             lower_area_h = upper_area_y - lower_area_y - 10
 
-            # XZ 平面投影（沿 Y 軸方向觀看，水平=X, 垂直=Z）
+            # 修正 2B：弦方向側視投影（水平=弦方向投影距離, 垂直=Z）
             def _proj_lf(x, y, z):
-                """3D → XZ 平面正視圖投影（水平=X, 垂直=Z）"""
-                return (x, z)
+                """3D → 弦方向側視投影（水平=弦方向, 垂直=Z）"""
+                return ((x - _lf_sp_x) * _lf_cos + (y - _lf_sp_y) * _lf_sin, z)
 
             # 取樣 3D 弧線點
             n_samp = 80
@@ -8602,10 +8802,15 @@ Solid 名稱: {solid_name}
                 is_after_curved=is_after_curved, prev_curved_section=prev_curved_section,
                 bend_direction=bend_direction, stp_data=stp_data)
 
+            n_section3_pairs = max(
+                len(section3.get('upper_tracks', [])),
+                len(section3.get('lower_tracks', []))
+            )
             section3_cl = self._build_section_cutting_list(
                 section3, section3_bends, stp_data['track_items'],
                 stp_data['part_classifications'], pipe_diameter,
-                stp_data=stp_data)
+                stp_data=stp_data,
+                include_entry_transition=(n_section3_pairs < 2))
 
             # 使用 Drawing 1 的繪圖函數，傳入 section3 的資料
             doc3 = self._draw_straight_section_sheet(
@@ -9670,14 +9875,24 @@ if __name__ == "__main__":
     root = Tk()
     root.withdraw()
 
-    # 讓使用者選擇 3D 模型檔案
-    log_print("請選擇 3D 模型檔案...")
-    model_file = select_3d_file()
-
-    if model_file:
-        log_print(f"[System] 已選擇檔案: {model_file}")
+    # 支援命令列直接傳入檔案路徑（跳過 GUI 對話框）
+    if len(sys.argv) > 1:
+        cli_path = sys.argv[1]
+        model_file = os.path.abspath(cli_path) if not os.path.isabs(cli_path) else cli_path
+        if os.path.exists(model_file):
+            log_print(f"[System] 使用命令列指定檔案: {model_file}")
+        else:
+            log_print(f"[System] 命令列指定的檔案不存在: {model_file}，將使用模擬資料")
+            model_file = None
     else:
-        log_print("[System] 未選擇檔案，將使用模擬資料")
+        # 讓使用者選擇 3D 模型檔案
+        log_print("請選擇 3D 模型檔案...")
+        model_file = select_3d_file()
+
+        if model_file:
+            log_print(f"[System] 已選擇檔案: {model_file}")
+        else:
+            log_print("[System] 未選擇檔案，將使用模擬資料")
 
     # 初始化系統
     system = AutoDraftingSystem(model_file=model_file)
