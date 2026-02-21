@@ -2873,8 +2873,8 @@ class MockCADEngine:
                 _global_elev = stp_data['elevation_deg'] if stp_data else 0
                 exit_bend_deg = _global_elev if _global_elev > 1 else 0
             
-            # 確保角度合理
-            if exit_bend_deg < 1:
+            # 確保角度合理：只有在無法從軌道資料計算（量測點 < 2）時才 fallback
+            if exit_bend_deg < 1 and len(all_elevs) < 2:
                 _global_elev = stp_data['elevation_deg'] if stp_data else 0
                 exit_bend_deg = _global_elev if _global_elev > 1 else 0
             
@@ -6720,19 +6720,17 @@ Solid 名稱: {solid_name}
         PW, PH = 420, 297
         MARGIN = 10
 
-        # 側視圖方向：統一使用 x_dir=-1（軌道從右向左延伸）
-        x_dir = -1  # 軌道從右向左延伸
-
-        # Drawing 3 (-3): 不反轉 cutting list（保持 U1→U2→U3 順序），
-        # 使軌道從過渡端(右下)向主端(左上)延伸，彎曲朝上
+        # Drawing 3 (-3): 弧管出口在左，自由端在右 → x_dir=+1（左向右延伸）
         _start_is_transition = bool(
             drawing_number and str(drawing_number).endswith('-3'))
-        # Drawing 1 (-1): 也不反轉 cutting list（保持 U1→U2→U3 順序），
-        # 但 U2/D2 角度為「下彎」（entry/exit 弧在 Draw 1 標準圖為向下）
+        # Drawing 1 (-1): 弧管入口在右，自由端在左 → x_dir=-1（右向左延伸）
         _is_drawing1 = bool(
             drawing_number and str(drawing_number).endswith('-1'))
         # 標註風格：Drawing 1 與 Drawing 3 相同（標示位置、方向）
         _annotation_like_draw3 = _start_is_transition or _is_drawing1
+
+        # 側視圖方向：Draw 3 從左向右（弧在左），Draw 1 從右向左（弧在右）
+        x_dir = 1 if _start_is_transition else -1
 
 
         doc = ezdxf.new(dxfversion='R2010')
