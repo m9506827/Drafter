@@ -267,9 +267,13 @@ class EngineeringViewer:
             add_model_to_subplot(p, 1, 0, "3. Front View (XZ Plane)", p.view_xz)
             add_model_to_subplot(p, 1, 1, "4. Right View (YZ Plane)", p.view_yz)
 
-            print("[Viewer] 視窗開啟中...")
-            p.show()
-            
+            if os.environ.get('DRAFTER_NO_GUI', '0') == '1':
+                p.close()
+                print("[Viewer] 跳過視窗（DRAFTER_NO_GUI=1）")
+            else:
+                print("[Viewer] 視窗開啟中...")
+                p.show()
+
         except Exception as e:
             print(f"[Viewer] 3D 顯示錯誤: {e}")
 

@@ -9941,6 +9941,8 @@ if __name__ == "__main__":
     log_print(f"程式啟動時間: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     log_print("=" * 50)
 
+    _NO_GUI = os.environ.get('DRAFTER_NO_GUI', '0') == '1'
+
     # 建立主視窗（隱藏）供後續對話框使用
     root = Tk()
     root.withdraw()
@@ -9978,7 +9980,11 @@ if __name__ == "__main__":
     # 建立資訊視窗顯示完整內容
     info = system.cad.get_model_info()
 
+    if _NO_GUI:
+        log_print("[System] 跳過 STEP 資訊視窗（DRAFTER_NO_GUI=1）")
     info_window = Toplevel(root)
+    if _NO_GUI:
+        info_window.after(0, info_window.destroy)  # 立即自毀，wait_window 會立即返回
     info_window.title("STEP 檔案完整資訊")
     info_window.geometry("1000x800")
     info_window.configure(bg='#f0f0f0')
@@ -10235,7 +10241,9 @@ if __name__ == "__main__":
     # =============================================
     log_print("步驟 2: 預覽 3D 模型")
 
-    if model_file and system.cad.cad_model is not None:
+    if _NO_GUI:
+        log_print("[System] 跳過 3D 預覽視窗（DRAFTER_NO_GUI=1）")
+    elif model_file and system.cad.cad_model is not None:
         log_print("[System] 開啟 3D 模型預覽視窗...")
         system.cad.preview_3d_model()
     else:
