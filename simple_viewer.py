@@ -214,6 +214,9 @@ class EngineeringViewer:
                 fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
                 plt.close(fig)
                 print(f"[Viewer] Saved: {save_path}")
+            elif os.environ.get('DRAFTER_NO_GUI', '0') == '1':
+                plt.close(fig)
+                print(f"[Viewer] 跳過視窗（DRAFTER_NO_GUI=1）")
             else:
                 print("[Viewer] 視窗開啟中...")
                 plt.show(block=True)
@@ -432,6 +435,9 @@ class EngineeringViewer:
                 fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
                 plt.close(fig)
                 print(f"[Viewer] Saved: {save_path}")
+            elif os.environ.get('DRAFTER_NO_GUI', '0') == '1':
+                plt.close(fig)
+                print(f"[Viewer] 跳過視窗（DRAFTER_NO_GUI=1）")
             else:
                 print("[Viewer] 視窗開啟中...")
                 plt.show(block=True)
