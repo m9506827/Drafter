@@ -8299,6 +8299,52 @@ Solid 名稱: {solid_name}
             c_upper = curved_sec.get('upper_tracks', []) if curved_sec else []
             c_lower = curved_sec.get('lower_tracks', []) if curved_sec else []
 
+            # 早期計算弧段支撐架數量（排除直線段支撐架）
+            # 以支撐架重心在 XY 平面上相對弧心的角度過濾，排除不在弧段角度範圍內的支撐架
+            _arc_brk_count = bracket_count  # default (correct for 2-2.stp)
+            try:
+                # 找弧管端點 → 計算弧心（與 _draw_top_plan_view 相同邏輯）
+                _arc_track_pipes = [pc for pc in pipe_centerlines
+                                    if {c['feature_id']: c for c in part_classifications}.get(
+                                        pc['solid_id'], {}).get('class') == 'track']
+                _arc_pipe_e = None
+                for _tp_e in _arc_track_pipes:
+                    if any(s.get('type') == 'arc' and s.get('radius', 0) > 50
+                           for s in _tp_e.get('segments', [])):
+                        _arc_pipe_e = _tp_e
+                        break
+                if _arc_pipe_e:
+                    _p1x_e, _p1y_e = _arc_pipe_e['start_point'][0], _arc_pipe_e['start_point'][1]
+                    _p2x_e, _p2y_e = _arc_pipe_e['end_point'][0],   _arc_pipe_e['end_point'][1]
+                    _ch_e = math.sqrt((_p2x_e - _p1x_e)**2 + (_p2y_e - _p1y_e)**2)
+                    if _ch_e > 1e-6:
+                        _mid_xe, _mid_ye = (_p1x_e + _p2x_e) / 2, (_p1y_e + _p2y_e) / 2
+                        _half_e = _ch_e / 2
+                        _h_perp_e = math.sqrt(max(arc_radius**2 - _half_e**2, 0))
+                        _nx_e = -(_p2y_e - _p1y_e) / _ch_e
+                        _ny_e =  (_p2x_e - _p1x_e) / _ch_e
+                        if bend_direction == 'left':
+                            _cx_e = _mid_xe + _h_perp_e * _nx_e
+                            _cy_e = _mid_ye + _h_perp_e * _ny_e
+                        else:
+                            _cx_e = _mid_xe - _h_perp_e * _nx_e
+                            _cy_e = _mid_ye - _h_perp_e * _ny_e
+                        _sa_e = math.degrees(math.atan2(_p1y_e - _cy_e, _p1x_e - _cx_e))
+                        _ea_e = math.degrees(math.atan2(_p2y_e - _cy_e, _p2x_e - _cx_e))
+                        _span_e = ((_ea_e - _sa_e) % 360) or 360
+                        # 支撐架角度過濾：重心相對弧心的角度是否在弧段範圍內
+                        _brk_cls = [c for c in part_classifications if c.get('class') == 'bracket']
+                        _n_arc = 0
+                        for _b_e in _brk_cls:
+                            _bcx, _bcy = _b_e.get('centroid', (0, 0, 0))[:2]
+                            _b_ang = (math.degrees(math.atan2(_bcy - _cy_e, _bcx - _cx_e)) - _sa_e) % 360
+                            if _b_ang <= _span_e + 1:  # +1° 容差
+                                _n_arc += 1
+                        if _n_arc >= 1:
+                            _arc_brk_count = _n_arc
+            except Exception:
+                pass  # 失敗時保留 default
+
             # 上圖繪圖區域（給下圖留足空間：上移分界線）
             upper_area_x = MARGIN + 5
             upper_area_y = PH * 0.65
@@ -8308,10 +8354,14 @@ Solid 名稱: {solid_name}
             R_arc = arc_radius
             pipe_r = pipe_diameter / 2
 
-            # 呼叫共用俯視圖繪製
+            # 呼叫共用俯視圖繪製（暫時覆蓋 bracket_count 為弧段數量）
+            _saved_bc = stp_data['bracket_count']
+            stp_data['bracket_count'] = _arc_brk_count
             plan_r2 = self._draw_top_plan_view(
                 msp2, upper_area_x, upper_area_y, upper_area_w, upper_area_h,
                 stp_data, x_dir=x_dir, draw_brackets=True)
+            stp_data['bracket_count'] = _saved_bc
+            bracket_count = _arc_brk_count  # 側視圖也使用弧段數量
 
             # 提取下半部需要的數據
             if plan_r2:
@@ -8361,6 +8411,21 @@ Solid 名稱: {solid_name}
                 _lf_sin = (_lf_ep_y - _lf_sp_y) / _lf_chord
             else:
                 _lf_cos, _lf_sin = 1.0, 0.0
+
+            # 修正 2D：對齊 3D 端點方向與 plan arc 參數化方向（t=0 對應弧起點）
+            # 若 3D start_point XY 距弧終點比距弧起點更近，表示方向相反，需交換
+            def _align_3d_with_plan(sp3, ep3):
+                """若 sp3 在 plan 弧終點側，交換 sp3/ep3 以對齊 t=0→plan_sa"""
+                d_sp = (sp3[0] - _lf_sp_x)**2 + (sp3[1] - _lf_sp_y)**2
+                d_ep = (ep3[0] - _lf_sp_x)**2 + (ep3[1] - _lf_sp_y)**2
+                if d_ep < d_sp:
+                    return ep3, sp3
+                return sp3, ep3
+
+            if u_sp_3d != (0, 0, 0):
+                u_sp_3d, u_ep_3d = _align_3d_with_plan(u_sp_3d, u_ep_3d)
+            if l_sp_3d != (0, 0, 0):
+                l_sp_3d, l_ep_3d = _align_3d_with_plan(l_sp_3d, l_ep_3d)
 
             # 修正 2C：Z fallback —— 若 3D 端點讀取失敗，以幾何估算
             if u_sp_3d == (0, 0, 0) and u_ep_3d == (0, 0, 0) and arc_height_gain > 0:
@@ -8734,11 +8799,10 @@ Solid 名稱: {solid_name}
             # ---- BOM 表 — flag: show_basic_info ----
             bom2_items = []
             if stp_data['bracket_items']:
-                total_brackets = sum(b.get('quantity', 1) for b in stp_data['bracket_items'])
                 psa_spec = f"PSA{elevation_deg:.0f}" if elevation_deg > 0 else 'PSA20'
                 bom2_items.append({
                     'id': 1, 'name': '支撐架',
-                    'quantity': total_brackets,
+                    'quantity': _arc_brk_count,
                     'remark': psa_spec
                 })
 
