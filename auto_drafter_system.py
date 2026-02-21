@@ -2634,11 +2634,24 @@ class MockCADEngine:
                         if seg.get('type') == 'arc' and seg.get('angle_deg', 0) > 0:
                             raw_arc_deg = seg['angle_deg']
                             # 大弧（≥90°）是弧本身，不是 transition 角度
-                            # 改用仰角（直軌與弧管間的高度過渡角）
-                            if raw_arc_deg >= 90 and stp_data:
-                                _elev = stp_data.get('elevation_deg', 0)
-                                entry_bend_deg = round(_elev) if _elev > 0.5 else 0
-                                log_print(f"  entry_bend_deg from elevation (arc={raw_arc_deg:.0f}°≥90°): {entry_bend_deg}° (fid={fid})")
+                            # 改用本 section 上下軌仰角差（與 is_before_curved 邏輯一致）
+                            if raw_arc_deg >= 90:
+                                _all_entry_elevs = []
+                                for _t in upper_tracks:
+                                    _e = elev_map.get(_t.get('solid_id', ''), 0)
+                                    if _e > 0:
+                                        _all_entry_elevs.append(_e)
+                                for _t in lower_tracks:
+                                    _e = elev_map.get(_t.get('solid_id', ''), 0)
+                                    if _e > 0:
+                                        _all_entry_elevs.append(_e)
+                                if len(_all_entry_elevs) >= 2:
+                                    _elev_diff = abs(max(_all_entry_elevs) - min(_all_entry_elevs))
+                                    entry_bend_deg = round(_elev_diff) if _elev_diff > 0.5 else 0
+                                if entry_bend_deg < 1 and stp_data:
+                                    _elev = stp_data.get('elevation_deg', 0)
+                                    entry_bend_deg = round(_elev) if _elev > 0.5 else 0
+                                log_print(f"  entry_bend_deg from elev diff (arc={raw_arc_deg:.0f}°≥90°): {entry_bend_deg}° elevs={_all_entry_elevs} (fid={fid})")
                             else:
                                 entry_bend_deg = round(raw_arc_deg)
                                 log_print(f"  entry_bend_deg from curved arc geom: {entry_bend_deg}° (fid={fid})")
@@ -2678,79 +2691,74 @@ class MockCADEngine:
             if n_upper >= 1 and prev_curved_section:
                 curve_upper = prev_curved_section.get('upper_tracks', [])
                 if curve_upper:
-                    # 從 stp_data.pipe_centerlines 查詢端點
+                    # 從 stp_data.pipe_centerlines 查詢上軌端點
                     _u_fid = upper_tracks[0].get('solid_id', '')
                     _u_pc = _pcl_map.get(_u_fid, upper_tracks[0].get('pipe_data', {}))
                     u_sp = _u_pc.get('start_point', (0, 0, 0))
                     u_ep = _u_pc.get('end_point', (0, 0, 0))
-                    
-                    # 找直軌最近的端點和曲線最近的端點
-                    best_curve_pt = None
-                    best_track_pt = None
-                    min_dist_yz = float('inf')
-                    for ct in curve_upper:
-                        _c_fid = ct.get('solid_id', '')
-                        cpd = _pcl_map.get(_c_fid, ct.get('pipe_data', {}))
-                        for cpt in [cpd.get('start_point', (0, 0, 0)),
-                                    cpd.get('end_point', (0, 0, 0))]:
-                            for tpt in [u_sp, u_ep]:
-                                d_yz = math.sqrt((tpt[1] - cpt[1])**2 + (tpt[2] - cpt[2])**2)
-                                if d_yz < min_dist_yz:
-                                    min_dist_yz = d_yz
-                                    best_curve_pt = cpt
-                                    best_track_pt = tpt
-                    
-                    if best_curve_pt and best_track_pt:
-                        entry_r = after_upper_r
-                        # 直軌方向（YZ 平面）
-                        dy_t = u_ep[1] - u_sp[1]
-                        dz_t = u_ep[2] - u_sp[2]
-                        len_yz_t = math.sqrt(dy_t**2 + dz_t**2)
-                        if len_yz_t > 1e-6:
-                            d_track_y = dy_t / len_yz_t
-                            d_track_z = dz_t / len_yz_t
-                        else:
-                            d_track_y = 0
-                            d_track_z = 1
-                        
-                        # 過渡段方向：彎管前的方向（根據直軌仰角反推）
-                        _fallback_elev = stp_data['elevation_deg'] if stp_data else 0
-                        track_elev = elev_map.get(upper_tracks[0]['solid_id'], _fallback_elev)
-                        trans_elev = track_elev - entry_bend_deg
-                        # 過渡段方向與直軌同向（Y 符號相同）
-                        sign_y = 1.0 if d_track_y >= 0 else -1.0
-                        d_trans_y = sign_y * math.cos(math.radians(trans_elev))
-                        d_trans_z = math.sin(math.radians(trans_elev))
-                        
-                        # 彎管幾何：CW 旋轉（仰角從 trans_elev 增加到 track_elev）
-                        # 在 YZ 平面中，旋轉中心在行進方向右側
-                        # 彎管出口 = 直軌起點（最近曲線的端點）
-                        # 使用投影法計算過渡段長度
-                        #   Center = exit + right_of_exit * R
-                        #   Entry = Center + left_of_entry * R (outward at entry for CW)
-                        right_track_y = d_track_z
-                        right_track_z = -d_track_y
-                        
-                        center_y = best_track_pt[1] + right_track_y * entry_r
-                        center_z = best_track_pt[2] + right_track_z * entry_r
-                        
-                        # 入口點（過渡段末端）
-                        left_trans_y = -d_trans_z
-                        left_trans_z = d_trans_y
-                        entry_pt_y = center_y + left_trans_y * entry_r
-                        entry_pt_z = center_z + left_trans_z * entry_r
-                        
-                        # 從曲線端點到彎管入口的間距，投影到過渡段方向
-                        gap_y = entry_pt_y - best_curve_pt[1]
-                        gap_z = entry_pt_z - best_curve_pt[2]
+
+                    # 上軌仰角及 trans 方向
+                    dy_t = u_ep[1] - u_sp[1]
+                    dz_t = u_ep[2] - u_sp[2]
+                    len_yz_t = math.sqrt(dy_t**2 + dz_t**2)
+                    d_track_y = dy_t / len_yz_t if len_yz_t > 1e-6 else 0.0
+                    d_track_z = dz_t / len_yz_t if len_yz_t > 1e-6 else 1.0
+                    _fallback_elev = stp_data['elevation_deg'] if stp_data else 0
+                    track_elev = elev_map.get(upper_tracks[0]['solid_id'], _fallback_elev)
+                    trans_elev = track_elev - entry_bend_deg
+                    sign_y = 1.0 if d_track_y >= 0 else -1.0
+                    d_trans_y = sign_y * math.cos(math.radians(trans_elev))
+                    d_trans_z = math.sin(math.radians(trans_elev))
+
+                    # 大弧上軌尾段：投影 (下軌自由端 - 上軌自由端) 到 trans 方向
+                    # 原因：上軌 arc-side 端與弧重合（gap≈0），尾段長度由上下軌
+                    # 自由端的相對位置決定。
+                    if n_lower >= 1:
+                        # 找上軌 arc-side 端（最近弧的端點）
+                        _u_near_yz = float('inf')
+                        _u_arc_side = u_sp
+                        for _ct in curve_upper:
+                            _cpd = _pcl_map.get(_ct.get('solid_id',''), _ct.get('pipe_data',{}))
+                            for _cpt in [_cpd.get('start_point',(0,0,0)),
+                                         _cpd.get('end_point',(0,0,0))]:
+                                for _tpt in [u_sp, u_ep]:
+                                    _d = math.sqrt((_tpt[1]-_cpt[1])**2+(_tpt[2]-_cpt[2])**2)
+                                    if _d < _u_near_yz:
+                                        _u_near_yz = _d
+                                        _u_arc_side = _tpt
+                        # 上軌自由端 = 另一端
+                        _u_free = u_ep if (_u_arc_side[1]==u_sp[1] and _u_arc_side[2]==u_sp[2]) else u_sp
+
+                        # 找下軌自由端（遠離弧的端點）
+                        _l_fid0 = lower_tracks[0].get('solid_id','')
+                        _l_pc0 = _pcl_map.get(_l_fid0, lower_tracks[0].get('pipe_data',{}))
+                        _l_sp0 = _l_pc0.get('start_point',(0,0,0))
+                        _l_ep0 = _l_pc0.get('end_point',(0,0,0))
+                        _curve_lower_tracks = prev_curved_section.get('lower_tracks',[]) if prev_curved_section else []
+                        _l_near_yz = float('inf')
+                        _l_arc_side = _l_sp0
+                        for _ct in _curve_lower_tracks:
+                            _cpd = _pcl_map.get(_ct.get('solid_id',''), _ct.get('pipe_data',{}))
+                            for _cpt in [_cpd.get('start_point',(0,0,0)),
+                                         _cpd.get('end_point',(0,0,0))]:
+                                for _lpt in [_l_sp0, _l_ep0]:
+                                    _d = math.sqrt((_lpt[1]-_cpt[1])**2+(_lpt[2]-_cpt[2])**2)
+                                    if _d < _l_near_yz:
+                                        _l_near_yz = _d
+                                        _l_arc_side = _lpt
+                        _l_free = _l_ep0 if (_l_arc_side[1]==_l_sp0[1] and _l_arc_side[2]==_l_sp0[2]) else _l_sp0
+
+                        gap_y = _l_free[1] - _u_free[1]
+                        gap_z = _l_free[2] - _u_free[2]
                         proj = d_trans_y * gap_y + d_trans_z * gap_z
-                        entry_straight_length_upper = round(max(abs(proj), 0), 1)
-                        log_print(f"  Entry transition upper: bend_geom proj={proj:.1f} R={entry_r:.0f} → straight={entry_straight_length_upper:.1f}")
+                        entry_straight_length_upper = round(abs(proj), 1)
+                        log_print(f"  Entry transition upper (free_end_proj): trans_elev={trans_elev:.1f}° gap=({gap_y:.1f},{gap_z:.1f}) proj={proj:.1f} → straight={entry_straight_length_upper:.1f}")
             
             if entry_straight_length_upper <= 0:
                 entry_straight_length_upper = 0  # 無法計算時不添加過渡段
 
-            # 下軌入口過渡段（幾何計算，類似上軌）
+            # 下軌入口過渡段：使用 _compute_outside_transition 相同的幾何邏輯
+            # 彎管入口 = 下軌 arc-side 端，彎管出口投影到 curve_pt（弧軌 arc-side 起點）
             entry_straight_length_lower = 0
             if n_lower >= 1 and prev_curved_section:
                 curve_lower = prev_curved_section.get('lower_tracks', [])
@@ -2759,6 +2767,7 @@ class MockCADEngine:
                     _l_pc = _pcl_map.get(_l_fid, lower_tracks[0].get('pipe_data', {}))
                     l_sp = _l_pc.get('start_point', (0, 0, 0))
                     l_ep = _l_pc.get('end_point', (0, 0, 0))
+                    # 找下軌 arc-side 端（最近弧端點）
                     best_curve_pt_l = None
                     best_track_pt_l = None
                     min_dist_yz_l = float('inf')
@@ -2774,33 +2783,32 @@ class MockCADEngine:
                                     best_track_pt_l = tpt
                     if best_curve_pt_l and best_track_pt_l:
                         entry_r_l = after_lower_r
+                        # 下軌 3D 方向（start→end）
                         dy_l = l_ep[1] - l_sp[1]
                         dz_l = l_ep[2] - l_sp[2]
                         len_yz_l = math.sqrt(dy_l**2 + dz_l**2)
-                        if len_yz_l > 1e-6:
-                            d_track_y_l = dy_l / len_yz_l
-                            d_track_z_l = dz_l / len_yz_l
-                        else:
-                            d_track_y_l, d_track_z_l = 0, 1
-                        _fallback_elev_l = stp_data['elevation_deg'] if stp_data else 0
-                        track_elev_l = elev_map.get(lower_tracks[0]['solid_id'], _fallback_elev_l)
-                        trans_elev_l = track_elev_l - entry_bend_deg
-                        sign_y_l = 1.0 if d_track_y_l >= 0 else -1.0
-                        d_trans_y_l = sign_y_l * math.cos(math.radians(trans_elev_l))
-                        d_trans_z_l = math.sin(math.radians(trans_elev_l))
-                        right_track_y_l = d_track_z_l
-                        right_track_z_l = -d_track_y_l
-                        center_y_l = best_track_pt_l[1] + right_track_y_l * entry_r_l
-                        center_z_l = best_track_pt_l[2] + right_track_z_l * entry_r_l
-                        left_trans_y_l = -d_trans_z_l
-                        left_trans_z_l = d_trans_y_l
-                        entry_pt_y_l = center_y_l + left_trans_y_l * entry_r_l
-                        entry_pt_z_l = center_z_l + left_trans_z_l * entry_r_l
-                        gap_y_l = entry_pt_y_l - best_curve_pt_l[1]
-                        gap_z_l = entry_pt_z_l - best_curve_pt_l[2]
-                        proj_l = d_trans_y_l * gap_y_l + d_trans_z_l * gap_z_l
-                        entry_straight_length_lower = round(max(abs(proj_l), 0), 1)
-                        log_print(f"  Entry transition lower: bend_geom proj={proj_l:.1f} R={entry_r_l:.0f} → straight={entry_straight_length_lower:.1f}")
+                        d0_y_l = dy_l / len_yz_l if len_yz_l > 1e-6 else 0.0
+                        d0_z_l = dz_l / len_yz_l if len_yz_l > 1e-6 else 1.0
+                        # 過渡後仰角 = 上軌仰角（另一軌的仰角，即 min(all_elevs)）
+                        _all_entry_elevs_l = []
+                        for _t in upper_tracks + lower_tracks:
+                            _e = elev_map.get(_t.get('solid_id',''), 0)
+                            if _e > 0:
+                                _all_entry_elevs_l.append(_e)
+                        post_elev_l = min(_all_entry_elevs_l) if _all_entry_elevs_l else (stp_data['elevation_deg'] if stp_data else 0)
+                        sign_y_l = 1.0 if d0_y_l >= 0 else -1.0
+                        d1_y_l = sign_y_l * math.cos(math.radians(post_elev_l))
+                        d1_z_l = (abs(d0_z_l)/d0_z_l if abs(d0_z_l) > 1e-6 else 1.0) * math.sin(math.radians(post_elev_l))
+                        # 彎管幾何：CW（右側中心），入口=near_pt（arc-side 端），出口投影到 curve_pt
+                        center_y_l = best_track_pt_l[1] + d0_z_l * entry_r_l
+                        center_z_l = best_track_pt_l[2] + (-d0_y_l) * entry_r_l
+                        exit_y_l = center_y_l + (-d1_z_l) * entry_r_l
+                        exit_z_l = center_z_l + d1_y_l * entry_r_l
+                        gap_y_l = best_curve_pt_l[1] - exit_y_l
+                        gap_z_l = best_curve_pt_l[2] - exit_z_l
+                        proj_l = d1_y_l * gap_y_l + d1_z_l * gap_z_l
+                        entry_straight_length_lower = round(max(proj_l, 0), 1)
+                        log_print(f"  Entry transition lower (_outside_logic): post_elev={post_elev_l:.1f}° proj={proj_l:.1f} R={entry_r_l:.0f} → straight={entry_straight_length_lower:.1f}")
             
             bend_rad = math.radians(entry_bend_deg)
             # 大弧（≥90°）時，上下軌統一用 entry bend，不用 entry_tail
