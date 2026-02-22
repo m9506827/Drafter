@@ -8480,8 +8480,9 @@ Solid 名稱: {solid_name}
             log_print(f"  [stp_data] arc_cl_len={arc_total_length:.1f}, "
                       f"h_gain={arc_height_gain:.1f}, brackets={bracket_count}")
 
-            # 映射(背面)顯示：x_dir=-1 將視圖左右鏡像
-            x_dir = -1  # 1=正面, -1=背面
+            # 側視圖方向：左彎 x_dir=-1（背面），右彎 x_dir=+1（正面）
+            # 右彎模型 3D 水平走向與左彎相反，翻轉 x_dir 以維持「左下→右上」慣例
+            x_dir = 1 if bend_direction == 'right' else -1
 
             # ================================================================
             # 上半部：俯視圖（Top View）— 共用 _draw_top_plan_view
