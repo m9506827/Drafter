@@ -293,6 +293,25 @@ def _find_dxf(base_name, sheet_num, output_dir):
     return None
 
 
+def test_dxf_content_draw1(T):
+    """Drawing 1 DXF: 腳架×1 + 支撐架×1 (PSA20)"""
+    print("\n--- Test: Drawing 1 DXF Content (2-4.stp) ---")
+    import ezdxf
+    output_dir = os.path.join(ROOT_DIR, 'output')
+    dxf_path = _find_dxf('2-4', 1, output_dir)
+    if not dxf_path:
+        T.check_true("Draw 1 DXF exists", False, "not found in output/")
+        return
+    msp = ezdxf.readfile(dxf_path).modelspace()
+    texts = [e.dxf.text for e in msp if e.dxftype() == 'TEXT']
+    T.check_true("Draw 1: BOM contains '支撐架'",
+                 any('支撐架' in t for t in texts),
+                 f"texts={texts[:20]}")
+    T.check_true("Draw 1: BOM contains 'PSA'",
+                 any('PSA' in t for t in texts),
+                 f"texts={[t for t in texts if 'PSA' in t]}")
+
+
 def test_dxf_content_draw2(T):
     """測試 Drawing 2 DXF 中的實際文字數值"""
     print("\n--- Test: Drawing 2 DXF Content (2-4.stp) ---")
@@ -433,6 +452,7 @@ def main():
         elif args.draw3:
             test_dxf_content_draw3(T)
         else:
+            test_dxf_content_draw1(T)
             test_dxf_content_draw2(T)
             test_dxf_content_draw3(T)
 

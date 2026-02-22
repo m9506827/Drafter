@@ -6665,7 +6665,10 @@ Solid 名稱: {solid_name}
                                      leg_angles_map,
                                      base_name, drawing_number,
                                      project, today, tb_override=None,
-                                     stp_data=None):
+                                     stp_data=None,
+                                     bracket_count=0,
+                                     bracket_spec='',
+                                     bracket_items_list=None):
         """
         繪製一張直線段施工圖（匹配 2-2-1.jpg 參考圖佈局）。
         包含：頁面框+標題欄+圖號、側視圖（上下軌+腳架+底座）、
@@ -6730,7 +6733,13 @@ Solid 名稱: {solid_name}
         _annotation_like_draw3 = _start_is_transition or _is_drawing1
 
         # 側視圖方向：Draw 3 從左向右（弧在左），Draw 1 從右向左（弧在右）
-        x_dir = 1 if _start_is_transition else -1
+        # 右彎模型（bend_direction='right'）的第一段 3D 水平走向與左彎相反，
+        # 因此 x_dir 須對調，才能讓 Draw 1 自由端在左、弧管在右（慣例不變）。
+        _bend_dir = stp_data.get('bend_direction', 'left')
+        if _bend_dir == 'right':
+            x_dir = -1 if _start_is_transition else 1   # 右彎：Draw3=-1, Draw1=+1
+        else:
+            x_dir = 1 if _start_is_transition else -1   # 左彎（預設）：Draw3=+1, Draw1=-1
 
 
         doc = ezdxf.new(dxfversion='R2010')
@@ -6771,6 +6780,16 @@ Solid 名稱: {solid_name}
             bom_items.append({
                 'id': li + 1, 'name': '腳架', 'quantity': 1,
                 'remark': f"線長L={ll:.0f}"
+            })
+        if bracket_count > 0:
+            _spec = bracket_spec or (
+                f"PSA{stp_data['elevation_deg']:.0f}"
+                if stp_data and stp_data.get('elevation_deg', 0) > 0 else 'PSA20')
+            bom_items.append({
+                'id': len(section_legs) + 1,
+                'name': '支撐架',
+                'quantity': bracket_count,
+                'remark': _spec
             })
         if _SHOW_BASIC and bom_items:
             bom_x = tables_left_x  # 左邊線與取料明細、標題欄對齊
@@ -7615,6 +7634,63 @@ Solid 名稱: {solid_name}
                 self._annotate_leg_block(msp, leg_top, leg_foot, leg_lower_pt,
                                          ll, below_len, li, scale)
 
+        # ========== 支撐架（bracket）繪製 ==========
+        # 每個 bracket 按其 3D 重心投影到軌道路徑，繪製在上下軌之間
+        if bracket_items_list:
+            _brk_hw   = min(pipe_hw * 0.6, 2.0)   # 支撐架管壁半寬
+            _brk_xsz  = min(pipe_hw * 0.5, 1.5)   # X 標記大小
+            _brk_cr   = _brk_xsz * 0.5             # 小圓圈半徑
+            for _bi, _brk in enumerate(bracket_items_list):
+                _brk_cen = _brk.get('centroid', (0, 0, 0))
+                # 投影到軌道水平方向（與腳架相同方法）
+                if all_track_h:
+                    _bh = _proj_horiz(_brk_cen)
+                    if _h_inverted:
+                        _bt = (track_h_max - _bh) / track_h_span
+                    else:
+                        _bt = (_bh - track_h_min) / track_h_span
+                    _bt = max(0.05, min(0.95, _bt))
+                else:
+                    _bt = 0.5
+                _bx, _bu_y = _interp_path(_bt)
+                _bl_y = _find_y_on_path(lower_seg_positions, _bx,
+                                        _bu_y - main_vert_gap * scale)
+
+                # 支撐架管壁雙線（上軌到下軌，不超出軌道範圍）
+                msp.add_line((_bx - _brk_hw, _bu_y), (_bx - _brk_hw, _bl_y))
+                msp.add_line((_bx + _brk_hw, _bu_y), (_bx + _brk_hw, _bl_y))
+
+                # X 標記（上軌穿越處）
+                msp.add_line((_bx - _brk_xsz, _bu_y - _brk_xsz),
+                             (_bx + _brk_xsz, _bu_y + _brk_xsz))
+                msp.add_line((_bx - _brk_xsz, _bu_y + _brk_xsz),
+                             (_bx + _brk_xsz, _bu_y - _brk_xsz))
+                # X 標記（下軌穿越處）
+                msp.add_line((_bx - _brk_xsz, _bl_y - _brk_xsz),
+                             (_bx + _brk_xsz, _bl_y + _brk_xsz))
+                msp.add_line((_bx - _brk_xsz, _bl_y + _brk_xsz),
+                             (_bx + _brk_xsz, _bl_y - _brk_xsz))
+
+                # 小圓圈（管壁邊緣，上下軌各 2 個）
+                msp.add_circle((_bx - _brk_hw, _bu_y), _brk_cr)
+                msp.add_circle((_bx + _brk_hw, _bu_y), _brk_cr)
+                msp.add_circle((_bx - _brk_hw, _bl_y), _brk_cr)
+                msp.add_circle((_bx + _brk_hw, _bl_y), _brk_cr)
+
+                # BOM 球號氣泡（標示支撐架 BOM 序號）— flag: show_basic_info
+                if _SHOW_BASIC:
+                    _bom_id = len(section_legs) + 1 + _bi
+                    _balloon_r = min(5.0, pipe_hw * 1.8)
+                    _balloon_cx = _bx + x_dir * (_brk_hw + _balloon_r + 4)
+                    _balloon_cy = (_bu_y + _bl_y) / 2
+                    _target_cx = _bx
+                    _target_cy = (_bu_y + _bl_y) / 2
+                    self._draw_balloon(msp, str(_bom_id),
+                                       (_balloon_cx, _balloon_cy),
+                                       (_target_cx, _target_cy),
+                                       radius=_balloon_r,
+                                       text_height=_balloon_r * 0.8)
+
         # ========== 角度標註（腳架與軌道夾角 + 彎曲角）==========
         # 角度標示邏輯：
         #   - 1 隻腳架：標示該腳架的上軌夾角 + 下軌夾角
@@ -8147,6 +8223,19 @@ Solid 名稱: {solid_name}
         # ================================================================
         # Drawing 1: 直線段施工圖 (Straight Section — 支架)
         # ================================================================
+        # 預設值（若 Draw 1 try 失敗，Draw 3 仍可使用）
+        _s0_brk_count = 0
+        _s0_brk_spec  = ''
+        _s0_brk_list  = []   # bracket part_classification dicts for Draw 1
+        _s1_brk_count = 0
+        _s1_brk_spec  = ''
+        _s1_brk_list  = []   # bracket part_classification dicts for Draw 3
+        _arc_brk_count = stp_data['bracket_count']  # will be refined inside try
+        # 組件分配追蹤（供事後完整性驗證用）
+        _val_sections       = None
+        _val_leg_assignment = None
+        _val_first_idx      = None
+        _val_second_idx     = None
         try:
             log_print("\n--- Drawing 1: 直線段施工圖 (支架) ---")
 
@@ -8179,6 +8268,107 @@ Solid 名稱: {solid_name}
                 if sec['section_type'] == 'straight':
                     first_straight_idx = si
                     break
+
+            # 供驗證使用：捕捉分段與腳架分配結果
+            _val_sections       = sections
+            _val_leg_assignment = leg_assignment
+            _val_first_idx      = first_straight_idx
+
+            # ================================================================
+            # 預先計算各段支撐架數量（Draw 1/3 使用；Draw 2 在自身 try 中再算一次）
+            # ================================================================
+            _s0_brk_count = 0   # Draw 1 直線段支撐架數量
+            _s0_brk_spec  = ''
+            _s1_brk_count = 0   # Draw 3 直線段支撐架數量
+            _s1_brk_spec  = ''
+            # 提前找第二個直線段索引（供非弧段支撐架分配）
+            _second_straight_early = None
+            _st_cnt_e = 0
+            for _si_e, _se in enumerate(sections):
+                if _se['section_type'] == 'straight':
+                    _st_cnt_e += 1
+                    if _st_cnt_e == 2:
+                        _second_straight_early = _si_e
+                        break
+            try:
+                # 找弧管端點 → 計算弧心與角度範圍（與 Drawing 2 try 相同邏輯）
+                _arc_track_pipes_e = [pc for pc in pipe_centerlines
+                                      if {c['feature_id']: c for c in part_classifications}.get(
+                                          pc['solid_id'], {}).get('class') == 'track']
+                _arc_pipe_early = None
+                for _tp in _arc_track_pipes_e:
+                    if any(s.get('type') == 'arc' and s.get('radius', 0) > 50
+                           for s in _tp.get('segments', [])):
+                        _arc_pipe_early = _tp
+                        break
+                if _arc_pipe_early:
+                    _p1xe, _p1ye = _arc_pipe_early['start_point'][0], _arc_pipe_early['start_point'][1]
+                    _p2xe, _p2ye = _arc_pipe_early['end_point'][0],   _arc_pipe_early['end_point'][1]
+                    _che = math.sqrt((_p2xe - _p1xe)**2 + (_p2ye - _p1ye)**2)
+                    if _che > 1e-6:
+                        _midxe, _midye = (_p1xe + _p2xe) / 2, (_p1ye + _p2ye) / 2
+                        _halfe = _che / 2
+                        _hperpe = math.sqrt(max(stp_data['arc_radius']**2 - _halfe**2, 0))
+                        _nxe = -(_p2ye - _p1ye) / _che
+                        _nye =  (_p2xe - _p1xe) / _che
+                        if bend_direction == 'left':
+                            _cxe = _midxe + _hperpe * _nxe
+                            _cye = _midye + _hperpe * _nye
+                        else:
+                            _cxe = _midxe - _hperpe * _nxe
+                            _cye = _midye - _hperpe * _nye
+                        _sae = math.degrees(math.atan2(_p1ye - _cye, _p1xe - _cxe))
+                        _eae = math.degrees(math.atan2(_p2ye - _cye, _p2xe - _cxe))
+                        _spane = ((_eae - _sae) % 360) or 360
+                        _brk_cls_e = [c for c in part_classifications if c.get('class') == 'bracket']
+                        _n_arc_e = 0
+                        _non_arc_e = []
+                        for _be in _brk_cls_e:
+                            _bcxe, _bcye = _be.get('centroid', (0, 0, 0))[:2]
+                            _bange = (math.degrees(math.atan2(_bcye - _cye, _bcxe - _cxe)) - _sae) % 360
+                            if _bange <= _spane + 1:
+                                _n_arc_e += 1
+                            else:
+                                _non_arc_e.append(_be)
+                        if _n_arc_e >= 1:
+                            _arc_brk_count = _n_arc_e
+                        # 非弧段支撐架 → 依各直線段軌道 XY 重心分配
+                        if _non_arc_e:
+                            _elev_e = stp_data.get('elevation_deg', 0)
+                            _psa_e = f"PSA{_elev_e:.0f}" if _elev_e > 0 else 'PSA20'
+                            def _sec_xy_cen(sidx):
+                                if sidx is None:
+                                    return None
+                                pts = []
+                                for tr in (sections[sidx].get('upper_tracks', []) +
+                                           sections[sidx].get('lower_tracks', [])):
+                                    pc = next((p for p in pipe_centerlines
+                                               if p['solid_id'] == tr.get('solid_id', '')), None)
+                                    if pc:
+                                        pts += [(pc['start_point'][0], pc['start_point'][1]),
+                                                (pc['end_point'][0],   pc['end_point'][1])]
+                                if not pts:
+                                    return None
+                                return (sum(p[0] for p in pts)/len(pts),
+                                        sum(p[1] for p in pts)/len(pts))
+                            _cen0 = _sec_xy_cen(first_straight_idx)
+                            _cen1 = _sec_xy_cen(_second_straight_early)
+                            for _nb in _non_arc_e:
+                                _nbx, _nby = _nb.get('centroid', (0, 0, 0))[:2]
+                                _d0 = (math.sqrt((_nbx-_cen0[0])**2+(_nby-_cen0[1])**2)
+                                       if _cen0 else float('inf'))
+                                _d1 = (math.sqrt((_nbx-_cen1[0])**2+(_nby-_cen1[1])**2)
+                                       if _cen1 else float('inf'))
+                                if _d0 <= _d1:
+                                    _s0_brk_count += 1
+                                    _s0_brk_spec = _psa_e
+                                    _s0_brk_list.append(_nb)
+                                else:
+                                    _s1_brk_count += 1
+                                    _s1_brk_spec = _psa_e
+                                    _s1_brk_list.append(_nb)
+            except Exception:
+                pass  # 保留預設值 0
 
             if first_straight_idx is not None:
                 section = sections[first_straight_idx]
@@ -8214,7 +8404,10 @@ Solid 名稱: {solid_name}
                     section, section_bends, section_cl, section_legs,
                     leg_angles_map,
                     base_name, drawing_number, project, today,
-                    stp_data=stp_data)
+                    stp_data=stp_data,
+                    bracket_count=_s0_brk_count,
+                    bracket_spec=_s0_brk_spec,
+                    bracket_items_list=_s0_brk_list)
             else:
                 # fallback: 沒有 straight section，仍繪製舊版單腳架圖
                 log_print("  [Warning] 未偵測到直線段，使用 fallback 繪圖")
@@ -8223,7 +8416,10 @@ Solid 名稱: {solid_name}
                     [], stp_data['track_items'], stp_data['leg_items'],
                     leg_angles_map,
                     base_name, f"{base_name}-1", project, today,
-                    stp_data=stp_data)
+                    stp_data=stp_data,
+                    bracket_count=_s0_brk_count,
+                    bracket_spec=_s0_brk_spec,
+                    bracket_items_list=_s0_brk_list)
 
             # 儲存
             path1 = os.path.join(output_dir, f"{base_name}-1.dxf")
@@ -8848,6 +9044,9 @@ Solid 名稱: {solid_name}
                             prev_curved_section = sections[si - 1]
                         break
 
+            # 供驗證使用
+            _val_second_idx = second_straight_idx
+
             # 使用第二個 straight section 或 fallback 到第一個
             if second_straight_idx is not None:
                 section3 = sections[second_straight_idx]
@@ -8891,7 +9090,10 @@ Solid 名稱: {solid_name}
                     'drawing_name': '彎軌軌道製圖',
                     'drawing_number': 'LM-13',
                 },
-                stp_data=stp_data)
+                stp_data=stp_data,
+                bracket_count=_s1_brk_count,
+                bracket_spec=_s1_brk_spec,
+                bracket_items_list=_s1_brk_list)
 
             # 儲存
             path3 = os.path.join(output_dir, f"{base_name}_3.dxf")
@@ -8905,6 +9107,100 @@ Solid 名稱: {solid_name}
             log_print(f"[Error] Drawing 3 失敗: {e}", "error")
             import traceback
             log_print(traceback.format_exc(), "error")
+
+        # ================================================================
+        # 施工圖組件分配完整性驗證
+        # ================================================================
+        try:
+            _all_cls        = {c['feature_id']: c for c in part_classifications}
+            _all_track_fids = {fid for fid, c in _all_cls.items() if c.get('class') == 'track'}
+            _all_leg_fids   = {fid for fid, c in _all_cls.items() if c.get('class') == 'leg'}
+            _all_brk_fids   = {fid for fid, c in _all_cls.items() if c.get('class') == 'bracket'}
+
+            # --- 軌道分配追蹤 ---
+            _seen_track = {}   # fid → [draw_num, ...]
+            if _val_sections is not None and _val_first_idx is not None:
+                # Draw 1: first straight section
+                for _t in (_val_sections[_val_first_idx].get('upper_tracks', []) +
+                           _val_sections[_val_first_idx].get('lower_tracks', [])):
+                    _fid = _t.get('solid_id', '')
+                    if _fid:
+                        _seen_track.setdefault(_fid, []).append(1)
+                # Draw 2: all curved sections
+                for _sec in _val_sections:
+                    if _sec['section_type'] == 'curved':
+                        for _t in _sec.get('upper_tracks', []) + _sec.get('lower_tracks', []):
+                            _fid = _t.get('solid_id', '')
+                            if _fid:
+                                _seen_track.setdefault(_fid, []).append(2)
+                # Draw 3: second straight section
+                if _val_second_idx is not None:
+                    for _t in (_val_sections[_val_second_idx].get('upper_tracks', []) +
+                               _val_sections[_val_second_idx].get('lower_tracks', [])):
+                        _fid = _t.get('solid_id', '')
+                        if _fid:
+                            _seen_track.setdefault(_fid, []).append(3)
+
+            _unassigned_tracks = _all_track_fids - set(_seen_track)
+            _dup_tracks = {f: d for f, d in _seen_track.items()
+                          if f in _all_track_fids and len(d) > 1}
+
+            # --- 腳架分配追蹤 ---
+            _seen_leg = {}   # fid → [draw_num, ...]
+            if _val_leg_assignment is not None:
+                for _draw_n, _idx in [(1, _val_first_idx), (3, _val_second_idx)]:
+                    if _idx is not None:
+                        for _leg in _val_leg_assignment.get(_idx, []):
+                            _fid = _leg.get('feature_id', _leg.get('solid_id', ''))
+                            if _fid:
+                                _seen_leg.setdefault(_fid, []).append(_draw_n)
+
+            _unassigned_legs = _all_leg_fids - set(_seen_leg)
+            _dup_legs = {f: d for f, d in _seen_leg.items()
+                        if f in _all_leg_fids and len(d) > 1}
+
+            # --- 支撐架分配追蹤（依數量） ---
+            _brk_total          = len(_all_brk_fids)
+            _brk_total_assigned = _s0_brk_count + _arc_brk_count + _s1_brk_count
+            _brk_mismatch       = (_brk_total_assigned != _brk_total)
+
+            # --- 彙整並輸出 ---
+            _val_warnings = []
+            if _unassigned_tracks:
+                _val_warnings.append(
+                    f"軌道未分配至任何施工圖: {', '.join(sorted(_unassigned_tracks))}")
+            if _dup_tracks:
+                for _f, _d in sorted(_dup_tracks.items()):
+                    _val_warnings.append(
+                        f"軌道重複分配: {_f} → Draw {'+'.join(map(str, _d))}")
+            if _unassigned_legs:
+                _val_warnings.append(
+                    f"腳架未分配至任何施工圖: {', '.join(sorted(_unassigned_legs))}")
+            if _dup_legs:
+                for _f, _d in sorted(_dup_legs.items()):
+                    _val_warnings.append(
+                        f"腳架重複分配: {_f} → Draw {'+'.join(map(str, _d))}")
+            if _brk_mismatch:
+                _val_warnings.append(
+                    f"支撐架數量不符: 模型共 {_brk_total} 個，"
+                    f"Draw1={_s0_brk_count} + Draw2={_arc_brk_count} + "
+                    f"Draw3={_s1_brk_count} = {_brk_total_assigned}")
+
+            if _val_warnings:
+                log_print("\n" + "!" * 60, "warning")
+                log_print("⚠  [施工圖警告] 組件分配有問題，請檢查施工圖！", "warning")
+                for _w in _val_warnings:
+                    log_print(f"   ‣ {_w}", "warning")
+                log_print("!" * 60, "warning")
+            else:
+                log_print(
+                    f"\n  [OK] 組件分配驗證通過 — "
+                    f"軌道 {len(_all_track_fids)} 件、"
+                    f"腳架 {len(_all_leg_fids)} 件、"
+                    f"支撐架 {_brk_total} 件 全部正確分配至施工圖")
+
+        except Exception as _val_ex:
+            log_print(f"[Warning] 組件分配驗證失敗: {_val_ex}", "warning")
 
         # ===== stp_data 來源驗證報告 =====
         log_print(f"\n{'=' * 60}")
