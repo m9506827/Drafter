@@ -7965,7 +7965,7 @@ Solid 名稱: {solid_name}
                     d = abs(leg_cum - bp['cum'])
                     if d < best_d:
                         best_d, best_bp = d, bp
-                if best_bp and best_d > 3 and not _is_drawing1:
+                if best_bp and best_d > 3 and not _is_drawing1 and not _start_is_transition:
                     _leg_dim_offset = (-x_dir if _annotation_like_draw3
                                        else x_dir) * (pipe_hw + 18)
                     self._draw_dimension_line_along(
