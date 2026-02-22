@@ -5991,7 +5991,7 @@ Solid 名稱: {solid_name}
     # ====================================================================
 
     def _draw_top_plan_view(self, msp, area_x, area_y, area_w, area_h,
-                            stp_data, x_dir=1, draw_brackets=True,
+                            stp_data, x_dir=1, y_dir=1, draw_brackets=True,
                             show_annotations=True):
         """
         繪製軌道俯視圖（弧形軌道 XY 平面投影） — Drawing 2 上半部使用。
@@ -6113,12 +6113,12 @@ Solid 名稱: {solid_name}
 
         view_scale = min(area_w / model_w, area_h / model_h) * 0.85
         off_x = area_x + area_w / 2 - x_dir * (bb_x0 + bb_x1) / 2 * view_scale
-        off_y = area_y + area_h / 2 - (bb_y0 + bb_y1) / 2 * view_scale
+        off_y = area_y + area_h / 2 - y_dir * (bb_y0 + bb_y1) / 2 * view_scale
 
         def _m2d(mx, my):
-            """模型座標 → 紙張座標"""
+            """模型座標 → 紙張座標（y_dir=-1 可翻轉 Y 軸，使右彎開口朝下）"""
             return (x_dir * mx * view_scale + off_x,
-                    my * view_scale + off_y)
+                    y_dir * my * view_scale + off_y)
 
         def _draw_arc_poly(cx, cy, r, sa, span, n=60, **dxf):
             pts = []
@@ -8555,9 +8555,11 @@ Solid 名稱: {solid_name}
             # 呼叫共用俯視圖繪製（暫時覆蓋 bracket_count 為弧段數量）
             _saved_bc = stp_data['bracket_count']
             stp_data['bracket_count'] = _arc_brk_count
+            # 右彎時 y_dir=-1 翻轉 Y 軸，確保俯視圖弧管開口一律朝下
+            _plan_y_dir = -1 if bend_direction == 'right' else 1
             plan_r2 = self._draw_top_plan_view(
                 msp2, upper_area_x, upper_area_y, upper_area_w, upper_area_h,
-                stp_data, x_dir=x_dir, draw_brackets=True)
+                stp_data, x_dir=x_dir, y_dir=_plan_y_dir, draw_brackets=True)
             stp_data['bracket_count'] = _saved_bc
             bracket_count = _arc_brk_count  # 側視圖也使用弧段數量
 
