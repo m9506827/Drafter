@@ -7433,18 +7433,20 @@ Solid 名稱: {solid_name}
             _pd_fc = _pcl_map_draw.get(_fid_fc, {})
             _sp_fc = _pd_fc.get('start_point', (0, 0, 0))
             _ep_fc = _pd_fc.get('end_point', (0, 0, 0))
-            _ref_h_mid = (_proj_horiz(_sp_fc) + _proj_horiz(_ep_fc)) / 2
-            _track_h_mid = (track_h_min + track_h_max) / 2
+            _ref_h_start = _proj_horiz(_sp_fc)
+            _ref_h_end   = _proj_horiz(_ep_fc)
+            # 用段的水平投影方向（起點→終點 h 是否遞減）判斷是否反轉，
+            # 避免當唯一段橫跨整個 h 範圍時中點相等導致浮點邊界判斷錯誤。
+            _EPS_H = 1.0  # mm，消除浮點誤差的容忍門檻
             if _is_near_start:
-                # 參考段在路徑前段：若 h > mid → 起點在高 h 側 → inverted
-                _h_inverted = (_ref_h_mid > _track_h_mid)
+                # 參考段在路徑前段：若段 h 遞減（起點 > 終點）→ 路徑從高 h 出發 → inverted
+                _h_inverted = (_ref_h_start > _ref_h_end + _EPS_H)
             else:
-                # 參考段在路徑後段：若 h < mid → 終點在低 h 側 → 起點在高 h → inverted
-                _h_inverted = (_ref_h_mid < _track_h_mid)
+                # 參考段在路徑後段：若段 h 遞增（終點 > 起點）→ 路徑終點在高 h 側 → 起點在低 h → not inverted
+                _h_inverted = (_ref_h_end < _ref_h_start - _EPS_H)
             logger.info(f"  Leg h_inverted: ref_seg_idx={_idx_in_cl}, "
                         f"is_near_start={_is_near_start}, "
-                        f"ref_h_mid={_ref_h_mid:.1f}, "
-                        f"track_h_mid={_track_h_mid:.1f}, "
+                        f"ref_h_start={_ref_h_start:.1f}, ref_h_end={_ref_h_end:.1f}, "
                         f"inverted={_h_inverted}")
         else:
             _h_inverted = _upper_cl_reversed
@@ -7697,7 +7699,7 @@ Solid 名稱: {solid_name}
         #   - 2 隻腳架：標示每隻腳架的上軌夾角（不標下軌）
         # 角度值 = 90° - 軌道仰角（complement），取腳架位置所在的軌道段仰角
         #   彎曲角（12°/16° 等）→ 下軌彎曲中心外側（不受腳架數量影響）
-        if _SHOW_LEG_ANGLES and leg_draw_data and upper_bends:
+        if _SHOW_LEG_ANGLES and leg_draw_data:
             def _get_elev_at_x(seg_positions, draw_x):
                 """取得 draw_x 位置的軌道仰角（從水平量測）"""
                 for seg in seg_positions:
