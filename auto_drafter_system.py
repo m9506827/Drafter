@@ -6672,6 +6672,93 @@ Solid 名稱: {solid_name}
         _SHOW_TRACK_RELATIONS = self._drafter_config.get('show_track_relations', False)
         _SHOW_ANNOTATIONS = _SHOW_TRACK_RELATIONS  # 兼容舊邏輯
 
+        PW, PH = 420, 297
+        MARGIN = 10
+
+        doc = ezdxf.new(dxfversion='R2010')
+        msp = doc.modelspace()
+
+        # 圖框
+        msp.add_lwpolyline([(0, 0), (PW, 0), (PW, PH), (0, PH), (0, 0)])
+        msp.add_lwpolyline([
+            (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
+            (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
+
+        # 標題欄（config > STP > hardcoded）
+        info = self.get_model_info()
+        tb_info = self._build_tb_info(info, base_name,
+                                      drawing_name='直線段施工圖',
+                                      drawing_number='LM-11',
+                                      today=today)
+        if tb_override:
+            tb_info.update(tb_override)
+        tb_top = self._draw_title_block(msp, PW, PH, tb_info)
+
+        # 圖號（右上角大字）
+        self._draw_drawing_number(msp, PW, PH, drawing_number)
+
+        # ---- 表格左邊線對齊標題欄 ----
+        TB_W = 161  # 標題欄寬度（與 _draw_title_block 一致）
+        tables_left_x = PW - MARGIN - TB_W  # 統一左邊線 x 座標
+
+        # ---- 取料明細表（右上）— flag: show_basic_info ----
+        if _SHOW_BASIC and section_cutting_list:
+            self._draw_cutting_list_table(msp, tables_left_x,
+                                          PH - MARGIN - 30, section_cutting_list)
+
+        # ---- BOM 表 — flag: show_basic_info ----
+        bom_items = []
+        for li, leg in enumerate(section_legs):
+            ll = leg.get('line_length', 0)
+            bom_items.append({
+                'id': li + 1, 'name': '腳架', 'quantity': 1,
+                'remark': f"線長L={ll:.0f}"
+            })
+        if bracket_count > 0:
+            _spec = bracket_spec or (
+                f"PSA{stp_data['elevation_deg']:.0f}"
+                if stp_data and stp_data.get('elevation_deg', 0) > 0 else 'PSA20')
+            bom_items.append({
+                'id': len(section_legs) + 1,
+                'name': '支撐架',
+                'quantity': bracket_count,
+                'remark': _spec
+            })
+        if _SHOW_BASIC and bom_items:
+            bom_x = tables_left_x  # 左邊線與取料明細、標題欄對齊
+            # BOM below cutting list
+            cl_rows = len(section_cutting_list) if section_cutting_list else 0
+            bom_y = PH - MARGIN - 30 - cl_rows * 12 - 30
+            self._draw_bom_table(msp, bom_x, bom_y, bom_items)
+
+        # --- Prepare geometry ---
+        data = self._prepare_section_draw_data(
+            section, section_cutting_list, section_legs, stp_data, drawing_number)
+        data._section_legs = section_legs
+        data._stp_data     = stp_data
+        data._tb_top       = tb_top
+
+        # --- Side view ---
+        view = self._draw_section_side_view(
+            msp, data, _SHOW_BASIC,
+            bracket_items_list=bracket_items_list)
+
+        # --- Annotations ---
+        self._draw_section_annotations(
+            msp, data, view,
+            _SHOW_BASIC, _SHOW_LEG_ANGLES, _SHOW_ANNOTATIONS)
+
+        return doc
+
+    def _prepare_section_draw_data(self, section, section_cutting_list, section_legs,
+                                    stp_data, drawing_number, section_rail_spacing=None):
+        """
+        Compute all geometry/path data needed for drawing a straight section.
+        Returns: types.SimpleNamespace
+        """
+        import types as _t
+        import math
+
         # 從 stp_data 讀取管徑與軌距
         pipe_diameter = stp_data['pipe_diameter'] if stp_data else 0
         rail_spacing = stp_data['rail_spacing'] if stp_data else 0
@@ -6729,62 +6816,6 @@ Solid 名稱: {solid_name}
         else:
             x_dir = 1 if _start_is_transition else -1   # 左彎（預設）：Draw3=+1, Draw1=-1
 
-
-        doc = ezdxf.new(dxfversion='R2010')
-        msp = doc.modelspace()
-
-        # 圖框
-        msp.add_lwpolyline([(0, 0), (PW, 0), (PW, PH), (0, PH), (0, 0)])
-        msp.add_lwpolyline([
-            (MARGIN, MARGIN), (PW - MARGIN, MARGIN),
-            (PW - MARGIN, PH - MARGIN), (MARGIN, PH - MARGIN), (MARGIN, MARGIN)])
-
-        # 標題欄（config > STP > hardcoded）
-        info = self.get_model_info()
-        tb_info = self._build_tb_info(info, base_name,
-                                      drawing_name='直線段施工圖',
-                                      drawing_number='LM-11',
-                                      today=today)
-        if tb_override:
-            tb_info.update(tb_override)
-        tb_top = self._draw_title_block(msp, PW, PH, tb_info)
-
-        # 圖號（右上角大字）
-        self._draw_drawing_number(msp, PW, PH, drawing_number)
-
-        # ---- 表格左邊線對齊標題欄 ----
-        TB_W = 161  # 標題欄寬度（與 _draw_title_block 一致）
-        tables_left_x = PW - MARGIN - TB_W  # 統一左邊線 x 座標
-
-        # ---- 取料明細表（右上）— flag: show_basic_info ----
-        if _SHOW_BASIC and section_cutting_list:
-            self._draw_cutting_list_table(msp, tables_left_x,
-                                          PH - MARGIN - 30, section_cutting_list)
-
-        # ---- BOM 表 — flag: show_basic_info ----
-        bom_items = []
-        for li, leg in enumerate(section_legs):
-            ll = leg.get('line_length', 0)
-            bom_items.append({
-                'id': li + 1, 'name': '腳架', 'quantity': 1,
-                'remark': f"線長L={ll:.0f}"
-            })
-        if bracket_count > 0:
-            _spec = bracket_spec or (
-                f"PSA{stp_data['elevation_deg']:.0f}"
-                if stp_data and stp_data.get('elevation_deg', 0) > 0 else 'PSA20')
-            bom_items.append({
-                'id': len(section_legs) + 1,
-                'name': '支撐架',
-                'quantity': bracket_count,
-                'remark': _spec
-            })
-        if _SHOW_BASIC and bom_items:
-            bom_x = tables_left_x  # 左邊線與取料明細、標題欄對齊
-            # BOM below cutting list
-            cl_rows = len(section_cutting_list) if section_cutting_list else 0
-            bom_y = PH - MARGIN - 30 - cl_rows * 12 - 30
-            self._draw_bom_table(msp, bom_x, bom_y, bom_items)
 
         # ---- 側視圖（基於 cutting list 完整路徑繪製）----
         n_legs = len(section_legs)
@@ -7037,6 +7068,79 @@ Solid 名稱: {solid_name}
             above = remain * 0.26
             below = remain - above
             leg_below_heights.append(below)
+
+        return _t.SimpleNamespace(
+            upper_cl=upper_cl,
+            lower_cl=lower_cl,
+            _upper_cl_reversed=_upper_cl_reversed,
+            _lower_cl_reversed=_lower_cl_reversed,
+            upper_path=upper_path,
+            lower_path=lower_path,
+            upper_start_elev=upper_start_elev,
+            lower_start_elev=lower_start_elev,
+            upper_base_elev=upper_base_elev,
+            lower_base_elev=lower_base_elev,
+            start_gap=start_gap,
+            end_gap=end_gap,
+            main_vert_gap=main_vert_gap,
+            transition_vert_gap=transition_vert_gap,
+            _upper_x_disp=_upper_x_disp,
+            _lower_x_disp=_lower_x_disp,
+            _upper_y_disp=_upper_y_disp,
+            _lower_y_disp=_lower_y_disp,
+            upper_tracks=upper_tracks,
+            lower_tracks=lower_tracks,
+            elev_map=elev_map,
+            pipe_diameter=pipe_diameter,
+            section_rail_spacing=section_rail_spacing,
+            leg_below_heights=leg_below_heights,
+            x_dir=x_dir,
+            _start_is_transition=_start_is_transition,
+            _is_drawing1=_is_drawing1,
+            _annotation_like_draw3=_annotation_like_draw3,
+            _bend_dir=_bend_dir,
+            _pcl_map_sp=_pcl_map_sp,
+        )
+
+    
+    def _draw_section_side_view(self, msp, data, _SHOW_BASIC, bracket_items_list=None):
+        """
+        Draw side view: track paths, legs, brackets + total-length annotation.
+        Returns: types.SimpleNamespace
+        """
+        import types as _t
+        import math
+        upper_cl                 = data.upper_cl
+        lower_cl                 = data.lower_cl
+        upper_path               = data.upper_path
+        lower_path               = data.lower_path
+        upper_start_elev         = data.upper_start_elev
+        lower_start_elev         = data.lower_start_elev
+        main_vert_gap            = data.main_vert_gap
+        transition_vert_gap      = data.transition_vert_gap
+        start_gap                = data.start_gap
+        end_gap                  = data.end_gap
+        _upper_x_disp            = data._upper_x_disp
+        _lower_x_disp            = data._lower_x_disp
+        _upper_y_disp            = data._upper_y_disp
+        _lower_y_disp            = data._lower_y_disp
+        upper_tracks             = data.upper_tracks
+        lower_tracks             = data.lower_tracks
+        pipe_diameter            = data.pipe_diameter
+        section_rail_spacing     = data.section_rail_spacing
+        leg_below_heights        = data.leg_below_heights
+        x_dir                    = data.x_dir
+        _start_is_transition     = data._start_is_transition
+        _is_drawing1             = data._is_drawing1
+        _annotation_like_draw3   = data._annotation_like_draw3
+        _pcl_map_sp              = data._pcl_map_sp
+        _upper_cl_reversed       = data._upper_cl_reversed
+        _lower_cl_reversed       = data._lower_cl_reversed
+        section_legs         = getattr(data, "_section_legs", [])
+        stp_data             = getattr(data, "_stp_data", None)
+        tb_top               = getattr(data, "_tb_top", 10)
+        n_legs               = len(section_legs)
+        PW, PH, MARGIN       = 420, 297, 10
 
         # ---- 計算完整路徑的 bounding box ----
         def _compute_path_extent(path_info, start_x, start_y):
@@ -7647,6 +7751,77 @@ Solid 名稱: {solid_name}
                                        radius=_balloon_r,
                                        text_height=_balloon_r * 0.8)
 
+        return _t.SimpleNamespace(
+            upper_seg_positions=upper_seg_positions,
+            lower_seg_positions=lower_seg_positions,
+            upper_track_end=upper_track_end,
+            lower_track_end=lower_track_end,
+            lower_start_y=lower_start_y,
+            leg_draw_data=leg_draw_data,
+            upper_start_elev=upper_start_elev,
+            scale=scale,
+            pipe_hw=pipe_hw,
+            base_x=base_x,
+            upper_path=upper_path,
+            lower_path=lower_path,
+            x_dir=x_dir,
+            _start_is_transition=_start_is_transition,
+            _is_drawing1=_is_drawing1,
+            _annotation_like_draw3=_annotation_like_draw3,
+            start_gap=start_gap,
+            end_gap=end_gap,
+        )
+
+    
+    def _draw_section_annotations(self, msp, data, view,
+                                   _SHOW_BASIC, _SHOW_LEG_ANGLES, _SHOW_ANNOTATIONS):
+        """
+        Orchestrate annotation calls for a straight section sheet.
+        """
+        import math
+        upper_path               = data.upper_path
+        lower_path               = data.lower_path
+        x_dir                    = data.x_dir
+        _start_is_transition     = data._start_is_transition
+        _is_drawing1             = data._is_drawing1
+        _annotation_like_draw3   = data._annotation_like_draw3
+        start_gap                = data.start_gap
+        end_gap                  = data.end_gap
+        pipe_diameter            = data.pipe_diameter
+        upper_seg_positions      = view.upper_seg_positions
+        lower_seg_positions      = view.lower_seg_positions
+        upper_track_end          = view.upper_track_end
+        lower_track_end          = view.lower_track_end
+        lower_start_y            = view.lower_start_y
+        leg_draw_data            = view.leg_draw_data
+        upper_start_elev         = view.upper_start_elev
+        scale                    = view.scale
+        pipe_hw                  = view.pipe_hw
+        base_x                   = view.base_x
+
+        def _find_y_on_path(seg_positions, draw_x, fallback_y):
+            if not seg_positions:
+                return fallback_y
+            for seg in seg_positions:
+                sx, sy, ex, ey = seg[0], seg[1], seg[2], seg[3]
+                min_sx, max_sx = min(sx, ex), max(sx, ex)
+                if min_sx - 1 <= draw_x <= max_sx + 1:
+                    if abs(ex - sx) > 0.01:
+                        frac = (draw_x - sx) / (ex - sx)
+                        frac = max(0, min(1, frac))
+                        return sy + frac * (ey - sy)
+                    else:
+                        return (sy + ey) / 2
+            min_dist = float('inf')
+            nearest_y = fallback_y
+            for seg in seg_positions:
+                for px, py in [(seg[0], seg[1]), (seg[2], seg[3])]:
+                    dist = abs(px - draw_x)
+                    if dist < min_dist:
+                        min_dist = dist
+                        nearest_y = py
+            return nearest_y
+
         # ========== 角度標註（脚架與軌道夾角 + 彎曲角）==========
         # [MARKED] 彎曲角標示— 暫時停用，後續再評估
         if _SHOW_LEG_ANGLES and leg_draw_data:
@@ -7706,9 +7881,8 @@ Solid 名稱: {solid_name}
         # ===== 整體尺寸：上軌/下軌總展開長 =====
         # （已在上方 always-on 區塊標註，此處不重複）
 
-        return doc
 
-
+    
     # ------------------------------------------------------------------
     # Annotation helper methods (extracted from _draw_straight_section_sheet)
     # ------------------------------------------------------------------
