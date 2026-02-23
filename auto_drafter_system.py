@@ -16,7 +16,7 @@ from simple_viewer import EngineeringViewer
 import time
 import multiprocessing
 
-__version__ = '1.0.0'
+__version__ = '2.0.0'
 
 # 彎管工程圖轉換用：檢視器是否可用、帶時間戳的 log、worker 程序
 VIEWER_AVAILABLE = hasattr(EngineeringViewer, 'view_2d_dxf')
@@ -8149,6 +8149,12 @@ Solid 名稱: {solid_name}
 
         # 偵測彎曲方向
         bend_direction = self._detect_bend_direction(pipe_centerlines, part_classifications)
+        # Assertion：確保偵測結果為有效值，任何下游邏輯（x_dir、BOM、螺旋標示）
+        # 都依賴此值，若誤判將導致 Draw 1/2/3 全鏡像 + BOM 件數錯誤。
+        assert bend_direction in ('left', 'right'), (
+            f"_detect_bend_direction() 回傳無效值: {bend_direction!r}，"
+            f"應為 'left' 或 'right'。請檢查模型幾何或 _detect_bend_direction() 邏輯。")
+        log_print(f"[bend_direction] 偵測結果: {bend_direction}（左彎=left, 右彎=right）")
 
         # Transition bend 半徑（from info.features → 大圓特徵）
         _large_circles = [f for f in self.features if f.type == 'circle' and f.params.get('radius', 0) > 100]
@@ -8973,7 +8979,11 @@ Solid 名稱: {solid_name}
             # 軌道取料明細表（右上）— 先繪製以取得 bottom_y
             # 格式：直徑XX R=XX(XX度)右/左螺旋高低差XX
             # ================================================================
-            # 螺旋方向：左彎→右螺旋（右手定則），右彎→左螺旋
+            # 螺旋方向（右手定則，由軌道進入端往出口端看）：
+            #   左彎（bend_direction='left'）：軌道向左轉、向上爬升 → 右螺旋（順時針上升）
+            #   右彎（bend_direction='right'）：軌道向右轉、向上爬升 → 左螺旋（逆時針上升）
+            # 注意：此處 'left'/'right' 指彎曲方向，與螺旋標示方向相反，
+            #       因此用 bend_direction == 'left' → '右螺旋' 是正確的，並非反向賦值錯誤。
             spiral_dir = '右螺旋' if bend_direction == 'left' else '左螺旋'
             
             cl_arc_items = [t for t in stp_data['track_items'] if t.get('type') == 'arc']
