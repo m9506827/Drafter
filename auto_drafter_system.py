@@ -17,6 +17,14 @@ import time
 import multiprocessing
 
 __version__ = '2.0.0'
+# ---- 幾何判斷閾值常數（集中定義，避免魔法數字散落全檔）----
+MIN_ARC_ANGLE_DEG    = 60    # 弧段識別最小角度（區分過渡弧與主弧）
+MIN_ARC_RADIUS_MM    = 50    # 真實弧段最小半徑（排除圓角等小圓弧）
+BEND_DIR_THRESH_MM   = 50    # 左/右彎判斷 XY/YZ 位移閾值
+SECTION_X_BUFFER_MM  = 150   # 腳架歸屬：弧段 X 方向緩衝距離
+SECTION_Z_BUFFER_MM  = 100   # 腳架歸屬：弧段沿軌方向緩衝距離
+DEFAULT_UPPER_BEND_R = 270   # 上軌彎管預設半徑（幾何推導不足時使用）
+DEFAULT_LOWER_BEND_R = 220   # 下軌彎管預設半徑（幾何推導不足時使用）
 
 # 彎管工程圖轉換用：檢視器是否可用、帶時間戳的 log、worker 程序
 VIEWER_AVAILABLE = hasattr(EngineeringViewer, 'view_2d_dxf')
@@ -2090,7 +2098,7 @@ class MockCADEngine:
                         vert_d = abs(ti['cz'] - tj['cz'])
                         horiz_d = math.sqrt((ti['cx'] - tj['cx'])**2 +
                                             (ti['cy'] - tj['cy'])**2)
-                    if vert_d > 50 and horiz_d < vert_d and horiz_d < best_hd:
+                    if vert_d > BEND_DIR_THRESH_MM and horiz_d < vert_d and horiz_d < best_hd:
                         best_hd = horiz_d
                         best_j = j
                 if best_j is not None:
@@ -2252,7 +2260,7 @@ class MockCADEngine:
                 continue
             
             for seg in pc.get('segments', []):
-                if seg.get('type') == 'arc' and seg.get('angle_deg', 0) >= 60:
+                if seg.get('type') == 'arc' and seg.get('angle_deg', 0) >= MIN_ARC_ANGLE_DEG:
                     start_p = pc.get('start_point', (0, 0, 0))
                     end_p = pc.get('end_point', (0, 0, 0))
                     curved_tracks.append({
@@ -2271,16 +2279,16 @@ class MockCADEngine:
         x_diff = ct['end_point'][0] - ct['start_point'][0]
         
         # 閾值設為 50mm
-        if x_diff > 50:
+        if x_diff > BEND_DIR_THRESH_MM:
             return 'right'
-        elif x_diff < -50:
+        elif x_diff < -BEND_DIR_THRESH_MM:
             return 'left'
         else:
             # 如果 X 變化不大，檢查 Y 座標
             y_diff = ct['end_point'][1] - ct['start_point'][1]
-            if y_diff > 50:
+            if y_diff > BEND_DIR_THRESH_MM:
                 return 'right'
-            elif y_diff < -50:
+            elif y_diff < -BEND_DIR_THRESH_MM:
                 return 'left'
         
         return 'straight'
@@ -2309,7 +2317,7 @@ class MockCADEngine:
 
             is_curved = False
             for seg in tp.get('segments', []):
-                if seg.get('type') == 'arc' and seg.get('angle_deg', 0) >= 60:
+                if seg.get('type') == 'arc' and seg.get('angle_deg', 0) >= MIN_ARC_ANGLE_DEG:
                     is_curved = True
                     break
 
@@ -2350,7 +2358,7 @@ class MockCADEngine:
                     horiz_d = math.sqrt((ei['cx'] - ej['cx'])**2 +
                                         (ei['cy'] - ej['cy'])**2)
                 # 上/下軌: 垂直差明顯，水平接近
-                if vert_d > 50 and horiz_d < vert_d and horiz_d < best_hd:
+                if vert_d > BEND_DIR_THRESH_MM and horiz_d < vert_d and horiz_d < best_hd:
                     best_hd = horiz_d
                     best_j = j
             if best_j is not None:
@@ -2607,8 +2615,8 @@ class MockCADEngine:
             lower_default_r = stp_data['lower_bend_r']
             track_arc_radius_map = dict(stp_data.get('track_arc_r_map', {}))
         else:
-            upper_default_r = 270 if bend_direction != 'right' else 220
-            lower_default_r = 220 if bend_direction != 'right' else 270
+            upper_default_r = DEFAULT_UPPER_BEND_R if bend_direction != 'right' else DEFAULT_LOWER_BEND_R
+            lower_default_r = DEFAULT_LOWER_BEND_R if bend_direction != 'right' else DEFAULT_UPPER_BEND_R
             track_arc_radius_map = {}
 
         bends = []
@@ -3190,12 +3198,12 @@ class MockCADEngine:
             in_curved = False
             for sr in section_ranges:
                 if sr['section_type'] == 'curved':
-                    if sr['v_min'] - 100 <= lv <= sr['v_max'] + 100:
+                    if sr['v_min'] - SECTION_Z_BUFFER_MM <= lv <= sr['v_max'] + SECTION_Z_BUFFER_MM:
                         # 額外檢查 X 座標是否接近 curved section
                         sec_idx = sr['section_idx']
                         if sec_idx in curved_x_center_map:
                             x_dist = abs(lx - curved_x_center_map[sec_idx])
-                            if x_dist < 150:  # X 座標也要接近才算在 curved section
+                            if x_dist < SECTION_X_BUFFER_MM:  # X 座標也要接近才算在 curved section
                                 in_curved = True
                                 break
                         else:
@@ -5437,58 +5445,101 @@ Solid 名稱: {solid_name}
 
         return tb_top  # 返回標題欄頂部 y 座標
 
+    def _draw_table(self, msp, x, y, headers, col_widths, rows,
+                    title=None, row_h=12, text_height=6.0,
+                    hdr_off=None, row_off=None):
+        '''
+        通用表格繪製函式，供 _draw_bom_table 與 _draw_cutting_list_table 共用。
+        '''
+        th = text_height
+        table_w = sum(col_widths)
+        n_rows = len(rows)
+        if title is not None:
+            msp.add_text(title, dxfattribs={'height': th * 1.1}).set_placement(
+                (x + 25, y + 3))
+        header_y = y - row_h
+        msp.add_line((x, y), (x + table_w, y))
+        msp.add_line((x, header_y), (x + table_w, header_y))
+        cx = x
+        full_height = header_y - n_rows * row_h
+        _hdr_off = hdr_off if hdr_off is not None else (row_h - th) / 2
+        for i, (hdr, w) in enumerate(zip(headers, col_widths)):
+            msp.add_text(hdr, dxfattribs={'height': th}).set_placement(
+                (cx + 3, header_y + _hdr_off))
+            if i > 0:
+                msp.add_line((cx, y), (cx, full_height))
+            cx += w
+        _row_off = row_off if row_off is not None else (row_h - th + 0.5) / 2
+        for ri, row in enumerate(rows):
+            ry = header_y - (ri + 1) * row_h
+            msp.add_line((x, ry), (x + table_w, ry))
+            cx = x
+            for vi, (val, w) in enumerate(zip(row, col_widths)):
+                msp.add_text(val, dxfattribs={'height': th - 0.5}).set_placement(
+                    (cx + 3, ry + _row_off))
+                cx += w
+        bottom_y = header_y - n_rows * row_h
+        msp.add_line((x, bottom_y), (x + table_w, bottom_y))
+        msp.add_line((x, y), (x, bottom_y))
+        msp.add_line((x + table_w, y), (x + table_w, bottom_y))
+        return bottom_y
+
     def _draw_bom_table(self, msp, x, y, items):
-        """
+        '''
         繪製 BOM 表（球號/品名/數量/備註）
         items: list of dict with keys: id, name, quantity, remark
         x, y: 表格左上角座標
         Returns: 表格底部 y 座標
-        """
-        th = 6.0
-        row_h = 14
-        col_widths = [30, 45, 30, 53]  # 球號, 品名, 數量, 備註（第4欄縮小1/3: 80→53）
-        table_w = sum(col_widths)
-
-        # 表頭
+        '''
         headers = ['球號', '品名', '數量', '備註']
-        header_y = y - row_h
-
-        # 表頭框線
-        msp.add_line((x, y), (x + table_w, y))
-        msp.add_line((x, header_y), (x + table_w, header_y))
-
-        cx = x
-        for i, (hdr, w) in enumerate(zip(headers, col_widths)):
-            msp.add_text(hdr, dxfattribs={'height': th}).set_placement(
-                (cx + 3, header_y + 2))
-            if i > 0:
-                msp.add_line((cx, y), (cx, header_y - len(items) * row_h))
-            cx += w
-
-        # 資料列
-        for ri, item in enumerate(items):
-            ry = header_y - (ri + 1) * row_h
-            msp.add_line((x, ry), (x + table_w, ry))
-            cx = x
-            vals = [
+        col_widths = [30, 45, 30, 53]
+        rows = [
+            [
                 str(item.get('id', ri + 1)),
                 str(item.get('name', '')),
                 str(item.get('quantity', 1)),
                 str(item.get('remark', '')),
             ]
-            for vi, (val, w) in enumerate(zip(vals, col_widths)):
-                msp.add_text(val, dxfattribs={'height': th - 0.5}).set_placement(
-                    (cx + 3, ry + 2))
-                cx += w
+            for ri, item in enumerate(items)
+        ]
+        return self._draw_table(msp, x, y, headers, col_widths, rows,
+                                title=None, row_h=14, text_height=6.0,
+                                hdr_off=2, row_off=2)
 
-        # 底邊
-        bottom_y = header_y - len(items) * row_h
-        msp.add_line((x, bottom_y), (x + table_w, bottom_y))
-        # 左右邊
-        msp.add_line((x, y), (x, bottom_y))
-        msp.add_line((x + table_w, y), (x + table_w, bottom_y))
-
-        return bottom_y
+    def _draw_cutting_list_table(self, msp, x, y, items):
+        '''
+        繪製軌道取料明細表
+        items: list of cutting_list track_items
+        x, y: 表格左上角座標
+        Returns: 表格底部 y 座標
+        '''
+        headers = ['球號', '取料尺寸(mm)']
+        col_widths = [35, 111]
+        rows = []
+        for item in items:
+            item_id = str(item.get('item', ''))
+            if item.get('spec'):
+                spec = str(item['spec'])
+            else:
+                diameter = item.get('diameter', 0)
+                if item.get('type') == 'straight':
+                    spec = f"直徑{diameter:.1f} 長度{item.get('length', 0):.1f}"
+                elif item.get('type') == 'arc':
+                    angle = item.get('angle_deg', 0)
+                    radius = item.get('radius', 0)
+                    outer_arc = item.get('outer_arc_length', 0)
+                    h_gain = item.get('height_gain', 0)
+                    spiral_dir = item.get('spiral_direction', '')
+                    if angle >= 90 and spiral_dir:
+                        spec = f"直徑{diameter:.1f} R={radius:.0f}({angle:.0f}度){spiral_dir}高低差{h_gain:.1f}"
+                    else:
+                        spec = f"直徑{diameter:.1f} 角度{angle:.0f}度(半徑{radius:.0f})外弧長{outer_arc:.0f}"
+                else:
+                    spec = ''
+            rows.append([item_id, spec[:60]])
+        return self._draw_table(msp, x, y, headers, col_widths, rows,
+                                title='軌道取料明細', row_h=12, text_height=6.0,
+                                hdr_off=1.5, row_off=1.5)
 
     def _draw_balloon(self, msp, label, balloon_pt, target_pt,
                       radius=5.0, text_height=4.0, color=7):
@@ -5582,69 +5633,6 @@ Solid 名稱: {solid_name}
         # 引線：從文字指向材料中心點（長度固定 = CL_LEADER_LEN）
         msp.add_line((lbl_x, lbl_y), (cx, cy),
                      dxfattribs={'color': 5})
-
-    def _draw_cutting_list_table(self, msp, x, y, items):
-        """
-        繪製軌道取料明細表
-        items: list of cutting_list track_items
-        x, y: 表格左上角座標
-        Returns: 表格底部 y 座標
-        """
-        th = 6.0
-        row_h = 12
-        col_widths = [35, 111]  # 球號, 取料尺寸（第2欄縮小1/4: 148→111）
-        table_w = sum(col_widths)
-
-        # 標題
-        msp.add_text("軌道取料明細", dxfattribs={'height': th * 1.1}).set_placement(
-            (x + 25, y + 3))
-
-        # 表頭
-        header_y = y - row_h
-        msp.add_line((x, y), (x + table_w, y))
-        msp.add_line((x, header_y), (x + table_w, header_y))
-        msp.add_text("球號", dxfattribs={'height': th}).set_placement((x + 3, header_y + 1.5))
-        msp.add_text("取料尺寸(mm)", dxfattribs={'height': th}).set_placement(
-            (x + col_widths[0] + 3, header_y + 1.5))
-        msp.add_line((x + col_widths[0], y), (x + col_widths[0], header_y - len(items) * row_h))
-
-        # 資料列
-        for ri, item in enumerate(items):
-            ry = header_y - (ri + 1) * row_h
-            msp.add_line((x, ry), (x + table_w, ry))
-            item_id = str(item.get('item', ''))
-            # 格式化規格 — 優先使用預建 spec 欄位
-            if item.get('spec'):
-                spec = str(item['spec'])
-            else:
-                diameter = item.get('diameter', 0)
-                if item.get('type') == 'straight':
-                    spec = f"直徑{diameter:.1f} 長度{item.get('length', 0):.1f}"
-                elif item.get('type') == 'arc':
-                    angle = item.get('angle_deg', 0)
-                    radius = item.get('radius', 0)
-                    outer_arc = item.get('outer_arc_length', 0)
-                    h_gain = item.get('height_gain', 0)
-                    spiral_dir = item.get('spiral_direction', '')
-                    if angle >= 90 and spiral_dir:
-                        # 螺旋弧格式 (Drawing 2)
-                        spec = f"直徑{diameter:.1f} R={radius:.0f}({angle:.0f}度){spiral_dir}高低差{h_gain:.1f}"
-                    else:
-                        # 轉接彎管格式 (Drawing 1 & 3)
-                        spec = f"直徑{diameter:.1f} 角度{angle:.0f}度(半徑{radius:.0f})外弧長{outer_arc:.0f}"
-                else:
-                    spec = ''
-            msp.add_text(item_id, dxfattribs={'height': th - 0.5}).set_placement(
-                (x + 3, ry + 1.5))
-            msp.add_text(spec[:60], dxfattribs={'height': th - 0.5}).set_placement(
-                (x + col_widths[0] + 3, ry + 1.5))
-
-        bottom_y = header_y - len(items) * row_h
-        msp.add_line((x, bottom_y), (x + table_w, bottom_y))
-        msp.add_line((x, y), (x, bottom_y))
-        msp.add_line((x + table_w, y), (x + table_w, bottom_y))
-
-        return bottom_y
 
     def _draw_drawing_number(self, msp, pw, ph, number):
         """在右上角繪製大字圖號"""
@@ -6035,7 +6023,7 @@ Solid 名稱: {solid_name}
         arc_pipe = None
         for tp in track_pipes:
             for seg in tp.get('segments', []):
-                if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
                     arc_pipe = tp
                     break
             if arc_pipe:
@@ -6622,7 +6610,7 @@ Solid 名稱: {solid_name}
             arc_pipe = None
             for tp in track_pipes:
                 for seg in tp.get('segments', []):
-                    if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                    if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
                         arc_pipe = tp
                         break
                 if arc_pipe:
@@ -8098,7 +8086,7 @@ Solid 名稱: {solid_name}
             # fallback: pipe_centerlines total_length
             for pc in track_pipes:
                 for seg in pc.get('segments', []):
-                    if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                    if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
                         _arc_cl_length = max(_arc_cl_length, pc.get('total_length', 0))
 
         # 仰角（from info.angles → 取第一個非零 track_elevation）
@@ -8137,7 +8125,7 @@ Solid 名稱: {solid_name}
                 vert_d = abs(ci[1] - cj[1]) if y_up_rs else abs(ci[2] - cj[2])
                 horiz_d = (math.sqrt((ci[0] - cj[0])**2 + (ci[2] - cj[2])**2) if y_up_rs
                            else math.sqrt((ci[0] - cj[0])**2 + (ci[1] - cj[1])**2))
-                if vert_d > 50 and horiz_d < vert_d and horiz_d < best_hd:
+                if vert_d > BEND_DIR_THRESH_MM and horiz_d < vert_d and horiz_d < best_hd:
                     best_hd = horiz_d
                     best_j = j
             if best_j is not None:
@@ -8168,7 +8156,7 @@ Solid 名稱: {solid_name}
             _arc_radii_from_pipes = []
             for pc in track_pipes:
                 for seg in pc.get('segments', []):
-                    if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                    if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
                         _arc_radii_from_pipes.append(seg['radius'])
             if _arc_radii_from_pipes:
                 _r_large = max(_arc_radii_from_pipes)
@@ -8185,7 +8173,7 @@ Solid 名稱: {solid_name}
         _track_arc_r_map = {}
         for pc in track_pipes:
             for seg in pc.get('segments', []):
-                if seg.get('type') == 'arc' and seg.get('radius', 0) > 50:
+                if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
                     _track_arc_r_map[pc['solid_id']] = seg['radius']
                     break
 
@@ -8336,7 +8324,7 @@ Solid 名稱: {solid_name}
                                           pc['solid_id'], {}).get('class') == 'track']
                 _arc_pipe_early = None
                 for _tp in _arc_track_pipes_e:
-                    if any(s.get('type') == 'arc' and s.get('radius', 0) > 50
+                    if any(s.get('type') == 'arc' and s.get('radius', 0) > MIN_ARC_RADIUS_MM
                            for s in _tp.get('segments', [])):
                         _arc_pipe_early = _tp
                         break
@@ -8545,7 +8533,7 @@ Solid 名稱: {solid_name}
                                         pc['solid_id'], {}).get('class') == 'track']
                 _arc_pipe_e = None
                 for _tp_e in _arc_track_pipes:
-                    if any(s.get('type') == 'arc' and s.get('radius', 0) > 50
+                    if any(s.get('type') == 'arc' and s.get('radius', 0) > MIN_ARC_RADIUS_MM
                            for s in _tp_e.get('segments', [])):
                         _arc_pipe_e = _tp_e
                         break
