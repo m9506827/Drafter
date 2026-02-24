@@ -2293,6 +2293,55 @@ class MockCADEngine:
         
         return 'straight'
 
+    # ------------------------------------------------------------------
+    # 彎向工具方法（bend-direction utilities）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_significant_arc(seg: dict) -> bool:
+        """True if seg is a real arc pipe (radius > MIN_ARC_RADIUS_MM, excludes corner radii)."""
+        return seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM
+
+    @staticmethod
+    def _get_bend_transforms(bend_direction: str) -> dict:
+        """
+        Returns a dict of bend-direction-dependent drawing transform values.
+        Centralises all 'left'/'right' branching for drawing generation.
+        Keys:
+          arc_center_sign  (+1 / -1) — 弧心偏移方向（+1 左彎，-1 右彎）
+          draw2_x_dir      (-1 / +1) — Draw 2 側視圖 X 方向
+          draw2_y_dir      (+1 / -1) — Draw 2 俯視圖 Y 方向（右彎翻轉）
+          spiral_label     str       — 螺旋方向標注文字
+        """
+        is_left = bend_direction == 'left'
+        return {
+            'arc_center_sign': 1 if is_left else -1,
+            'draw2_x_dir':    -1 if is_left else 1,
+            'draw2_y_dir':     1 if is_left else -1,
+            'spiral_label':   '右螺旋' if is_left else '左螺旋',
+        }
+
+    @staticmethod
+    def _draw_section_x_dir(bend_direction: str, start_is_transition: bool) -> int:
+        """
+        x_dir for Draw 1/3 side view.
+        Ensures: free-end on left, arc-end on right (慣例不變).
+        右彎：Draw3=-1, Draw1=+1 / 左彎（預設）：Draw3=+1, Draw1=-1
+        """
+        if bend_direction == 'right':
+            return -1 if start_is_transition else 1
+        return 1 if start_is_transition else -1
+
+    @staticmethod
+    def _assign_bend_radii(bend_direction: str, r_large: float, r_small: float):
+        """
+        Returns (upper_r, lower_r) based on bend direction.
+        右彎：upper=small, lower=large / 左彎：upper=large, lower=small
+        """
+        if bend_direction == 'right':
+            return r_small, r_large
+        return r_large, r_small
+
     def _detect_track_sections(self, pipe_centerlines, part_classifications, track_items):
         """
         將軌道分段為 straight / curved sections.
@@ -2615,8 +2664,8 @@ class MockCADEngine:
             lower_default_r = stp_data['lower_bend_r']
             track_arc_radius_map = dict(stp_data.get('track_arc_r_map', {}))
         else:
-            upper_default_r = DEFAULT_UPPER_BEND_R if bend_direction != 'right' else DEFAULT_LOWER_BEND_R
-            lower_default_r = DEFAULT_LOWER_BEND_R if bend_direction != 'right' else DEFAULT_UPPER_BEND_R
+            upper_default_r, lower_default_r = self._assign_bend_radii(
+                bend_direction, DEFAULT_UPPER_BEND_R, DEFAULT_LOWER_BEND_R)
             track_arc_radius_map = {}
 
         bends = []
@@ -2657,8 +2706,15 @@ class MockCADEngine:
                                     _elev_diff = abs(max(_all_entry_elevs) - min(_all_entry_elevs))
                                     entry_bend_deg = round(_elev_diff) if _elev_diff > 0.5 else 0
                                 if entry_bend_deg < 1 and stp_data:
-                                    _elev = stp_data.get('elevation_deg', 0)
-                                    entry_bend_deg = round(_elev) if _elev > 0.5 else 0
+                                    if _all_entry_elevs:
+                                        # section 2 所有軌道仰角相同 → 與 section 1 仰角求差
+                                        _sec2_elev = max(_all_entry_elevs)
+                                        _sec1_elev = stp_data.get('elevation_deg', 0)
+                                        _cross_diff = abs(_sec2_elev - _sec1_elev)
+                                        entry_bend_deg = round(_cross_diff) if _cross_diff > 0.5 else 0
+                                    if entry_bend_deg < 1:
+                                        _elev = stp_data.get('elevation_deg', 0)
+                                        entry_bend_deg = round(_elev) if _elev > 0.5 else 0
                                 log_print(f"  entry_bend_deg from elev diff (arc={raw_arc_deg:.0f}°≥90°): {entry_bend_deg}° elevs={_all_entry_elevs} (fid={fid})")
                             else:
                                 entry_bend_deg = round(raw_arc_deg)
@@ -2718,49 +2774,49 @@ class MockCADEngine:
                     d_trans_y = sign_y * math.cos(math.radians(trans_elev))
                     d_trans_z = math.sin(math.radians(trans_elev))
 
-                    # 大弧上軌尾段：投影 (下軌自由端 - 上軌自由端) 到 trans 方向
-                    # 原因：上軌 arc-side 端與弧重合（gap≈0），尾段長度由上下軌
-                    # 自由端的相對位置決定。
-                    if n_lower >= 1:
-                        # 找上軌 arc-side 端（最近弧的端點）
-                        _u_near_yz = float('inf')
-                        _u_arc_side = u_sp
-                        for _ct in curve_upper:
-                            _cpd = _pcl_map.get(_ct.get('solid_id',''), _ct.get('pipe_data',{}))
-                            for _cpt in [_cpd.get('start_point',(0,0,0)),
-                                         _cpd.get('end_point',(0,0,0))]:
-                                for _tpt in [u_sp, u_ep]:
-                                    _d = math.sqrt((_tpt[1]-_cpt[1])**2+(_tpt[2]-_cpt[2])**2)
-                                    if _d < _u_near_yz:
-                                        _u_near_yz = _d
-                                        _u_arc_side = _tpt
-                        # 上軌自由端 = 另一端
-                        _u_free = u_ep if (_u_arc_side[1]==u_sp[1] and _u_arc_side[2]==u_sp[2]) else u_sp
-
-                        # 找下軌自由端（遠離弧的端點）
-                        _l_fid0 = lower_tracks[0].get('solid_id','')
-                        _l_pc0 = _pcl_map.get(_l_fid0, lower_tracks[0].get('pipe_data',{}))
-                        _l_sp0 = _l_pc0.get('start_point',(0,0,0))
-                        _l_ep0 = _l_pc0.get('end_point',(0,0,0))
-                        _curve_lower_tracks = prev_curved_section.get('lower_tracks',[]) if prev_curved_section else []
-                        _l_near_yz = float('inf')
-                        _l_arc_side = _l_sp0
-                        for _ct in _curve_lower_tracks:
-                            _cpd = _pcl_map.get(_ct.get('solid_id',''), _ct.get('pipe_data',{}))
-                            for _cpt in [_cpd.get('start_point',(0,0,0)),
-                                         _cpd.get('end_point',(0,0,0))]:
-                                for _lpt in [_l_sp0, _l_ep0]:
-                                    _d = math.sqrt((_lpt[1]-_cpt[1])**2+(_lpt[2]-_cpt[2])**2)
-                                    if _d < _l_near_yz:
-                                        _l_near_yz = _d
-                                        _l_arc_side = _lpt
-                        _l_free = _l_ep0 if (_l_arc_side[1]==_l_sp0[1] and _l_arc_side[2]==_l_sp0[2]) else _l_sp0
-
-                        gap_y = _l_free[1] - _u_free[1]
-                        gap_z = _l_free[2] - _u_free[2]
-                        proj = d_trans_y * gap_y + d_trans_z * gap_z
-                        entry_straight_length_upper = round(abs(proj), 1)
-                        log_print(f"  Entry transition upper (free_end_proj): trans_elev={trans_elev:.1f}° gap=({gap_y:.1f},{gap_z:.1f}) proj={proj:.1f} → straight={entry_straight_length_upper:.1f}")
+                    # 大弧上軌：使用彎管幾何投影（與下軌相同邏輯）
+                    # 找 F07 arc-side 端 + 弧軌 curve_pt，計算彎管出口到 curve_pt 的投影距離
+                    _best_curve_pt_u = None
+                    _best_track_pt_u = None
+                    _min_dist_yz_u = float('inf')
+                    for _ct in curve_upper:
+                        _cpd = _pcl_map.get(_ct.get('solid_id',''), _ct.get('pipe_data',{}))
+                        for _cpt in [_cpd.get('start_point',(0,0,0)),
+                                     _cpd.get('end_point',(0,0,0))]:
+                            for _tpt in [u_sp, u_ep]:
+                                _d_yz_u = math.sqrt((_tpt[1]-_cpt[1])**2+(_tpt[2]-_cpt[2])**2)
+                                if _d_yz_u < _min_dist_yz_u:
+                                    _min_dist_yz_u = _d_yz_u
+                                    _best_curve_pt_u = _cpt
+                                    _best_track_pt_u = _tpt
+                    if _best_curve_pt_u and _best_track_pt_u:
+                        entry_r_u = after_upper_r
+                        # d0 方向：從自由端指向 arc-side（進入彎管方向）
+                        _d_sp_u = math.sqrt((_best_track_pt_u[1]-u_sp[1])**2+(_best_track_pt_u[2]-u_sp[2])**2)
+                        if _d_sp_u < 1e-3:
+                            # arc-side 是 sp，d0 從 ep 指向 sp
+                            _dy0_u, _dz0_u = u_sp[1]-u_ep[1], u_sp[2]-u_ep[2]
+                        else:
+                            # arc-side 是 ep，d0 從 sp 指向 ep
+                            _dy0_u, _dz0_u = u_ep[1]-u_sp[1], u_ep[2]-u_sp[2]
+                        _len0_u = math.sqrt(_dy0_u**2 + _dz0_u**2)
+                        _d0_y_u = _dy0_u / _len0_u if _len0_u > 1e-6 else 0.0
+                        _d0_z_u = _dz0_u / _len0_u if _len0_u > 1e-6 else 1.0
+                        # 過渡後仰角 = trans_elev（= track_elev - entry_bend_deg）
+                        _sign_y_u = 1.0 if _d0_y_u >= 0 else -1.0
+                        _sign_z_u = 1.0 if _d0_z_u >= 0 else -1.0
+                        _d1_y_u = _sign_y_u * math.cos(math.radians(trans_elev))
+                        _d1_z_u = _sign_z_u * math.sin(math.radians(trans_elev))
+                        # 彎管幾何：旋轉方向由 d0_z 正負決定（d0_z>0 → CW, d0_z<0 → CCW）
+                        _ctr_y_u = _best_track_pt_u[1] + _sign_z_u * _d0_z_u * entry_r_u
+                        _ctr_z_u = _best_track_pt_u[2] + _sign_z_u * (-_d0_y_u) * entry_r_u
+                        _exit_y_u = _ctr_y_u + _sign_z_u * (-_d1_z_u) * entry_r_u
+                        _exit_z_u = _ctr_z_u + _sign_z_u * _d1_y_u * entry_r_u
+                        _gap_y_u = _best_curve_pt_u[1] - _exit_y_u
+                        _gap_z_u = _best_curve_pt_u[2] - _exit_z_u
+                        _proj_u = _d1_y_u * _gap_y_u + _d1_z_u * _gap_z_u
+                        entry_straight_length_upper = round(max(_proj_u, 0), 1)
+                        log_print(f"  Entry transition upper (arc_geom): trans_elev={trans_elev:.1f}° proj={_proj_u:.1f} R={entry_r_u:.0f} → straight={entry_straight_length_upper:.1f}")
             
             if entry_straight_length_upper <= 0:
                 entry_straight_length_upper = 0  # 無法計算時不添加過渡段
@@ -3461,7 +3517,7 @@ class MockCADEngine:
                         'radius': _u_r,
                         'outer_arc_length': _u_arc_len,
                         'height_gain': 0,
-                        'bend_sign': entry_bend.get('bend_sign', 1),
+                        'bend_sign': -entry_bend.get('bend_sign', 1),
                         'spec': f"直徑{pipe_diameter:.1f} 角度{_u_bend_deg:.0f}度(半徑{_u_r:.0f})外弧長{_u_arc_len:.0f}",
                     })
                     idx += 1
@@ -6023,7 +6079,7 @@ Solid 名稱: {solid_name}
         arc_pipe = None
         for tp in track_pipes:
             for seg in tp.get('segments', []):
-                if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
+                if self._is_significant_arc(seg):
                     arc_pipe = tp
                     break
             if arc_pipe:
@@ -6055,12 +6111,9 @@ Solid 名稱: {solid_name}
         ny_ch = dx_ch / chord_xy
 
         # 根據彎曲方向選擇弧心側
-        if bend_direction == 'left':
-            arc_cx = mid_x + h_perp * nx_ch
-            arc_cy = mid_y + h_perp * ny_ch
-        else:
-            arc_cx = mid_x - h_perp * nx_ch
-            arc_cy = mid_y - h_perp * ny_ch
+        _bsign = self._get_bend_transforms(bend_direction)['arc_center_sign']
+        arc_cx = mid_x + _bsign * h_perp * nx_ch
+        arc_cy = mid_y + _bsign * h_perp * ny_ch
 
         # 起止角度
         plan_sa_deg = math.degrees(math.atan2(p1y - arc_cy, p1x - arc_cx))
@@ -6610,7 +6663,7 @@ Solid 名稱: {solid_name}
             arc_pipe = None
             for tp in track_pipes:
                 for seg in tp.get('segments', []):
-                    if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
+                    if self._is_significant_arc(seg):
                         arc_pipe = tp
                         break
                 if arc_pipe:
@@ -6811,10 +6864,7 @@ Solid 名稱: {solid_name}
         # 右彎模型（bend_direction='right'）的第一段 3D 水平走向與左彎相反，
         # 因此 x_dir 須對調，才能讓 Draw 1 自由端在左、弧管在右（慣例不變）。
         _bend_dir = stp_data.get('bend_direction', 'left')
-        if _bend_dir == 'right':
-            x_dir = -1 if _start_is_transition else 1   # 右彎：Draw3=-1, Draw1=+1
-        else:
-            x_dir = 1 if _start_is_transition else -1   # 左彎（預設）：Draw3=+1, Draw1=-1
+        x_dir = self._draw_section_x_dir(_bend_dir, _start_is_transition)
 
 
         # ---- 側視圖（基於 cutting list 完整路徑繪製）----
@@ -6870,12 +6920,28 @@ Solid 名稱: {solid_name}
                     it['bend_sign'] = -it.get('bend_sign', 1)
             return rev, True  # 已反轉
         if _start_is_transition or _is_drawing1:
-            # Drawing 3 / Drawing 1: 上軌保持原始順序（過渡段在前）
-            _upper_cl_reversed = False
-            # 下軌：若主管段(solid_id)在前，反轉使過渡段(弧段)在前
-            _first_lower_str = next(
-                (it for it in lower_cl if it.get('type') == 'straight'), None)
-            if _first_lower_str and _first_lower_str.get('solid_id'):
+            # 上軌：Draw 3 (start_is_transition) 時，若第一項即為主管段，反轉使過渡段在前
+            # Draw 1 (is_drawing1) 不反轉上軌（exit bend 在末尾，已是正確順序）
+            if _start_is_transition:
+                _first_upper_item = upper_cl[0] if upper_cl else None
+                if (_first_upper_item
+                        and _first_upper_item.get('type') == 'straight'
+                        and _first_upper_item.get('solid_id')):
+                    upper_cl = list(reversed([_copy.copy(it) for it in upper_cl]))
+                    for it in upper_cl:
+                        if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
+                            it['bend_sign'] = -it.get('bend_sign', 1)
+                    _upper_cl_reversed = True
+                else:
+                    _upper_cl_reversed = False
+            else:
+                _upper_cl_reversed = False
+            # 下軌：若第一項即為主管段（solid_id），反轉使過渡弧在前
+            # 注意：若第一項已是弧段（過渡弧在前），不需反轉
+            _first_lower_item = lower_cl[0] if lower_cl else None
+            if (_first_lower_item
+                    and _first_lower_item.get('type') == 'straight'
+                    and _first_lower_item.get('solid_id')):
                 lower_cl = list(reversed([_copy.copy(it) for it in lower_cl]))
                 for it in lower_cl:
                     if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
@@ -7403,6 +7469,14 @@ Solid 名稱: {solid_name}
             upper_track_end, lower_track_end,
             base_x, lower_start_y,
             pipe_hw, x_dir, _SHOW_BASIC, _start_is_transition)
+
+        # ========== 過渡弧角度標註（下軌 entry / exit 彎曲段）==========
+        # 標準圖慣例：彎曲角標注在下軌彎管處（D2），不在上軌重複標注
+        if _SHOW_BASIC:
+            for bi in lower_bends:
+                self._draw_bend_arc(
+                    msp, bi['center'], bi['prev_angle'], bi['post_angle'],
+                    bi['bend_deg'], scale, x_dir)
 
         # ========== 腳架（垂直向下到地面）— 沿軌道方向投影定位 ==========
         # 腳架在前視圖的水平位置 = 沿軌道方向投影的位置（t 參數）
@@ -8260,7 +8334,7 @@ Solid 名稱: {solid_name}
             # fallback: pipe_centerlines total_length
             for pc in track_pipes:
                 for seg in pc.get('segments', []):
-                    if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
+                    if self._is_significant_arc(seg):
                         _arc_cl_length = max(_arc_cl_length, pc.get('total_length', 0))
 
         # 仰角（from info.angles → 取第一個非零 track_elevation）
@@ -8330,7 +8404,7 @@ Solid 名稱: {solid_name}
             _arc_radii_from_pipes = []
             for pc in track_pipes:
                 for seg in pc.get('segments', []):
-                    if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
+                    if self._is_significant_arc(seg):
                         _arc_radii_from_pipes.append(seg['radius'])
             if _arc_radii_from_pipes:
                 _r_large = max(_arc_radii_from_pipes)
@@ -8338,16 +8412,13 @@ Solid 名稱: {solid_name}
             else:
                 _r_large = _r_small = _arc_radius  # 使用主弧半徑
 
-        if bend_direction == 'right':
-            _upper_bend_r, _lower_bend_r = _r_small, _r_large
-        else:
-            _upper_bend_r, _lower_bend_r = _r_large, _r_small
+        _upper_bend_r, _lower_bend_r = self._assign_bend_radii(bend_direction, _r_large, _r_small)
 
         # Per-pipe arc radius 查表（from info.pipe_centerlines）
         _track_arc_r_map = {}
         for pc in track_pipes:
             for seg in pc.get('segments', []):
-                if seg.get('type') == 'arc' and seg.get('radius', 0) > MIN_ARC_RADIUS_MM:
+                if self._is_significant_arc(seg):
                     _track_arc_r_map[pc['solid_id']] = seg['radius']
                     break
 
@@ -8498,8 +8569,7 @@ Solid 名稱: {solid_name}
                                           pc['solid_id'], {}).get('class') == 'track']
                 _arc_pipe_early = None
                 for _tp in _arc_track_pipes_e:
-                    if any(s.get('type') == 'arc' and s.get('radius', 0) > MIN_ARC_RADIUS_MM
-                           for s in _tp.get('segments', [])):
+                    if any(self._is_significant_arc(s) for s in _tp.get('segments', [])):
                         _arc_pipe_early = _tp
                         break
                 if _arc_pipe_early:
@@ -8512,12 +8582,9 @@ Solid 名稱: {solid_name}
                         _hperpe = math.sqrt(max(stp_data['arc_radius']**2 - _halfe**2, 0))
                         _nxe = -(_p2ye - _p1ye) / _che
                         _nye =  (_p2xe - _p1xe) / _che
-                        if bend_direction == 'left':
-                            _cxe = _midxe + _hperpe * _nxe
-                            _cye = _midye + _hperpe * _nye
-                        else:
-                            _cxe = _midxe - _hperpe * _nxe
-                            _cye = _midye - _hperpe * _nye
+                        _bsign_e = self._get_bend_transforms(bend_direction)['arc_center_sign']
+                        _cxe = _midxe + _bsign_e * _hperpe * _nxe
+                        _cye = _midye + _bsign_e * _hperpe * _nye
                         _sae = math.degrees(math.atan2(_p1ye - _cye, _p1xe - _cxe))
                         _eae = math.degrees(math.atan2(_p2ye - _cye, _p2xe - _cxe))
                         _spane = ((_eae - _sae) % 360) or 360
@@ -8681,7 +8748,7 @@ Solid 名稱: {solid_name}
 
             # 側視圖方向：左彎 x_dir=-1（背面），右彎 x_dir=+1（正面）
             # 右彎模型 3D 水平走向與左彎相反，翻轉 x_dir 以維持「左下→右上」慣例
-            x_dir = 1 if bend_direction == 'right' else -1
+            x_dir = self._get_bend_transforms(bend_direction)['draw2_x_dir']
 
             # ================================================================
             # 上半部：俯視圖（Top View）— 共用 _draw_top_plan_view
@@ -8707,8 +8774,7 @@ Solid 名稱: {solid_name}
                                         pc['solid_id'], {}).get('class') == 'track']
                 _arc_pipe_e = None
                 for _tp_e in _arc_track_pipes:
-                    if any(s.get('type') == 'arc' and s.get('radius', 0) > MIN_ARC_RADIUS_MM
-                           for s in _tp_e.get('segments', [])):
+                    if any(self._is_significant_arc(s) for s in _tp_e.get('segments', [])):
                         _arc_pipe_e = _tp_e
                         break
                 if _arc_pipe_e:
@@ -8721,12 +8787,9 @@ Solid 名稱: {solid_name}
                         _h_perp_e = math.sqrt(max(arc_radius**2 - _half_e**2, 0))
                         _nx_e = -(_p2y_e - _p1y_e) / _ch_e
                         _ny_e =  (_p2x_e - _p1x_e) / _ch_e
-                        if bend_direction == 'left':
-                            _cx_e = _mid_xe + _h_perp_e * _nx_e
-                            _cy_e = _mid_ye + _h_perp_e * _ny_e
-                        else:
-                            _cx_e = _mid_xe - _h_perp_e * _nx_e
-                            _cy_e = _mid_ye - _h_perp_e * _ny_e
+                        _bsign = self._get_bend_transforms(bend_direction)['arc_center_sign']
+                        _cx_e = _mid_xe + _bsign * _h_perp_e * _nx_e
+                        _cy_e = _mid_ye + _bsign * _h_perp_e * _ny_e
                         _sa_e = math.degrees(math.atan2(_p1y_e - _cy_e, _p1x_e - _cx_e))
                         _ea_e = math.degrees(math.atan2(_p2y_e - _cy_e, _p2x_e - _cx_e))
                         _span_e = ((_ea_e - _sa_e) % 360) or 360
@@ -8756,7 +8819,7 @@ Solid 名稱: {solid_name}
             _saved_bc = stp_data['bracket_count']
             stp_data['bracket_count'] = _arc_brk_count
             # 右彎時 y_dir=-1 翻轉 Y 軸，確保俯視圖弧管開口一律朝下
-            _plan_y_dir = -1 if bend_direction == 'right' else 1
+            _plan_y_dir = self._get_bend_transforms(bend_direction)['draw2_y_dir']
             plan_r2 = self._draw_top_plan_view(
                 msp2, upper_area_x, upper_area_y, upper_area_w, upper_area_h,
                 stp_data, x_dir=x_dir, y_dir=_plan_y_dir, draw_brackets=True)
@@ -9146,7 +9209,7 @@ Solid 名稱: {solid_name}
             #   右彎（bend_direction='right'）：軌道向右轉、向上爬升 → 左螺旋（逆時針上升）
             # 注意：此處 'left'/'right' 指彎曲方向，與螺旋標示方向相反，
             #       因此用 bend_direction == 'left' → '右螺旋' 是正確的，並非反向賦值錯誤。
-            spiral_dir = '右螺旋' if bend_direction == 'left' else '左螺旋'
+            spiral_dir = self._get_bend_transforms(bend_direction)['spiral_label']
             
             cl_arc_items = [t for t in stp_data['track_items'] if t.get('type') == 'arc']
             cl_items_for_d2 = []

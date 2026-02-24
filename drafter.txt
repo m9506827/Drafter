@@ -48,6 +48,12 @@ review code
 3.function是否可以再精簡, 彈性, 共用
 4.是否有更新更快package或寫法
 
+auto_drafter_system.py 拆分成多個模組：
+occ_engine.py: 專門處理 Open CASCADE 的 STEP 讀取與 HLR 投影邏輯。
+dxf_manager.py: 專門處理 ezdxf 的圖層建立、線型設定與存檔。
+geometry_utils.py: 存放幾何計算、座標轉換的輔助函式。
+main.py: 程式進入點，負責調度上述模組。
+
   1. Hardcoded Values
 
   ┌───────────┬────────────────────┬───────────────────────────────────────────────────┐
