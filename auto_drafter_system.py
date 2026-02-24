@@ -5939,7 +5939,7 @@ Solid 名稱: {solid_name}
 
         Args:
             center: (cx, cy) 標註中心點
-            elev_deg: 軌道仰角（從水平量測），complement = 90 - elev_deg
+            elev_deg: 軌道仰角（從水平量測），可為負值（下坡），complement = 90 - |elev_deg|
             scale: 繪圖縮放比
             x_dir: 1=正面, -1=鏡像
             below: True=標示在軌道下側（上軌用），False=標示在軌道上側（下軌用）
@@ -5947,19 +5947,24 @@ Solid 名稱: {solid_name}
         cx, cy = center
         arc_r = min(15, 25 * scale)
         elev_arc_r = arc_r + 12
-        complement = 90 - elev_deg
+        complement = 90 - abs(elev_deg)  # 使用絕對值，負仰角（下坡）亦正確
         if abs(complement) < 0.5:
             return
-        # DXF 角度（軌道方向）
-        dxf_angle = (180 - elev_deg) if x_dir < 0 else elev_deg
+        # DXF 角度（軌道方向）—— 使用絕對仰角計算基礎 dxf_angle
+        abs_elev = abs(elev_deg)
+        dxf_angle = (180 - abs_elev) if x_dir < 0 else elev_deg  # 保留原始符號
         if below:
-            # 下側夾角：腳架向下 (270°) 與軌道反方向 (dxf_angle+180°)
+            # 下側夾角：腳架向下 (270°) 與軌道「向下」側方向
+            # 仰角>0（上坡）：反方向朝下 = dxf_angle+180；仰角<0（下坡）：正方向朝下 = dxf_angle
             vert_dxf = 270
-            track_dxf = dxf_angle + 180
+            raw = (dxf_angle + 180) if math.sin(math.radians(dxf_angle)) > 0 else dxf_angle
+            track_dxf = raw % 360
         else:
-            # 上側夾角：腳架向上 (90°) 與軌道方向 (dxf_angle)
+            # 上側夾角：腳架向上 (90°) 與軌道「向上」側方向
+            # 仰角>0（上坡）：正方向朝上 = dxf_angle；仰角<0（下坡）：反方向朝上 = dxf_angle+180
             vert_dxf = 90
-            track_dxf = dxf_angle
+            raw = dxf_angle if math.sin(math.radians(dxf_angle)) >= 0 else (dxf_angle + 180)
+            track_dxf = raw % 360
         e_sa = min(vert_dxf, track_dxf)
         e_ea = max(vert_dxf, track_dxf)
         if e_ea - e_sa > 0.5:
@@ -6893,6 +6898,11 @@ Solid 名稱: {solid_name}
         if lower_base_elev == 0:
             lower_base_elev = stp_data['elevation_deg'] if stp_data else 0
 
+        # Draw 3 左彎：從弧管側往自由端繪製，需翻轉仰角符號（右彎不需要）
+        if _start_is_transition and _bend_dir == 'left':
+            upper_base_elev = -upper_base_elev
+            lower_base_elev = -lower_base_elev
+
         # 從 cutting list 分離上軌和下軌的 items
         import copy as _copy_pre
         upper_cl = [_copy_pre.copy(it) for it in section_cutting_list if str(it.get('item', '')).startswith('U')]
@@ -6923,16 +6933,19 @@ Solid 名稱: {solid_name}
             # 上軌：Draw 3 (start_is_transition) 時，若第一項即為主管段，反轉使過渡段在前
             # Draw 1 (is_drawing1) 不反轉上軌（exit bend 在末尾，已是正確順序）
             if _start_is_transition:
-                _first_upper_item = upper_cl[0] if upper_cl else None
-                if (_first_upper_item
-                        and _first_upper_item.get('type') == 'straight'
-                        and _first_upper_item.get('solid_id')):
-                    upper_cl = list(reversed([_copy.copy(it) for it in upper_cl]))
-                    for it in upper_cl:
-                        if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
-                            it['bend_sign'] = -it.get('bend_sign', 1)
-                    _upper_cl_reversed = True
+                if _bend_dir == 'left':
+                    # 左彎 Draw 3：反轉 CL 使弧管端（arc end）在前（繪圖左側）
+                    _first_upper_item = upper_cl[0] if upper_cl else None
+                    if (_first_upper_item
+                            and _first_upper_item.get('type') == 'straight'
+                            and _first_upper_item.get('solid_id')):
+                        upper_cl = list(reversed([_copy.copy(it) for it in upper_cl]))
+                        # 注意：不再對弧段 bend_sign 取反（base_elev 已取反補償）
+                        _upper_cl_reversed = True
+                    else:
+                        _upper_cl_reversed = False
                 else:
+                    # 右彎 Draw 3：x_dir=-1 自然將弧管端放在左側，不需反轉 CL
                     _upper_cl_reversed = False
             else:
                 _upper_cl_reversed = False
@@ -6942,11 +6955,18 @@ Solid 名稱: {solid_name}
             if (_first_lower_item
                     and _first_lower_item.get('type') == 'straight'
                     and _first_lower_item.get('solid_id')):
-                lower_cl = list(reversed([_copy.copy(it) for it in lower_cl]))
-                for it in lower_cl:
-                    if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
-                        it['bend_sign'] = -it.get('bend_sign', 1)
-                _lower_cl_reversed = True
+                # 左彎 Draw 3 或 Draw 1 時反轉；右彎 Draw 3 不反轉
+                if not _start_is_transition or _bend_dir == 'left':
+                    lower_cl = list(reversed([_copy.copy(it) for it in lower_cl]))
+                    if not _start_is_transition:
+                        # Draw 1：仍需對弧段 bend_sign 取反
+                        for it in lower_cl:
+                            if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
+                                it['bend_sign'] = -it.get('bend_sign', 1)
+                    # 左彎 Draw 3：不取反（base_elev 已取反補償）
+                    _lower_cl_reversed = True
+                else:
+                    _lower_cl_reversed = False  # 右彎 Draw 3：不反轉
             else:
                 _lower_cl_reversed = False
         else:
