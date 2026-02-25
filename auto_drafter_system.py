@@ -2325,11 +2325,11 @@ class MockCADEngine:
     def _draw_section_x_dir(bend_direction: str, start_is_transition: bool) -> int:
         """
         x_dir for Draw 1/3 side view.
-        Ensures: free-end on left, arc-end on right (慣例不變).
-        右彎：Draw3=-1, Draw1=+1 / 左彎（預設）：Draw3=+1, Draw1=-1
+        Draw 3（start_is_transition）：側視圖弧管端統一在左，x_dir=+1（左→右）
+        Draw 1（左彎）：x_dir=-1 / Draw 1（右彎）：x_dir=+1
         """
         if bend_direction == 'right':
-            return -1 if start_is_transition else 1
+            return 1  # 右彎 Draw1/Draw3 均為 +1（Draw3 與左彎 Draw3 相同）
         return 1 if start_is_transition else -1
 
     @staticmethod
@@ -6898,7 +6898,7 @@ Solid 名稱: {solid_name}
         if lower_base_elev == 0:
             lower_base_elev = stp_data['elevation_deg'] if stp_data else 0
 
-        # Draw 3 左彎：從弧管側往自由端繪製，需翻轉仰角符號（右彎不需要）
+        # Draw 3 左彎：從弧管側往自由端繪製，需翻轉仰角符號（右彎物理方向相反，不需翻轉）
         if _start_is_transition and _bend_dir == 'left':
             upper_base_elev = -upper_base_elev
             lower_base_elev = -lower_base_elev
@@ -6933,19 +6933,14 @@ Solid 名稱: {solid_name}
             # 上軌：Draw 3 (start_is_transition) 時，若第一項即為主管段，反轉使過渡段在前
             # Draw 1 (is_drawing1) 不反轉上軌（exit bend 在末尾，已是正確順序）
             if _start_is_transition:
-                if _bend_dir == 'left':
-                    # 左彎 Draw 3：反轉 CL 使弧管端（arc end）在前（繪圖左側）
-                    _first_upper_item = upper_cl[0] if upper_cl else None
-                    if (_first_upper_item
-                            and _first_upper_item.get('type') == 'straight'
-                            and _first_upper_item.get('solid_id')):
-                        upper_cl = list(reversed([_copy.copy(it) for it in upper_cl]))
-                        # 注意：不再對弧段 bend_sign 取反（base_elev 已取反補償）
-                        _upper_cl_reversed = True
-                    else:
-                        _upper_cl_reversed = False
+                # Draw 3（左彎/右彎）：反轉 CL 使弧管端在前（繪圖左側），base_elev 已取反補償
+                _first_upper_item = upper_cl[0] if upper_cl else None
+                if (_first_upper_item
+                        and _first_upper_item.get('type') == 'straight'
+                        and _first_upper_item.get('solid_id')):
+                    upper_cl = list(reversed([_copy.copy(it) for it in upper_cl]))
+                    _upper_cl_reversed = True
                 else:
-                    # 右彎 Draw 3：x_dir=-1 自然將弧管端放在左側，不需反轉 CL
                     _upper_cl_reversed = False
             else:
                 _upper_cl_reversed = False
@@ -6955,18 +6950,15 @@ Solid 名稱: {solid_name}
             if (_first_lower_item
                     and _first_lower_item.get('type') == 'straight'
                     and _first_lower_item.get('solid_id')):
-                # 左彎 Draw 3 或 Draw 1 時反轉；右彎 Draw 3 不反轉
-                if not _start_is_transition or _bend_dir == 'left':
-                    lower_cl = list(reversed([_copy.copy(it) for it in lower_cl]))
-                    if not _start_is_transition:
-                        # Draw 1：仍需對弧段 bend_sign 取反
-                        for it in lower_cl:
-                            if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
-                                it['bend_sign'] = -it.get('bend_sign', 1)
-                    # 左彎 Draw 3：不取反（base_elev 已取反補償）
-                    _lower_cl_reversed = True
-                else:
-                    _lower_cl_reversed = False  # 右彎 Draw 3：不反轉
+                # Draw 3（左彎/右彎均反轉）及 Draw 1 均反轉
+                lower_cl = list(reversed([_copy.copy(it) for it in lower_cl]))
+                if not _start_is_transition:
+                    # Draw 1：仍需對弧段 bend_sign 取反
+                    for it in lower_cl:
+                        if it.get('type') == 'arc' and not it.get('is_exit_bend') and not it.get('is_entry_tail_bend'):
+                            it['bend_sign'] = -it.get('bend_sign', 1)
+                # Draw 3（左彎/右彎）：不取反（base_elev 已取反補償）
+                _lower_cl_reversed = True
             else:
                 _lower_cl_reversed = False
         else:
@@ -8971,6 +8963,15 @@ Solid 名稱: {solid_name}
             lower_area_y = tb_top2 + 5
             lower_area_w = PW * 0.52
             lower_area_h = upper_area_y - lower_area_y - 10
+
+            # 確保低仰角端在圖面左側（與 Draw 1 慣例一致：左低右高）
+            # 若弧起點（plan_sa 側）仰角高於終點，翻轉弦方向使低仰角側在左
+            _elev_ref_sp = u_sp_3d if u_sp_3d != (0, 0, 0) else l_sp_3d
+            _elev_ref_ep = u_ep_3d if u_ep_3d != (0, 0, 0) else l_ep_3d
+            if _elev_ref_sp != (0, 0, 0) and _elev_ref_sp[2] > _elev_ref_ep[2]:
+                log_print(f"  [Draw2下圖] 弧起點仰角高於終點，翻轉弦方向以對齊 Draw1 慣例")
+                _lf_sp_x, _lf_sp_y = _lf_ep_x, _lf_ep_y
+                _lf_cos, _lf_sin = -_lf_cos, -_lf_sin
 
             # 修正 2B：弦方向側視投影（水平=弦方向投影距離, 垂直=Z）
             def _proj_lf(x, y, z):
